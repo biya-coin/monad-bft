@@ -28,7 +28,7 @@ use bindings::monad_executor_result;
 use futures::channel::oneshot::{channel, Sender};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use crate::bindings::{add_override_address, monad_state_override};
+use crate::bindings::{add_override_address, monad_block_override, monad_state_override};
 
 #[allow(dead_code, non_camel_case_types, non_upper_case_globals)]
 pub mod bindings {
@@ -655,7 +655,7 @@ pub struct BlockOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<U64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gas_limit: Option<U256>,
+    pub gas_limit: Option<U64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_recipient: Option<Address>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -673,7 +673,7 @@ pub async fn eth_simulate_v1(
     block_header: Header,
     block_number: u64,
     block_id: Option<[u8; 32]>,
-    eth_call_executor: Arc<EthCallExecutor>,
+    eth_call_executor: &EthCallExecutor,
     overrides: &[(&BlockOverride, &StateOverrideSet)],
 ) -> SimulateResult {
     assert_eq!(calls.len(), overrides.len());
@@ -689,23 +689,82 @@ pub async fn eth_simulate_v1(
 
     let rlp_encoded_block_id = alloy_rlp::encode(block_id.unwrap_or([0_u8; 32]));
 
-    let chain_config = match chain_id {
-        ETHEREUM_MAINNET_CHAIN_ID => bindings::monad_chain_config_CHAIN_CONFIG_ETHEREUM_MAINNET,
-        MONAD_DEVNET_CHAIN_ID => bindings::monad_chain_config_CHAIN_CONFIG_MONAD_DEVNET,
-        MONAD_TESTNET_CHAIN_ID => bindings::monad_chain_config_CHAIN_CONFIG_MONAD_TESTNET,
-        MONAD_MAINNET_CHAIN_ID => bindings::monad_chain_config_CHAIN_CONFIG_MONAD_MAINNET,
-        _ => {
-            return SimulateResult::Failure(FailureSimulateResult {
-                error_code: EthCallResult::OtherError,
-                message: "unsupported chain id".to_string(),
-                data: Some(chain_id.to_string()),
-            });
-        }
-    };
+    chain_id.to_ffi_chain_config();
 
     let state_overrides: Vec<*mut monad_state_override> = overrides
         .iter()
         .map(|(_, state_override)| unsafe { bind_state_override(state_override) })
+        .collect();
+
+    let block_overrides: Vec<*mut monad_block_override> = overrides
+        .iter()
+        .map(|(block_override, _)| {
+            let override_ctx = unsafe { bindings::monad_block_override_create() };
+
+            if let Some(number) = block_override.number {
+                unsafe {
+                    bindings::set_block_override_number(override_ctx, number.as_limbs()[0]);
+                }
+            }
+
+            if let Some(time) = block_override.time {
+                unsafe {
+                    bindings::set_block_override_time(override_ctx, time.as_limbs()[0]);
+                }
+            }
+
+            if let Some(gas_limit) = block_override.gas_limit {
+                unsafe {
+                    bindings::set_block_override_gas_limit(override_ctx, gas_limit.as_limbs()[0]);
+                }
+            }
+
+            if let Some(fee_recipient) = block_override.fee_recipient {
+                let fee_recipient_bytes: &[u8] = fee_recipient.as_slice();
+                unsafe {
+                    bindings::set_block_override_fee_recipient(
+                        override_ctx,
+                        fee_recipient_bytes.as_ptr(),
+                        fee_recipient_bytes.len(),
+                    );
+                }
+            }
+
+            if let Some(prev_randao) = block_override.prev_randao {
+                let prev_randao_vec = prev_randao.as_slice();
+                unsafe {
+                    bindings::set_block_override_prev_randao(
+                        override_ctx,
+                        prev_randao_vec.as_ptr(),
+                        prev_randao_vec.len(),
+                    );
+                }
+            }
+
+            if let Some(base_fee_per_gas) = block_override.base_fee_per_gas {
+                let base_fee_per_gas_vec = base_fee_per_gas.to_be_bytes_vec();
+                unsafe {
+                    bindings::set_block_override_base_fee_per_gas(
+                        override_ctx,
+                        base_fee_per_gas_vec.as_ptr(),
+                        base_fee_per_gas_vec.len(),
+                    );
+                }
+            }
+
+            if let Some(blob_base_fee) = block_override.blob_base_fee {
+                let blob_base_fee_vec = blob_base_fee.to_be_bytes_vec();
+                unsafe {
+                    bindings::set_block_override_blob_base_fee(
+                        override_ctx,
+                        blob_base_fee_vec.as_ptr(),
+                        blob_base_fee_vec.len(),
+                    );
+                }
+            }
+
+            override_ctx
+        })
         .collect();
 
     let (send, recv) = channel();
@@ -728,6 +787,8 @@ pub async fn eth_simulate_v1(
             rlp_encoded_block_id.len(),
             state_overrides.as_ptr() as *const *const monad_state_override,
             state_overrides.len(),
+            block_overrides.as_ptr() as *const *const monad_block_override,
+            block_overrides.len(),
             Some(eth_call_submit_callback),
             sender_ctx_ptr as *mut std::ffi::c_void,
         );
