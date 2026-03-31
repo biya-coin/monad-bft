@@ -39,10 +39,8 @@ use monad_peer_discovery::{
     mock::{NopDiscovery, NopDiscoveryBuilder},
 };
 use monad_raptorcast::{
-    auth::{NoopAuthProtocol, NopScore},
-    config::RaptorCastConfig,
-    raptorcast_secondary::SecondaryRaptorCastModeConfig,
-    RaptorCast,
+    auth::NoopAuthProtocol, config::RaptorCastConfig,
+    raptorcast_secondary::SecondaryRaptorCastModeConfig, RaptorCast,
 };
 use monad_state::{Forkpoint, MonadMessage, MonadState, MonadStateBuilder, VerifiedMonadMessage};
 use monad_state_backend::InMemoryState;
@@ -184,7 +182,7 @@ where
                     .expect("raptorcast socket");
                 let control = dp.control;
 
-                let authenticated = (authenticated_socket, NoopAuthProtocol::new());
+                let auth_protocol = NoopAuthProtocol::new();
                 Updater::boxed(RaptorCast::<
                     ST,
                     MonadMessage<ST, SCT, MockExecutionProtocol>,
@@ -192,17 +190,16 @@ where
                     MonadEvent<ST, SCT, MockExecutionProtocol>,
                     NopDiscovery<ST>,
                     NoopAuthProtocol<CertificateSignaturePubKey<ST>>,
-                    NopScore<NodeId<CertificateSignaturePubKey<ST>>>,
                 >::new(
                     cfg,
                     SecondaryRaptorCastModeConfig::None,
                     tcp_socket,
-                    authenticated,
-                    None,
-                    non_authenticated_socket,
+                    authenticated_socket,
+                    Some(non_authenticated_socket),
                     control,
                     shared_peer_discovery_driver,
                     Epoch(0),
+                    auth_protocol,
                 ))
             }
         },
