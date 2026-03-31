@@ -668,7 +668,7 @@ fn setup_node(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
         tcp_socket,
-        Some((authenticated_socket, auth_protocol)),
+        (authenticated_socket, auth_protocol),
         None,
         non_authenticated_socket,
         dataplane_control,
