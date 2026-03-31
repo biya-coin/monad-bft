@@ -614,7 +614,7 @@ where
         *name_record_address.ip(),
         name_record_address.port(),
         name_record_address.port(),
-        Some(peer_discovery_config.self_auth_port),
+        peer_discovery_config.self_auth_port,
         peer_discovery_config.self_direct_udp_port,
         peer_discovery_config.self_record_seq_num,
     );
