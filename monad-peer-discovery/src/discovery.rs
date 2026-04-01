@@ -499,10 +499,9 @@ impl<ST: CertificateSignatureRecoverable, C: governor::clock::Clock> PeerDiscove
         }
 
         // check if the peer ip address is valid
-        if let Err(err) = validate_socket_ipv4_address(
-            &name_record.udp_address(),
-            &self.self_record.udp_address(),
-        ) {
+        let peer_addr = name_record.authenticated_udp_address();
+        let self_addr = self.self_record.authenticated_udp_address();
+        if let Err(err) = validate_socket_ipv4_address(&peer_addr, &self_addr) {
             warn!(
                 ?peer_id,
                 ?name_record,
@@ -1819,19 +1818,19 @@ where
     ) -> Option<SocketAddrV4> {
         self.pending_queue
             .get(id)
-            .map(|info| info.name_record.udp_address())
+            .map(|info| info.name_record.authenticated_udp_address())
     }
 
     fn get_addr_by_id(&self, id: &NodeId<CertificateSignaturePubKey<ST>>) -> Option<SocketAddrV4> {
         self.routing_info
             .get(id)
-            .map(|name_record| name_record.udp_address())
+            .map(|name_record| name_record.authenticated_udp_address())
     }
 
     fn get_known_addrs(&self) -> HashMap<NodeId<CertificateSignaturePubKey<ST>>, SocketAddrV4> {
         self.routing_info
             .iter()
-            .map(|(id, name_record)| (*id, name_record.udp_address()))
+            .map(|(id, name_record)| (*id, name_record.authenticated_udp_address()))
             .collect()
     }
 
@@ -1892,7 +1891,7 @@ mod tests {
     const DUMMY_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 8000);
 
     fn name_record_addr(record: &MonadNameRecord<SignatureType>) -> SocketAddr {
-        SocketAddr::V4(record.udp_address())
+        SocketAddr::V4(record.authenticated_udp_address())
     }
 
     fn peer_source(
@@ -1908,7 +1907,7 @@ mod tests {
     fn peer_source_from_record(
         keypair: &KeyPairType,
     ) -> PeerSource<CertificateSignaturePubKey<SignatureType>> {
-        let addr = SocketAddr::V4(generate_name_record(keypair, 0).udp_address());
+        let addr = SocketAddr::V4(generate_name_record(keypair, 0).authenticated_udp_address());
         peer_source(keypair, addr)
     }
 
@@ -1983,7 +1982,7 @@ mod tests {
             .map(|key| {
                 let node_id = NodeId::new(key.pubkey());
                 let name_record = generate_name_record(key, 0);
-                (name_record.udp_address(), node_id)
+                (name_record.authenticated_udp_address(), node_id)
             })
             .collect::<BTreeMap<_, _>>();
 
@@ -2489,10 +2488,16 @@ mod tests {
 
         // insert into routing info after ping pong round trip
         assert_eq!(
-            state.socket_to_id.get(&original_name_record.udp_address()),
+            state
+                .socket_to_id
+                .get(&original_name_record.authenticated_udp_address()),
             Some(&peer1_pubkey)
         );
-        assert!(!state.socket_to_id.contains_key(&record.udp_address()));
+        assert!(
+            !state
+                .socket_to_id
+                .contains_key(&record.authenticated_udp_address())
+        );
         state.handle_pong(
             peer_source_from_record(peer1),
             Pong {
@@ -2506,10 +2511,10 @@ mod tests {
         assert!(
             !state
                 .socket_to_id
-                .contains_key(&original_name_record.udp_address())
+                .contains_key(&original_name_record.authenticated_udp_address())
         );
         assert_eq!(
-            state.socket_to_id.get(&record.udp_address()),
+            state.socket_to_id.get(&record.authenticated_udp_address()),
             Some(&peer1_pubkey)
         );
 
@@ -2950,7 +2955,9 @@ mod tests {
         let peer1_record = generate_name_record(peer1, 0);
         assert!(state.routing_info.contains_key(&peer1_pubkey));
         assert_eq!(
-            state.socket_to_id.get(&peer1_record.udp_address()),
+            state
+                .socket_to_id
+                .get(&peer1_record.authenticated_udp_address()),
             Some(&peer1_pubkey)
         );
 
@@ -2966,7 +2973,11 @@ mod tests {
         assert!(!state.participation_info.contains_key(&peer1_pubkey));
 
         // verify socket_to_id is also cleaned up
-        assert!(!state.socket_to_id.contains_key(&peer1_record.udp_address()));
+        assert!(
+            !state
+                .socket_to_id
+                .contains_key(&peer1_record.authenticated_udp_address())
+        );
     }
 
     #[test]
@@ -2981,7 +2992,14 @@ mod tests {
         let (mut state, _clock) = generate_test_state(peer0, vec![]);
 
         let peer1_record = MonadNameRecord::new(
-            NameRecord::new_with_ports(Ipv4Addr::new(8, 8, 8, 8), 8000, 8000, 9100, Some(9000), 1),
+            NameRecord::new_with_ports(
+                Ipv4Addr::new(8, 8, 8, 8),
+                8000,
+                Some(8000),
+                9100,
+                Some(9000),
+                1,
+            ),
             peer1,
         );
         let peer1_entry = PeerEntry::from(peer1_record.with_pubkey(peer1.pubkey()));
@@ -2992,7 +3010,7 @@ mod tests {
         assert_eq!(first_pings[0].0, peer1_pubkey);
         assert_eq!(
             state.get_pending_addr_by_id(&peer1_pubkey),
-            Some(peer1_record.udp_address())
+            Some(peer1_record.authenticated_udp_address())
         );
 
         state.handle_pong(
@@ -3006,7 +3024,14 @@ mod tests {
         assert_eq!(state.get_name_record(&peer1_pubkey), Some(&peer1_record));
 
         let peer2_record = MonadNameRecord::new(
-            NameRecord::new_with_ports(Ipv4Addr::new(8, 8, 8, 8), 8001, 8001, 9101, Some(9000), 1),
+            NameRecord::new_with_ports(
+                Ipv4Addr::new(8, 8, 8, 8),
+                8001,
+                Some(8001),
+                9101,
+                Some(9000),
+                1,
+            ),
             peer2,
         );
         let peer_entry = PeerEntry::from(peer2_record.with_pubkey(peer2.pubkey()));
@@ -3038,7 +3063,7 @@ mod tests {
             .map(|key| {
                 let node_id = NodeId::new(key.pubkey());
                 let record = generate_name_record(key, 0);
-                (node_id, record.udp_address())
+                (node_id, record.authenticated_udp_address())
             })
             .collect();
 
@@ -3267,7 +3292,7 @@ mod tests {
             let name_record = NameRecord::new_with_ports(
                 Ipv4Addr::new(8, 8, 4, 4),
                 8001,
-                8001,
+                Some(8001),
                 9001,
                 Some(9002),
                 2,
@@ -3398,7 +3423,7 @@ mod tests {
         let loaded_peer1 = &state.pending_queue.get(&peer1_pubkey).unwrap().name_record;
         assert_eq!(
             loaded_peer1.udp_address(),
-            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 8000),
+            Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 8000)),
             "peer1 address should match"
         );
         assert_eq!(loaded_peer1.seq(), 1, "peer1 seq should match");
@@ -3412,7 +3437,7 @@ mod tests {
         let loaded_peer2 = &state.pending_queue.get(&peer2_pubkey).unwrap().name_record;
         assert_eq!(
             loaded_peer2.udp_address(),
-            SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 8001),
+            Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 8001)),
             "peer2 address should match"
         );
         assert_eq!(loaded_peer2.seq(), 2, "peer2 seq should match");

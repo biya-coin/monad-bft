@@ -614,7 +614,7 @@ where
     let self_record = NameRecord::new_with_ports(
         *name_record_address.ip(),
         name_record_address.port(),
-        name_record_address.port(),
+        None,
         peer_discovery_config.self_auth_port.get(),
         peer_discovery_config
             .self_direct_udp_port
@@ -637,17 +637,10 @@ where
             if node_id == self_id {
                 return None;
             }
-            let address = match resolve_domain_v4(&node_id, &peer.address) {
-                Some(SocketAddr::V4(addr)) => addr,
-                _ => {
-                    warn!(?node_id, ?peer.address, "Unable to resolve");
-                    return None;
-                }
-            };
 
             let peer_entry = monad_executor_glue::PeerEntry {
                 pubkey: peer.secp256k1_pubkey,
-                addr: address,
+                addr: peer.address.clone(),
                 signature: peer.name_record_sig,
                 record_seq_num: peer.record_seq_num,
                 auth_port: peer.auth_port,
@@ -656,8 +649,12 @@ where
 
             match MonadNameRecord::try_from(&peer_entry) {
                 Ok(monad_name_record) => Some((node_id, monad_name_record)),
-                Err(_) => {
-                    warn!(?node_id, "invalid name record signature in config file");
+                Err(error) => {
+                    warn!(
+                        ?node_id,
+                        ?error,
+                        "invalid bootstrap name record in config file"
+                    );
                     None
                 }
             }

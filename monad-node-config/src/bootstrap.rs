@@ -43,11 +43,34 @@ pub struct NodeBootstrapPeerConfig<ST: CertificateSignatureRecoverable> {
     #[serde(bound = "ST: CertificateSignatureRecoverable")]
     pub name_record_sig: ST,
 
-    pub auth_port: NonZeroU16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_port: Option<NonZeroU16>,
 
     #[serde(
         alias = "direct_udp_auth_port",
         skip_serializing_if = "Option::is_none"
     )]
     pub direct_udp_port: Option<NonZeroU16>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Wrapper {
+        address: String,
+    }
+
+    #[test]
+    fn address_deserializes_socket_addr() {
+        let parsed: Wrapper = toml::from_str(r#"address = "127.0.0.1:8000""#).unwrap();
+        assert_eq!(parsed.address, "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn address_deserializes_ip_addr() {
+        let parsed: Wrapper = toml::from_str(r#"address = "127.0.0.2""#).unwrap();
+        assert_eq!(parsed.address, "127.0.0.2");
+    }
 }

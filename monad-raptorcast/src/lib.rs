@@ -1654,7 +1654,11 @@ where
                 return Some(addr);
             }
 
-            Some(SocketAddr::V4(target_name_record.name_record.udp_socket()))
+            target_name_record
+                .name_record
+                .udp_socket()
+                .or(Some(auth_addr))
+                .map(SocketAddr::V4)
         } else {
             // otherwise lookup address using peer-discovery
             let peer_lookup = (&*self.dual_socket, self.peer_disc_driver);

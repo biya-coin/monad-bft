@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{marker::PhantomData, net::SocketAddr, ops::DerefMut, path::PathBuf, task::Poll};
+use std::{marker::PhantomData, ops::DerefMut, path::PathBuf, task::Poll};
 
 use futures::Stream;
 use monad_crypto::certificate_signature::{
@@ -26,10 +26,7 @@ use monad_executor_glue::{
 use monad_node_config::{NodeBootstrapPeerConfig, NodeConfig};
 use monad_types::{ExecutionProtocol, NodeId};
 use monad_validator::signature_collection::SignatureCollection;
-use tokio::{
-    net::lookup_host,
-    sync::mpsc::{error::TrySendError, Receiver, Sender},
-};
+use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
 use tracing::{error, warn};
 pub struct MockConfigLoader<ST, SCT, EPT> {
     _phantom: PhantomData<(ST, SCT, EPT)>,
@@ -205,16 +202,9 @@ where
     ) -> Vec<PeerEntry<ST>> {
         let mut peer_entries = Vec::new();
         for peer in bootstrap_peers {
-            let addr = match resolve_domain_v4(&peer.address).await {
-                Ok(Some(SocketAddr::V4(addr))) => addr,
-                _ => {
-                    warn!("config loader: cannot resolve: {:?}", &peer.address);
-                    continue;
-                }
-            };
             peer_entries.push(PeerEntry {
                 pubkey: peer.secp256k1_pubkey,
-                addr,
+                addr: peer.address,
                 signature: peer.name_record_sig,
                 record_seq_num: peer.record_seq_num,
                 auth_port: peer.auth_port,
@@ -265,17 +255,4 @@ where
     fn metrics(&self) -> monad_executor::ExecutorMetricsChain<'_> {
         Default::default()
     }
-}
-
-async fn resolve_domain_v4(domain: &String) -> Result<Option<SocketAddr>, std::io::Error> {
-    let dns_response = lookup_host(domain).await?;
-
-    for entry in dns_response {
-        match entry {
-            SocketAddr::V4(_) => return Ok(Some(entry)),
-            SocketAddr::V6(_) => continue,
-        }
-    }
-
-    Ok(None)
 }
