@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{net::SocketAddrV4, panic, path::PathBuf};
+use std::{net::Ipv4Addr, panic, path::PathBuf};
 
 use clap::Parser;
 use monad_keystore::keystore::Keystore;
@@ -22,13 +22,16 @@ use monad_peer_discovery::{MonadNameRecord, NameRecord};
 use monad_secp::SecpSignature;
 
 /// Example command to run the following program:
-/// sign-name-record -- --address 0.0.0.0:8888 --authenticated-udp-port 8889 --node-config <...> --keystore-path <...> --password ""
+/// sign-name-record -- --address 0.0.0.0 --authenticated-udp-port 8889 --node-config <...> --keystore-path <...> --password ""
 #[derive(Debug, Parser)]
 #[command(name = "monad-peer-discovery", about)]
 struct Args {
-    /// SocketV4 address in format x.x.x.x:<port>
+    /// IP address in format x.x.x.x
     #[arg(long)]
-    address: SocketAddrV4,
+    address: Ipv4Addr,
+
+    #[arg(long, help = "Optional non-authenticated UDP port")]
+    udp_port: Option<u16>,
 
     #[arg(long, help = "Authenticated UDP port for the name record")]
     authenticated_udp_port: u16,
@@ -76,9 +79,9 @@ fn main() {
     };
     let self_address = args.address;
     let name_record = NameRecord::new_with_ports(
-        *self_address.ip(),
-        self_address.port(),
-        self_address.port(),
+        self_address,
+        args.authenticated_udp_port,
+        args.udp_port,
         args.authenticated_udp_port,
         args.direct_udp_port,
         self_record_seq_num,
@@ -86,8 +89,11 @@ fn main() {
     let signed_name_record: MonadNameRecord<SecpSignature> =
         MonadNameRecord::new(name_record, &keypair);
 
-    println!("self_address = {:?}", self_address.to_string());
+    println!("self_address = {}", self_address);
     println!("self_record_seq_num = {}", self_record_seq_num);
+    if let Some(udp_port) = args.udp_port {
+        println!("self_udp_port = {}", udp_port);
+    }
     println!("self_auth_port = {}", args.authenticated_udp_port);
     if let Some(direct_udp_port) = args.direct_udp_port {
         println!("self_direct_udp_auth_port = {}", direct_udp_port);

@@ -49,12 +49,8 @@ use monad_peer_discovery::{
     discovery::{PeerDiscovery, PeerDiscoveryBuilder},
     MonadNameRecord, NameRecord,
 };
-use monad_peer_score::{ema, IdentityScore, StdClock};
 use monad_pprof::start_pprof_server;
-use monad_raptorcast::{
-    auth::WireAuthProtocol,
-    config::{RaptorCastConfig, RaptorCastConfigPrimary},
-};
+use monad_raptorcast::config::{RaptorCastConfig, RaptorCastConfigPrimary};
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
 use monad_state_backend::StateBackendThreadClient;
@@ -159,17 +155,11 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .qc()
         .get_round()
         + Round(1);
-    let (score_provider, score_reader) =
-        ema::create::<NodeId<CertificateSignaturePubKey<SignatureType>>, StdClock>(
-            node_state.node_config.txpool_peer_score.clone(),
-            StdClock,
-        );
     let router = build_raptorcast_router::<
         SignatureType,
         SignatureCollectionType,
         MonadMessage<SignatureType, SignatureCollectionType, ExecutionProtocolType>,
         VerifiedMonadMessage<SignatureType, SignatureCollectionType, ExecutionProtocolType>,
-        _,
     >(
         node_state.node_config.clone(),
         node_state.node_config.peer_discovery,
@@ -180,7 +170,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         current_epoch,
         current_round,
         node_state.persisted_peers_path,
-        score_reader.clone(),
     );
 
     let statesync_threshold: usize = node_state.node_config.statesync_threshold.into();
@@ -272,8 +261,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 .get_round(),
             // TODO(andr-dev): Use timestamp from last commit in ledger
             0,
-            score_provider,
-            score_reader,
         )
         .expect("txpool ipc succeeds"),
         control_panel: ControlPanelIpcReceiver::new(
@@ -510,7 +497,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     Ok(())
 }
 
-fn build_raptorcast_router<ST, SCT, M, OM, DS>(
+fn build_raptorcast_router<ST, SCT, M, OM>(
     node_config: NodeConfig<ST>,
     peer_discovery_config: PeerDiscoveryConfig<ST>,
     identity: ST::KeyPairType,
@@ -520,15 +507,13 @@ fn build_raptorcast_router<ST, SCT, M, OM, DS>(
     current_epoch: Epoch,
     current_round: Round,
     persisted_peers_path: PathBuf,
-    direct_udp_peer_score_reader: DS,
 ) -> MultiRouter<
     ST,
     M,
     OM,
     MonadEvent<ST, SCT, ExecutionProtocolType>,
     PeerDiscovery<ST>,
-    WireAuthProtocol,
-    DS,
+    monad_raptorcast::auth::WireAuthProtocol,
 >
 where
     ST: CertificateSignatureRecoverable<KeyPairType = monad_secp::KeyPair>,
@@ -540,7 +525,6 @@ where
         + Sync
         + 'static,
     OM: Encodable + Clone + Send + Sync + 'static,
-    DS: IdentityScore<Identity = NodeId<CertificateSignaturePubKey<ST>>>,
 {
     let bind_address = SocketAddr::new(
         IpAddr::V4(node_config.network.bind_address_host),
@@ -550,10 +534,6 @@ where
         IpAddr::V4(node_config.network.bind_address_host),
         node_config.network.authenticated_bind_address_port,
     );
-    let direct_udp_bind_address = node_config
-        .network
-        .direct_udp_bind_address_port
-        .map(|port| SocketAddr::new(IpAddr::V4(node_config.network.bind_address_host), port));
     let Some(SocketAddr::V4(name_record_address)) = resolve_domain_v4(
         &NodeId::new(identity.pubkey()),
         &peer_discovery_config.self_address,
@@ -567,7 +547,6 @@ where
     tracing::debug!(
         ?bind_address,
         ?authenticated_bind_address,
-        ?direct_udp_bind_address,
         ?name_record_address,
         "Monad-node starting, pid: {}",
         process::id()
@@ -590,18 +569,11 @@ where
             network_config.tcp_rate_limit_burst,
         );
 
-    let mut udp_sockets: Vec<(UdpSocketId, std::net::SocketAddr)> = vec![
-        (UdpSocketId::Raptorcast, bind_address),
-        (
+    dp_builder = dp_builder
+        .with_udp_sockets([(
             UdpSocketId::AuthenticatedRaptorcast,
             authenticated_bind_address,
-        ),
-    ];
-    if let Some(direct_addr) = direct_udp_bind_address {
-        udp_sockets.push((UdpSocketId::DirectUdp, direct_addr));
-    }
-    dp_builder = dp_builder
-        .with_udp_sockets(udp_sockets)
+        )])
         .with_tcp_sockets([(TcpSocketId::Raptorcast, bind_address)]);
 
     assert_eq!(
@@ -613,7 +585,7 @@ where
     let self_record = NameRecord::new_with_ports(
         *name_record_address.ip(),
         name_record_address.port(),
-        name_record_address.port(),
+        None,
         peer_discovery_config.self_auth_port,
         peer_discovery_config.self_direct_udp_port,
         peer_discovery_config.self_record_seq_num,
@@ -634,17 +606,10 @@ where
             if node_id == self_id {
                 return None;
             }
-            let address = match resolve_domain_v4(&node_id, &peer.address) {
-                Some(SocketAddr::V4(addr)) => addr,
-                _ => {
-                    warn!(?node_id, ?peer.address, "Unable to resolve");
-                    return None;
-                }
-            };
 
             let peer_entry = monad_executor_glue::PeerEntry {
                 pubkey: peer.secp256k1_pubkey,
-                addr: address,
+                addr: peer.address.clone(),
                 signature: peer.name_record_sig,
                 record_seq_num: peer.record_seq_num,
                 auth_port: peer.auth_port,
@@ -653,8 +618,12 @@ where
 
             match MonadNameRecord::try_from(&peer_entry) {
                 Ok(monad_name_record) => Some((node_id, monad_name_record)),
-                Err(_) => {
-                    warn!(?node_id, "invalid name record signature in config file");
+                Err(error) => {
+                    warn!(
+                        ?node_id,
+                        ?error,
+                        "invalid bootstrap name record in config file"
+                    );
                     None
                 }
             }
@@ -716,18 +685,11 @@ where
 
     let shared_key = Arc::new(identity);
     let wireauth_config = monad_wireauth::Config::default();
-    let auth_protocol = WireAuthProtocol::new(
+    let auth_protocol = monad_raptorcast::auth::WireAuthProtocol::new(
         &monad_raptorcast::auth::metrics::UDP_METRICS,
-        wireauth_config.clone(),
+        wireauth_config,
         shared_key.clone(),
     );
-    let direct_udp_auth_protocol = direct_udp_bind_address.map(|_| {
-        WireAuthProtocol::new(
-            &monad_raptorcast::auth::metrics::DIRECT_UDP_METRICS,
-            wireauth_config.clone(),
-            shared_key.clone(),
-        )
-    });
 
     MultiRouter::new(
         self_id,
@@ -750,8 +712,6 @@ where
         current_epoch,
         epoch_validators,
         auth_protocol,
-        direct_udp_auth_protocol,
-        direct_udp_peer_score_reader,
     )
 }
 

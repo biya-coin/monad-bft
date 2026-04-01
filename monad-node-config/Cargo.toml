@@ -17,6 +17,7 @@ monad-peer-score = { workspace = true }
 monad-secp = { workspace = true, optional = true }
 monad-types = { workspace = true }
 
+alloy-rlp = { workspace = true }
 alloy-primitives = { workspace = true }
 serde = { workspace = true }
 

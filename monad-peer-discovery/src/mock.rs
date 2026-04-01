@@ -16,7 +16,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     marker::PhantomData,
-    net::SocketAddrV4,
+    net::{Ipv4Addr, SocketAddrV4},
 };
 
 use monad_crypto::certificate_signature::{
@@ -238,7 +238,16 @@ where
 
         for peer in peers {
             let node_id = NodeId::new(peer.pubkey);
-            self.known_addresses.insert(node_id, peer.addr);
+            let addr = peer.addr.parse::<SocketAddrV4>().ok().or_else(|| {
+                peer.addr
+                    .parse::<Ipv4Addr>()
+                    .ok()
+                    .zip(peer.auth_port)
+                    .map(|(ip, port)| SocketAddrV4::new(ip, port))
+            });
+            if let Some(addr) = addr {
+                self.known_addresses.insert(node_id, addr);
+            }
         }
 
         Vec::new()

@@ -50,3 +50,25 @@ pub struct NodeBootstrapPeerConfig<ST: CertificateSignatureRecoverable> {
     )]
     pub direct_udp_port: Option<u16>,
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Wrapper {
+        address: String,
+    }
+
+    #[test]
+    fn address_deserializes_socket_addr() {
+        let parsed: Wrapper = toml::from_str(r#"address = "127.0.0.1:8000""#).unwrap();
+        assert_eq!(parsed.address, "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn address_deserializes_ip_addr() {
+        let parsed: Wrapper = toml::from_str(r#"address = "127.0.0.2""#).unwrap();
+        assert_eq!(parsed.address, "127.0.0.2");
+    }
+}

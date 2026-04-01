@@ -637,7 +637,13 @@ fn setup_node(
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
-        known_addresses.insert(*node_id, record.name_record.udp_socket());
+        known_addresses.insert(
+            *node_id,
+            record
+                .name_record
+                .udp_socket()
+                .expect("latency example requires non-auth UDP"),
+        );
     }
 
     let noop_builder = NopDiscoveryBuilder {
