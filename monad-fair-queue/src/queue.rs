@@ -21,10 +21,14 @@ use std::{
 use monad_dynamic_cap::DynamicCapConfig;
 use monad_executor::{ExecutorMetrics, MetricDef};
 
-use crate::{metrics::*, pool::Pool, IdentityScore, PeerStatus, PushError, Score};
+use crate::{metrics::*, pool::Pool, IdentityScore, Len, PeerStatus, PushError, Score};
 
 const DEFAULT_REGULAR_SCORE: Score = Score::ONE;
 const POP_COUNTER_WINDOW: u8 = 100;
+const DEFAULT_PER_ID_LIMIT: usize = 4_000;
+const DEFAULT_MAX_SIZE: usize = 40_000;
+const DEFAULT_PER_ID_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_POOL_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoolKind {
@@ -52,18 +56,26 @@ fn pool_and_score(status: PeerStatus) -> (PoolKind, Score) {
 pub struct FairQueueBuilder {
     per_id_limit: usize,
     max_size: usize,
+    per_id_byte_limit: usize,
+    max_bytes: usize,
     regular_per_id_limit: usize,
     regular_max_size: usize,
+    regular_per_id_byte_limit: usize,
+    regular_max_bytes: usize,
     regular_bandwidth_pct: u8,
 }
 
 impl Default for FairQueueBuilder {
     fn default() -> Self {
         Self {
-            per_id_limit: 4_000,
-            max_size: 40_000,
-            regular_per_id_limit: 4_000,
-            regular_max_size: 40_000,
+            per_id_limit: DEFAULT_PER_ID_LIMIT,
+            max_size: DEFAULT_MAX_SIZE,
+            per_id_byte_limit: DEFAULT_PER_ID_BYTE_LIMIT,
+            max_bytes: DEFAULT_POOL_MAX_BYTES,
+            regular_per_id_limit: DEFAULT_PER_ID_LIMIT,
+            regular_max_size: DEFAULT_MAX_SIZE,
+            regular_per_id_byte_limit: DEFAULT_PER_ID_BYTE_LIMIT,
+            regular_max_bytes: DEFAULT_POOL_MAX_BYTES,
             regular_bandwidth_pct: 10,
         }
     }
@@ -84,6 +96,16 @@ impl FairQueueBuilder {
         self
     }
 
+    pub fn per_id_byte_limit(mut self, limit: usize) -> Self {
+        self.per_id_byte_limit = limit;
+        self
+    }
+
+    pub fn max_bytes(mut self, size: usize) -> Self {
+        self.max_bytes = size;
+        self
+    }
+
     pub fn regular_per_id_limit(mut self, limit: usize) -> Self {
         self.regular_per_id_limit = limit;
         self
@@ -91,6 +113,16 @@ impl FairQueueBuilder {
 
     pub fn regular_max_size(mut self, size: usize) -> Self {
         self.regular_max_size = size;
+        self
+    }
+
+    pub fn regular_per_id_byte_limit(mut self, limit: usize) -> Self {
+        self.regular_per_id_byte_limit = limit;
+        self
+    }
+
+    pub fn regular_max_bytes(mut self, size: usize) -> Self {
+        self.regular_max_bytes = size;
         self
     }
 
@@ -102,24 +134,40 @@ impl FairQueueBuilder {
     pub fn build<S: IdentityScore, T>(self, scorer: S) -> FairQueue<S, T>
     where
         S::Identity: Hash + Eq + Clone + Debug + Display,
+        T: Len,
     {
         assert!(self.per_id_limit > 0, "per_id_limit must be > 0");
         assert!(self.max_size > 0, "max_size must be > 0");
+        assert!(self.per_id_byte_limit > 0, "per_id_byte_limit must be > 0");
+        assert!(self.max_bytes > 0, "max_bytes must be > 0");
         assert!(
             self.regular_per_id_limit > 0,
             "regular_per_id_limit must be > 0"
         );
         assert!(self.regular_max_size > 0, "regular_max_size must be > 0");
+        assert!(
+            self.regular_per_id_byte_limit > 0,
+            "regular_per_id_byte_limit must be > 0"
+        );
+        assert!(self.regular_max_bytes > 0, "regular_max_bytes must be > 0");
         let priority_dynamic_cap_cfg = DynamicCapConfig::default();
         priority_dynamic_cap_cfg.validate();
         let regular_dynamic_cap_cfg = DynamicCapConfig::default();
         regular_dynamic_cap_cfg.validate();
 
         FairQueue {
-            priority_pool: Pool::new(self.per_id_limit, self.max_size, priority_dynamic_cap_cfg),
+            priority_pool: Pool::new(
+                self.per_id_limit,
+                self.max_size,
+                self.per_id_byte_limit,
+                self.max_bytes,
+                priority_dynamic_cap_cfg,
+            ),
             regular_pool: Pool::new(
                 self.regular_per_id_limit,
                 self.regular_max_size,
+                self.regular_per_id_byte_limit,
+                self.regular_max_bytes,
                 regular_dynamic_cap_cfg,
             ),
             scorer,
@@ -131,7 +179,7 @@ impl FairQueueBuilder {
     }
 }
 
-pub struct FairQueue<S: IdentityScore, T> {
+pub struct FairQueue<S: IdentityScore, T: Len> {
     priority_pool: Pool<S::Identity, T>,
     regular_pool: Pool<S::Identity, T>,
     scorer: S,
@@ -141,7 +189,7 @@ pub struct FairQueue<S: IdentityScore, T> {
     metrics: ExecutorMetrics,
 }
 
-impl<S: IdentityScore, T> FairQueue<S, T>
+impl<S: IdentityScore, T: Len> FairQueue<S, T>
 where
     S::Identity: Hash + Eq + Clone + Debug + Display,
 {
@@ -327,11 +375,16 @@ mod tests {
         regular_max_size: usize,
         regular_bandwidth_pct: u8,
     ) -> FairQueue<S, u32> {
+        let item_len = std::mem::size_of::<u32>();
         FairQueueBuilder::new()
             .per_id_limit(per_id_limit)
             .max_size(max_size)
+            .per_id_byte_limit(per_id_limit * item_len)
+            .max_bytes(max_size * item_len)
             .regular_per_id_limit(regular_per_id_limit)
             .regular_max_size(regular_max_size)
+            .regular_per_id_byte_limit(regular_per_id_limit * item_len)
+            .regular_max_bytes(regular_max_size * item_len)
             .regular_bandwidth_pct(regular_bandwidth_pct)
             .build(scorer)
     }

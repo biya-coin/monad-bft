@@ -26,7 +26,7 @@ use monad_dynamic_cap::{
 };
 use tracing::warn;
 
-use crate::{ensure, PushError, Score};
+use crate::{ensure, Len, PushError, Score};
 
 const IDENTITY_QUEUE_SHRINK_RATIO: usize = 2;
 const IDENTITY_QUEUE_SHRINK_FLOOR: usize = 4;
@@ -58,6 +58,7 @@ impl<Id> Ord for HeapEntry<Id> {
 
 struct IdentityState<T> {
     queue: VecDeque<T>,
+    queued_bytes: usize,
     score: Score,
     finish_time: f64,
     dynamic_cap: DynamicCapIdentity,
@@ -73,8 +74,11 @@ pub(crate) struct Pool<Id, T> {
     identities: HashMap<Id, IdentityState<T>>,
     virtual_time: f64,
     total_items: usize,
+    total_bytes: usize,
     max_size: usize,
+    max_bytes: usize,
     per_id_limit: usize,
+    per_id_byte_limit: usize,
     dynamic_cap_cfg: DynamicCapConfig,
     dynamic_cap_enforced: bool,
 }
@@ -82,10 +86,13 @@ pub(crate) struct Pool<Id, T> {
 impl<Id, T> Pool<Id, T>
 where
     Id: Eq + Hash + Clone + Debug + Display,
+    T: Len,
 {
     pub(crate) fn new(
         per_id_limit: usize,
         max_size: usize,
+        per_id_byte_limit: usize,
+        max_bytes: usize,
         dynamic_cap_cfg: DynamicCapConfig,
     ) -> Self {
         Self {
@@ -93,8 +100,11 @@ where
             identities: HashMap::new(),
             virtual_time: 0.0,
             total_items: 0,
+            total_bytes: 0,
             max_size,
+            max_bytes,
             per_id_limit,
+            per_id_byte_limit,
             dynamic_cap_cfg,
             dynamic_cap_enforced: false,
         }
@@ -108,10 +118,16 @@ where
         self.total_items == 0
     }
 
-    pub(crate) fn has_capacity_for(&self, incoming_items: usize) -> bool {
+    pub(crate) fn has_item_capacity_for(&self, incoming_items: usize) -> bool {
         self.total_items
             .checked_add(incoming_items)
             .is_some_and(|next| next <= self.max_size)
+    }
+
+    pub(crate) fn has_byte_capacity_for(&self, incoming_bytes: usize) -> bool {
+        self.total_bytes
+            .checked_add(incoming_bytes)
+            .is_some_and(|next| next <= self.max_bytes)
     }
 
     pub(crate) fn contains_identity(&self, id: &Id) -> bool {
@@ -166,12 +182,14 @@ where
         item: T,
         service_sequence: u64,
     ) -> Result<(), PushError<Id>> {
+        let incoming_bytes = item.len();
         let effective_limit = self.effective_per_id_limit(id, service_sequence, 1);
-        let new_len = self
+        let state = self
             .identities
             .get(id)
-            .map(|state| state.queue.len().saturating_add(1))
             .expect("identity must exist when routed to existing pool");
+        let new_len = state.queue.len().saturating_add(1);
+        let new_queued_bytes = state.queued_bytes.saturating_add(incoming_bytes);
         ensure!(
             new_len <= effective_limit,
             PushError::PerIdLimitExceeded {
@@ -180,10 +198,24 @@ where
             }
         );
         ensure!(
-            self.has_capacity_for(1),
+            new_queued_bytes <= self.per_id_byte_limit,
+            PushError::PerIdLimitExceeded {
+                id: id.clone(),
+                limit: self.per_id_byte_limit,
+            }
+        );
+        ensure!(
+            self.has_item_capacity_for(1),
             PushError::Full {
                 size: self.total_items,
                 max_size: self.max_size,
+            }
+        );
+        ensure!(
+            self.has_byte_capacity_for(incoming_bytes),
+            PushError::Full {
+                size: self.total_bytes,
+                max_size: self.max_bytes,
             }
         );
         let state = self
@@ -191,7 +223,9 @@ where
             .get_mut(id)
             .expect("identity must exist when routed to existing pool");
         state.queue.push_back(item);
+        state.queued_bytes = state.queued_bytes.saturating_add(incoming_bytes);
         self.total_items = self.total_items.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(incoming_bytes);
         let _ = self.refresh_pressure_mode();
         Ok(())
     }
@@ -203,12 +237,23 @@ where
         score: Score,
         service_sequence: u64,
     ) -> Result<(), (PushError<Id>, T)> {
+        let incoming_bytes = item.len();
         ensure!(
-            self.has_capacity_for(1),
+            self.has_item_capacity_for(1),
             (
                 PushError::Full {
                     size: self.total_items,
                     max_size: self.max_size,
+                },
+                item,
+            )
+        );
+        ensure!(
+            self.has_byte_capacity_for(incoming_bytes),
+            (
+                PushError::Full {
+                    size: self.total_bytes,
+                    max_size: self.max_bytes,
                 },
                 item,
             )
@@ -219,12 +264,14 @@ where
             id.clone(),
             IdentityState {
                 queue: VecDeque::from([item]),
+                queued_bytes: incoming_bytes,
                 score,
                 finish_time,
                 dynamic_cap: DynamicCapIdentity::new(service_sequence),
             },
         );
         self.total_items = self.total_items.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(incoming_bytes);
         self.heap.push(HeapEntry { finish_time, id });
         let _ = self.refresh_pressure_mode();
         Ok(())
@@ -235,7 +282,7 @@ where
             let entry = self.heap.pop()?;
             let id = entry.id.clone();
 
-            let (item, next_finish) = {
+            let (item, item_bytes, next_finish) = {
                 let Some(state) = self.identities.get_mut(&id) else {
                     warn!(?id, "heap entry missing identity state");
                     continue;
@@ -257,6 +304,8 @@ where
                         continue;
                     }
                 };
+                let item_bytes = item.len();
+                state.queued_bytes = state.queued_bytes.saturating_sub(item_bytes);
 
                 let next_finish = if state.queue.is_empty() {
                     None
@@ -270,10 +319,11 @@ where
                     state.finish_time = base + state.score.reciprocal();
                     Some(state.finish_time)
                 };
-                (item, next_finish)
+                (item, item_bytes, next_finish)
             };
 
             self.total_items = self.total_items.saturating_sub(1);
+            self.total_bytes = self.total_bytes.saturating_sub(item_bytes);
             self.virtual_time = entry.finish_time;
             let _ = self.refresh_pressure_mode();
 
@@ -333,7 +383,8 @@ mod tests {
 
     #[test]
     fn pop_next_does_not_panic_when_total_items_is_stale() {
-        let mut pool = Pool::new(100, 100, test_cfg());
+        let item_len = std::mem::size_of::<u32>();
+        let mut pool = Pool::new(100, 100, 100 * item_len, 100 * item_len, test_cfg());
         let score = Score::try_from(1.0).unwrap();
         pool.push_new(0u32, 42u32, score, 0).unwrap();
         pool.remove_items(usize::MAX);
@@ -343,7 +394,8 @@ mod tests {
 
     #[test]
     fn rejected_push_does_not_enable_pressure_mode() {
-        let mut pool = Pool::new(1, 10, test_cfg());
+        let item_len = std::mem::size_of::<u32>();
+        let mut pool = Pool::new(1, 10, item_len, 10 * item_len, test_cfg());
         let score = Score::try_from(1.0).unwrap();
 
         for id in 0..7u32 {
@@ -358,7 +410,8 @@ mod tests {
 
     #[test]
     fn partially_drained_identity_shrinks_queue_capacity() {
-        let mut pool = Pool::new(2_048, 4_096, test_cfg());
+        let item_len = std::mem::size_of::<u32>();
+        let mut pool = Pool::new(2_048, 4_096, 2_048 * item_len, 4_096 * item_len, test_cfg());
         let score = Score::try_from(1.0).unwrap();
 
         pool.push_new(0u32, 0u32, score, 0).unwrap();
