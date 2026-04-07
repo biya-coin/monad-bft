@@ -164,7 +164,9 @@ where
         Instant::now() < self.last_round_heartbeat + self.config.invite_accept_heartbeat
     }
 
-    fn validate_prepare_group_message(
+    /// Validate that the invite message itself is well-formed, independent of
+    /// any local group state.
+    fn validate_invite_well_formedness(
         &self,
         invite_msg: &PrepareGroup<CertificateSignaturePubKey<ST>>,
     ) -> bool {
@@ -216,6 +218,16 @@ where
             return false;
         }
 
+        true
+    }
+
+    /// Validate that the invite does not conflict with existing confirmed or
+    /// pending groups (self-overlap from the same validator, or exceeding the
+    /// max number of concurrent groups). Assumes the invite is well-formed.
+    fn validate_group_conflicts(
+        &self,
+        invite_msg: &PrepareGroup<CertificateSignaturePubKey<ST>>,
+    ) -> bool {
         let log_exceed_max_num_group = || {
             debug!(
                 "RaptorCastSecondary rejected invite for rounds \
@@ -275,6 +287,57 @@ where
         true
     }
 
+    /// If the invite overlaps with any already-confirmed group from
+    /// the same validator, that validator may have restarted and have
+    /// its own group map reset. Evict all confirmed groups and
+    /// pending invites from that validator so the new invite may be
+    /// accepted.
+    fn evict_stale_groups_from_restarted_validator(
+        &mut self,
+        invite_msg: &PrepareGroup<CertificateSignaturePubKey<ST>>,
+    ) {
+        let has_overlap = self
+            .confirmed_groups
+            .values(invite_msg.start_round..invite_msg.end_round)
+            .any(|g| g.publisher_id() == &invite_msg.validator_id);
+
+        if !has_overlap {
+            return;
+        }
+
+        // Evict from confirmed_groups
+        let validator_id = &invite_msg.validator_id;
+        let stale_confirmed_groups: Vec<_> = self
+            .confirmed_groups
+            .iter(..)
+            .filter(|(_, g)| g.publisher_id() == validator_id)
+            .map(|(interval, _)| interval.clone())
+            .collect();
+        for interval in &stale_confirmed_groups {
+            self.confirmed_groups.remove(interval.clone());
+        }
+
+        // Evict from pending_confirms
+        let mut empty_rounds = Vec::new();
+        for (&round, invites) in self.pending_confirms.iter_mut() {
+            invites.remove(validator_id);
+            if invites.is_empty() {
+                empty_rounds.push(round);
+            }
+        }
+        for round in empty_rounds {
+            self.pending_confirms.remove(&round);
+        }
+
+        // TODO: discount validator reputation
+        warn!(
+            ?validator_id,
+            evicted_confirmed = stale_confirmed_groups.len(),
+            "RaptorCastSecondary evicted stale groups from restarted \
+             validator",
+        );
+    }
+
     pub fn handle_prepare_group_message(
         &mut self,
         invite_msg: PrepareGroup<CertificateSignaturePubKey<ST>>,
@@ -285,9 +348,15 @@ where
         );
         self.metrics[CLIENT_RECEIVED_INVITES] += 1;
 
-        // Check the invite for duplicates & bandwidth requirements
-        let accept = self.validate_prepare_group_message(&invite_msg);
+        let well_formed = self.validate_invite_well_formedness(&invite_msg);
+        if well_formed {
+            // A validator that restarts will re-send PrepareGroup for rounds it
+            // already has confirmed groups for. Evict the stale groups so the
+            // new invite is not rejected by the self-overlap check.
+            self.evict_stale_groups_from_restarted_validator(&invite_msg);
+        }
 
+        let accept = well_formed && self.validate_group_conflicts(&invite_msg);
         if accept {
             // Let's remember about this invite so that we don't blindly
             // accept any confirmation message.
@@ -601,23 +670,25 @@ mod tests {
         clt.pending_confirms.insert(
             Round(4),
             BTreeMap::from([(
-                nid(2),
+                nid(10),
                 PrepareGroup {
                     max_group_size: 1,
-                    validator_id: nid(2),
+                    validator_id: nid(10),
                     start_round: Round(4),
                     end_round: Round(7),
                 },
             )]),
         );
 
-        let malformed_message = PrepareGroup {
+        // From a third validator so eviction doesn't trigger, but
+        // overlapping with both existing groups -> exceeds max_num_group=2.
+        let message = PrepareGroup {
             max_group_size: 1,
-            validator_id: nid(2),
+            validator_id: nid(11),
             start_round: Round(3),
             end_round: Round(6),
         };
-        let resp = clt.handle_prepare_group_message(malformed_message);
+        let resp = clt.handle_prepare_group_message(message);
         assert!(!resp.accept);
     }
 
@@ -701,6 +772,120 @@ mod tests {
                 .contains_key(&validator_id),
             "Valid NoConfirm should remove the invite from pending_confirms"
         );
+    }
+
+    #[test]
+    fn test_evict_stale_groups_on_validator_restart() {
+        let (clt_tx, _clt_rx): RcToRcChannelGrp = unbounded_channel();
+        let self_id = nid(1);
+        let validator_a = nid(2);
+        let validator_b = nid(3);
+
+        let mut clt = Client::<ST>::new(
+            self_id,
+            clt_tx,
+            RaptorCastConfigSecondaryClient {
+                max_num_group: 5,
+                max_group_size: 50,
+                invite_future_dist_min: Round(1),
+                invite_future_dist_max: Round(200),
+                invite_accept_heartbeat: Duration::from_secs(10),
+            },
+        );
+
+        let make_group = |publisher, start, end| {
+            SecondaryGroupAssignment::new(
+                publisher,
+                RoundSpan::new(Round(start), Round(end)).unwrap(),
+                SecondaryGroup::new([self_id, nid(4), nid(5), nid(6)].into_iter().collect())
+                    .unwrap(),
+            )
+        };
+
+        clt.curr_round = Round(5);
+
+        // Confirm groups from two validators with overlapping intervals.
+        clt.confirmed_groups
+            .insert(Round(10)..Round(60), make_group(validator_a, 10, 60));
+        clt.confirmed_groups
+            .insert(Round(20)..Round(70), make_group(validator_b, 20, 70));
+
+        // Also add a pending invite from validator_a.
+        clt.pending_confirms.insert(
+            Round(80),
+            BTreeMap::from([(
+                validator_a,
+                PrepareGroup {
+                    max_group_size: 10,
+                    validator_id: validator_a,
+                    start_round: Round(80),
+                    end_round: Round(120),
+                },
+            )]),
+        );
+
+        // Validator A restarts and sends a new invite overlapping its
+        // confirmed group [10, 60).
+        let new_invite = PrepareGroup {
+            max_group_size: 10,
+            validator_id: validator_a,
+            start_round: Round(30),
+            end_round: Round(80),
+        };
+        let resp = clt.handle_prepare_group_message(new_invite);
+
+        // The new invite should be accepted (stale groups evicted).
+        assert!(resp.accept);
+        // Only validator_b's confirmed group remains. Check at a round
+        // inside validator_b's interval.
+        clt.curr_round = Round(25);
+        assert_eq!(clt.get_current_group_count(), 1);
+        // validator_a's old pending invite at Round(80) was evicted.
+        assert!(!clt.pending_confirms.contains_key(&Round(80)));
+        // The new invite is now in pending_confirms.
+        assert!(clt.pending_confirms[&Round(30)].contains_key(&validator_a));
+    }
+
+    #[test]
+    fn test_no_eviction_without_overlap() {
+        let (clt_tx, _clt_rx): RcToRcChannelGrp = unbounded_channel();
+        let self_id = nid(1);
+        let validator_a = nid(2);
+
+        let mut clt = Client::<ST>::new(
+            self_id,
+            clt_tx,
+            RaptorCastConfigSecondaryClient {
+                max_num_group: 5,
+                max_group_size: 50,
+                invite_future_dist_min: Round(1),
+                invite_future_dist_max: Round(200),
+                invite_accept_heartbeat: Duration::from_secs(10),
+            },
+        );
+
+        clt.curr_round = Round(15);
+
+        let grp = SecondaryGroupAssignment::new(
+            validator_a,
+            RoundSpan::new(Round(10), Round(50)).unwrap(),
+            SecondaryGroup::new([self_id, nid(4), nid(5), nid(6)].into_iter().collect()).unwrap(),
+        );
+        clt.confirmed_groups.insert(Round(10)..Round(50), grp);
+        assert_eq!(clt.get_current_group_count(), 1);
+
+        // Non-overlapping invite from the same validator -- no eviction.
+        let invite = PrepareGroup {
+            max_group_size: 10,
+            validator_id: validator_a,
+            start_round: Round(50),
+            end_round: Round(80),
+        };
+        let resp = clt.handle_prepare_group_message(invite);
+
+        assert!(resp.accept);
+        // Original confirmed group still present.
+        assert_eq!(clt.get_current_group_count(), 1);
     }
 
     // Creates a node id that we can refer to just from its seed
