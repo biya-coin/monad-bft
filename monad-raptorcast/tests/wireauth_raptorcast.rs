@@ -29,7 +29,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_executor::Executor;
-use monad_executor_glue::{Message, RouterCommand};
+use monad_executor_glue::{Message, PeerEntry, RouterCommand};
 use monad_peer_discovery::{
     driver::PeerDiscoveryDriver, message::Ping, mock::NopDiscovery, MonadNameRecord, NameRecord,
     PeerDiscoveryEvent,
@@ -42,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const PREWARM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const NUM_NODES: usize = 10;
 
 fn init_tracing() {
@@ -572,6 +573,239 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
     }
 }
 
+async fn run_prewarm_establishes_validator_sessions_without_publish() {
+    let alice_info = ValidatorInfo::new(1);
+    let bob_info = ValidatorInfo::new(2);
+
+    let alice_dp = create_dataplane_for_tests(true);
+    let bob_dp = create_dataplane_for_tests(true);
+
+    let alice_auth_addr = alice_dp.auth_addr;
+    let bob_auth_addr = bob_dp.auth_addr;
+    let alice_non_auth_addr = alice_dp.non_auth_addr.expect("non-auth enabled");
+    let bob_non_auth_addr = bob_dp.non_auth_addr.expect("non-auth enabled");
+
+    let name_records: HashMap<_, _> = [
+        (
+            alice_info.nodeid,
+            alice_info.create_name_record(
+                true,
+                alice_dp.tcp_addr,
+                alice_auth_addr,
+                alice_non_auth_addr,
+            ),
+        ),
+        (
+            bob_info.nodeid,
+            bob_info.create_name_record(true, bob_dp.tcp_addr, bob_auth_addr, bob_non_auth_addr),
+        ),
+    ]
+    .into();
+
+    let known_addresses: HashMap<_, _> = [
+        (alice_info.nodeid, alice_non_auth_addr),
+        (bob_info.nodeid, bob_non_auth_addr),
+    ]
+    .into();
+
+    let alice = spawn_wireauth_validator(
+        alice_info.keypair.clone(),
+        alice_dp,
+        known_addresses.clone(),
+        name_records.clone(),
+        vec![(bob_auth_addr, bob_info.pubkey)],
+        DEFAULT_SIG_VERIFICATION_RATE_LIMIT,
+    );
+
+    let bob = spawn_wireauth_validator(
+        bob_info.keypair.clone(),
+        bob_dp,
+        known_addresses,
+        name_records,
+        vec![(alice_auth_addr, alice_info.pubkey)],
+        DEFAULT_SIG_VERIFICATION_RATE_LIMIT,
+    );
+
+    let epoch = Epoch(0);
+    let validator_set: Vec<_> = [
+        (alice_info.nodeid, Stake::ONE),
+        (bob_info.nodeid, Stake::ONE),
+    ]
+    .into();
+
+    for cmd_tx in [&alice.cmd_tx, &bob.cmd_tx] {
+        cmd_tx
+            .send(RouterCommand::AddEpochValidatorSet {
+                epoch,
+                validator_set: validator_set.clone(),
+            })
+            .unwrap();
+    }
+
+    wait_until_ready(PREWARM_CONNECTION_TIMEOUT, [alice.ready_rx, bob.ready_rx]).await;
+}
+
+async fn run_reconnects_when_validator_auth_address_changes() {
+    let alice_info = ValidatorInfo::new(1);
+    let bob_info = ValidatorInfo::new(2);
+
+    let alice_dp = create_dataplane_for_tests(true);
+    let bob1_dp = create_dataplane_for_tests(true);
+    let bob2_dp = create_dataplane_for_tests(false);
+
+    let alice_auth_addr = alice_dp.auth_addr;
+    let bob1_auth_addr = bob1_dp.auth_addr;
+
+    let name_records: HashMap<_, _> = [
+        (
+            alice_info.nodeid,
+            alice_info.create_name_record(
+                true,
+                alice_dp.tcp_addr,
+                alice_auth_addr,
+                alice_dp.non_auth_addr.expect("non-auth enabled"),
+            ),
+        ),
+        (
+            bob_info.nodeid,
+            bob_info.create_name_record(
+                true,
+                bob1_dp.tcp_addr,
+                bob1_auth_addr,
+                bob1_dp.non_auth_addr.expect("non-auth enabled"),
+            ),
+        ),
+    ]
+    .into();
+
+    let known_addresses: HashMap<_, _> = [
+        (
+            alice_info.nodeid,
+            alice_dp.non_auth_addr.expect("non-auth enabled"),
+        ),
+        (
+            bob_info.nodeid,
+            bob1_dp.non_auth_addr.expect("non-auth enabled"),
+        ),
+    ]
+    .into();
+
+    let alice = spawn_wireauth_validator(
+        alice_info.keypair.clone(),
+        alice_dp,
+        known_addresses.clone(),
+        name_records.clone(),
+        vec![(bob1_auth_addr, bob_info.pubkey)],
+        DEFAULT_SIG_VERIFICATION_RATE_LIMIT,
+    );
+
+    let mut bob1 = spawn_wireauth_validator(
+        bob_info.keypair.clone(),
+        bob1_dp,
+        known_addresses,
+        name_records,
+        vec![(alice_auth_addr, alice_info.pubkey)],
+        DEFAULT_SIG_VERIFICATION_RATE_LIMIT,
+    );
+
+    let epoch = Epoch(0);
+    let validator_set: Vec<_> = [
+        (alice_info.nodeid, Stake::ONE),
+        (bob_info.nodeid, Stake::ONE),
+    ]
+    .into();
+
+    for cmd_tx in [&alice.cmd_tx, &bob1.cmd_tx] {
+        cmd_tx
+            .send(RouterCommand::AddEpochValidatorSet {
+                epoch,
+                validator_set: validator_set.clone(),
+            })
+            .unwrap();
+    }
+
+    wait_until_ready(CONNECTION_TIMEOUT, [alice.ready_rx, bob1.ready_rx]).await;
+
+    let bob2_name_record = MonadNameRecord::new(
+        NameRecord::new_with_ports(
+            Ipv4Addr::new(127, 0, 0, 1),
+            bob2_dp.tcp_addr.port(),
+            None,
+            bob2_dp.auth_addr.port(),
+            None,
+            2,
+        ),
+        &*bob_info.keypair,
+    );
+
+    let mut bob2 = spawn_wireauth_validator(
+        bob_info.keypair.clone(),
+        bob2_dp,
+        HashMap::new(),
+        [(bob_info.nodeid, bob2_name_record.clone())].into(),
+        vec![],
+        DEFAULT_SIG_VERIFICATION_RATE_LIMIT,
+    );
+
+    tokio::time::timeout(CONNECTION_TIMEOUT, bob2.ready_rx)
+        .await
+        .expect("bob2 ready timeout")
+        .expect("bob2 ready channel closed");
+
+    alice
+        .cmd_tx
+        .send(RouterCommand::UpdatePeers {
+            peer_entries: vec![PeerEntry::try_from(&bob2_name_record).unwrap()],
+            dedicated_full_nodes: vec![],
+            prioritized_full_nodes: vec![],
+        })
+        .unwrap();
+
+    let start = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut attempt = 0u32;
+    loop {
+        interval.tick().await;
+        attempt += 1;
+
+        let msg_id = 10_000 + attempt;
+        alice
+            .cmd_tx
+            .send(RouterCommand::Publish {
+                target: monad_types::RouterTarget::PointToPoint(bob_info.nodeid),
+                message: MockMessage::new(msg_id, 1_000),
+            })
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut bob1_received = Vec::new();
+        while let Ok(MockEvent((from, id))) = bob1.event_rx.try_recv() {
+            assert_eq!(from, alice_info.nodeid);
+            bob1_received.push(id);
+        }
+
+        let mut bob2_received = Vec::new();
+        while let Ok(MockEvent((from, id))) = bob2.event_rx.try_recv() {
+            assert_eq!(from, alice_info.nodeid);
+            bob2_received.push(id);
+        }
+
+        if bob2_received.contains(&msg_id) {
+            assert!(
+                !bob1_received.contains(&msg_id),
+                "message should not still be delivered to bob1 after address migration"
+            );
+            break;
+        }
+
+        assert!(
+            start.elapsed() < PREWARM_CONNECTION_TIMEOUT,
+            "alice should reconnect to bob2 after bob's authenticated address changes"
+        );
+    }
+}
+
 async fn test_rate_limiting_basic() {
     const NUM_TEST_NODES: usize = 3;
     const RATE_LIMIT: u32 = 10;
@@ -736,6 +970,24 @@ async fn test_rate_limiting_p2p() {
 
     tokio::task::LocalSet::new()
         .run_until(test_rate_limiting_basic())
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_prewarm_establishes_validator_sessions_without_publish() {
+    init_tracing();
+
+    tokio::task::LocalSet::new()
+        .run_until(run_prewarm_establishes_validator_sessions_without_publish())
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_reconnects_when_validator_auth_address_changes() {
+    init_tracing();
+
+    tokio::task::LocalSet::new()
+        .run_until(run_reconnects_when_validator_auth_address_changes())
         .await;
 }
 

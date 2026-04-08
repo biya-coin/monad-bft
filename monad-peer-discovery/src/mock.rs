@@ -238,6 +238,9 @@ where
 
         for peer in peers {
             let node_id = NodeId::new(peer.pubkey);
+            if let Ok(name_record) = MonadNameRecord::try_from(&peer) {
+                self.name_records.insert(node_id, name_record);
+            }
             let addr = peer.addr.parse::<SocketAddrV4>().ok().or_else(|| {
                 peer.addr
                     .parse::<Ipv4Addr>()

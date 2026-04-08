@@ -58,6 +58,7 @@ use monad_validator::{
     signature_collection::SignatureCollection,
     validator_set::{ValidatorSet, ValidatorSetType as _},
 };
+use monad_wireauth::RETRY_ALWAYS;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, debug_span, error, trace, warn};
 use udp::GroupId;
@@ -67,6 +68,7 @@ use util::{
 };
 
 use crate::{
+    auth::AuthenticationProtocol,
     metrics::{
         GAUGE_RAPTORCAST_TOTAL_DESERIALIZE_ERRORS, GAUGE_RAPTORCAST_TOTAL_MESSAGES_RECEIVED,
         GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS,
@@ -91,6 +93,7 @@ pub mod util;
 
 const SIGNATURE_SIZE: usize = 65;
 const DEFAULT_RETRY_ATTEMPTS: u64 = 3;
+const VALIDATOR_SESSION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const UNICAST_MSG_BATCH_SIZE: usize = 32;
 
@@ -102,10 +105,11 @@ where
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     signing_key: Arc<ST::KeyPairType>,
     is_dynamic_fullnode: bool,
+    validator_session_reconcile_timer: tokio::time::Interval,
 
     epoch_validators: BTreeMap<Epoch, ValidatorSet<CertificateSignaturePubKey<ST>>>,
     full_node_groups: FullNodeGroupMap<CertificateSignaturePubKey<ST>>,
@@ -148,13 +152,22 @@ pub enum RaptorCastEvent<E, ST: CertificateSignatureRecoverable> {
     SecondaryRaptorcastPeersUpdate(Round, Vec<NodeId<CertificateSignaturePubKey<ST>>>),
 }
 
+fn validator_session_reconcile_timer() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + VALIDATOR_SESSION_RECONCILE_INTERVAL,
+        VALIDATOR_SESSION_RECONCILE_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 impl<ST, M, OM, SE, PD, AP> RaptorCast<ST, M, OM, SE, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -224,6 +237,7 @@ where
             .redundancy(secondary_redundancy);
 
         Self {
+            validator_session_reconcile_timer: validator_session_reconcile_timer(),
             is_dynamic_fullnode,
             epoch_validators: Default::default(),
             full_node_groups: Default::default(),
@@ -236,7 +250,6 @@ where
             secondary_message_builder: Some(secondary_message_builder),
 
             current_epoch,
-
             udp_state: udp::UdpState::new(
                 self_id,
                 config.udp_message_max_age_ms,
@@ -315,6 +328,33 @@ where
     ) -> bool {
         self.dual_socket
             .is_connected_socket_and_public_key(socket_addr, public_key)
+    }
+
+    fn validator_ids_for_epoch(
+        &self,
+        epoch: Epoch,
+        self_id: NodeId<CertificateSignaturePubKey<ST>>,
+    ) -> HashSet<NodeId<CertificateSignaturePubKey<ST>>> {
+        self.epoch_validators
+            .get(&epoch)
+            .into_iter()
+            .flat_map(|validator_set| validator_set.get_members().keys().copied())
+            .filter(|validator_id| *validator_id != self_id)
+            .collect()
+    }
+
+    fn reconcile_current_epoch_authenticated_validator_sessions(
+        &mut self,
+        self_id: NodeId<CertificateSignaturePubKey<ST>>,
+    ) {
+        let validator_ids = self.validator_ids_for_epoch(self.current_epoch, self_id);
+
+        ensure_authenticated_sessions(
+            &mut self.dual_socket,
+            &self.peer_discovery_driver,
+            validator_ids.iter(),
+            RETRY_ALWAYS,
+        );
     }
 
     fn enqueue_message_to_self(
@@ -728,7 +768,7 @@ where
     M: Message<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Decodable,
     OM: Encodable + Into<M> + Clone,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     type Command = RouterCommand<ST, OM>;
 
@@ -740,6 +780,9 @@ where
                 RouterCommand::UpdateCurrentRound(epoch, round) => {
                     if self.current_epoch < epoch {
                         trace!(?epoch, ?round, "RaptorCast UpdateCurrentRound");
+                        let current_validator_ids =
+                            self.validator_ids_for_epoch(self.current_epoch, self_id);
+                        let next_validator_ids = self.validator_ids_for_epoch(epoch, self_id);
 
                         {
                             let pd_driver = self.peer_discovery_driver.lock().unwrap();
@@ -759,6 +802,12 @@ where
                             self.dataplane_control.update_trusted(added, removed);
                         }
 
+                        for validator_id in current_validator_ids {
+                            if !next_validator_ids.contains(&validator_id) {
+                                self.dual_socket.disconnect(&validator_id.pubkey());
+                            }
+                        }
+
                         self.current_epoch = epoch;
                         self.message_builder.set_group_id(GroupId::Primary(epoch));
                         if let Some(secondary_mb) = self.secondary_message_builder.as_mut() {
@@ -766,6 +815,7 @@ where
                         }
 
                         self.epoch_validators.retain(|e, _| *e + Epoch(1) >= epoch);
+                        self.reconcile_current_epoch_authenticated_validator_sessions(self_id);
                     }
                     self.full_node_groups.delete_expired(round);
                     self.peer_discovery_driver
@@ -798,6 +848,9 @@ where
                         );
                         let removed = self.epoch_validators.insert(epoch, validators);
                         assert!(removed.is_none());
+                    }
+                    if epoch == self.current_epoch {
+                        self.reconcile_current_epoch_authenticated_validator_sessions(self_id);
                     }
                     self.peer_discovery_driver.lock().unwrap().update(
                         PeerDiscoveryEvent::UpdateValidatorSet {
@@ -961,7 +1014,7 @@ where
     OM: Encodable + Into<M> + Clone,
     E: From<RaptorCastEvent<M::Event, ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PeerDiscoveryDriver<PD>: Unpin,
     Self: Unpin,
 {
@@ -979,6 +1032,16 @@ where
 
         if let Some(event) = this.pending_events.pop_front() {
             return Poll::Ready(Some(event.into()));
+        }
+
+        let self_id = NodeId::new(this.signing_key.pubkey());
+
+        while this
+            .validator_session_reconcile_timer
+            .poll_tick(cx)
+            .is_ready()
+        {
+            this.reconcile_current_epoch_authenticated_validator_sessions(self_id);
         }
 
         loop {
@@ -1371,7 +1434,7 @@ where
 struct DualUdpPacketSender<'a, ST, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     dual_socket: &'a mut auth::DualSocketHandle<AP>,
@@ -1391,7 +1454,7 @@ struct TargetNameRecord<'a, ST: CertificateSignatureRecoverable> {
 impl<'a, ST, PD, AP> DualUdpPacketSender<'a, ST, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn new(
@@ -1527,7 +1590,7 @@ where
 impl<'a, ST, PD, AP> Drop for DualUdpPacketSender<'a, ST, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn drop(&mut self) {
@@ -1554,7 +1617,12 @@ where
             }
         } else {
             let targets = self.targets.iter().map(|recipient| recipient.node_id());
-            ensure_authenticated_sessions(self.dual_socket, self.peer_disc_driver, targets);
+            ensure_authenticated_sessions(
+                self.dual_socket,
+                self.peer_disc_driver,
+                targets,
+                DEFAULT_RETRY_ATTEMPTS,
+            );
         }
     }
 }
@@ -1563,7 +1631,7 @@ impl<'a, ST, PD, AP> Collector<UdpMessage<CertificateSignaturePubKey<ST>>>
     for DualUdpPacketSender<'a, ST, PD, AP>
 where
     ST: CertificateSignatureRecoverable,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
 {
     fn push(&mut self, item: UdpMessage<CertificateSignaturePubKey<ST>>) {
@@ -1599,7 +1667,7 @@ fn rebroadcast_packet<ST, PD, AP>(
 ) where
     ST: CertificateSignatureRecoverable,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     // if the packet was created by non-upgraded node we won't be able to fit auth header
     let fits_with_auth_header =
@@ -1635,44 +1703,72 @@ fn rebroadcast_packet<ST, PD, AP>(
         UdpPriority::High,
     );
 
-    ensure_authenticated_sessions(dual_socket, peer_discovery_driver, std::iter::once(target));
+    ensure_authenticated_sessions(
+        dual_socket,
+        peer_discovery_driver,
+        std::iter::once(target),
+        DEFAULT_RETRY_ATTEMPTS,
+    );
 }
 
 fn ensure_authenticated_sessions<'a, ST, PD, AP>(
     dual_socket: &mut auth::DualSocketHandle<AP>,
     peer_discovery_driver: &Arc<Mutex<PeerDiscoveryDriver<PD>>>,
     targets: impl Iterator<Item = &'a NodeId<CertificateSignaturePubKey<ST>>>,
+    retry_attempts: u64,
 ) where
     ST: CertificateSignatureRecoverable,
     PD: PeerDiscoveryAlgo<SignatureType = ST>,
-    AP: auth::AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
 {
     let pd_driver = peer_discovery_driver.lock().unwrap();
 
-    targets
-        .filter_map(|target| {
-            pd_driver
-                .get_name_record(target)
-                .map(|record| (target, record.name_record.authenticated_udp_socket()))
-        })
-        .for_each(|(target, auth_addr)| {
-            if dual_socket.has_any_session_by_public_key(&target.pubkey()) {
-                return;
-            }
+    for target in targets {
+        let Some(auth_addr) = pd_driver
+            .get_name_record(target)
+            .map(|record| record.name_record.authenticated_udp_socket())
+        else {
+            continue;
+        };
+        reconcile_authenticated_session::<ST, AP>(dual_socket, target, auth_addr, retry_attempts);
+    }
+}
 
-            if let Err(e) = dual_socket.connect(
-                &target.pubkey(),
-                SocketAddr::V4(auth_addr),
-                DEFAULT_RETRY_ATTEMPTS,
-            ) {
-                warn!(
-                    target=?target,
-                    auth_addr=?auth_addr,
-                    error=?e,
-                    "failed to initiate connection to authenticated endpoint"
-                );
-            }
-        });
+fn reconcile_authenticated_session<ST, AP>(
+    dual_socket: &mut auth::DualSocketHandle<AP>,
+    target: &NodeId<CertificateSignaturePubKey<ST>>,
+    auth_addr: SocketAddrV4,
+    retry_attempts: u64,
+) where
+    ST: CertificateSignatureRecoverable,
+    AP: AuthenticationProtocol<PublicKey = CertificateSignaturePubKey<ST>>,
+{
+    let public_key = target.pubkey();
+    let desired_addr = SocketAddr::V4(auth_addr);
+
+    if dual_socket.is_connected_socket_and_public_key(&desired_addr, &public_key) {
+        return;
+    }
+
+    if let Some(current_addr) = dual_socket.get_socket_by_public_key(&public_key) {
+        if current_addr == desired_addr {
+            return;
+        }
+
+        dual_socket.disconnect(&public_key);
+    } else if dual_socket.has_any_session_by_public_key(&public_key) {
+        return;
+    }
+
+    if let Err(error) = dual_socket.connect(&public_key, desired_addr, retry_attempts) {
+        warn!(
+            target = ?target,
+            auth_addr = ?auth_addr,
+            error = ?error,
+            "failed to initiate connection to authenticated endpoint"
+        );
+        return;
+    }
 
     dual_socket.flush();
 }
@@ -1680,7 +1776,7 @@ fn ensure_authenticated_sessions<'a, ST, PD, AP>(
 impl<PT, AP> PeerAddrLookup<PT> for auth::DualSocketHandle<AP>
 where
     PT: PubKey,
-    AP: auth::AuthenticationProtocol<PublicKey = PT>,
+    AP: AuthenticationProtocol<PublicKey = PT>,
 {
     fn lookup(&self, node_id: &NodeId<PT>) -> Option<SocketAddr> {
         self.get_socket_by_public_key(&node_id.pubkey())
