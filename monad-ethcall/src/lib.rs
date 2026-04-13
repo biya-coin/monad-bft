@@ -28,6 +28,7 @@ use bindings::monad_executor_result;
 use futures::channel::oneshot::{channel, Sender};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
 use crate::bindings::{add_override_address, monad_block_override, monad_state_override};
 
 #[allow(dead_code, non_camel_case_types, non_upper_case_globals)]
@@ -55,7 +56,6 @@ impl ChainId {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub struct EthCallExecutor {
@@ -669,7 +669,7 @@ pub struct BlockOverride {
 }
 
 pub async fn eth_simulate_v1(
-    chain_id: u64,
+    chain_id: ChainId,
     senders: &Vec<Vec<Address>>,
     calls: &Vec<Vec<TxEnvelope>>,
     block_header: Header,
@@ -691,7 +691,7 @@ pub async fn eth_simulate_v1(
 
     let rlp_encoded_block_id = alloy_rlp::encode(block_id.unwrap_or([0_u8; 32]));
 
-    chain_id.to_ffi_chain_config();
+    let chain_config = chain_id.to_ffi_chain_config();
 
     let state_overrides: Vec<*mut monad_state_override> = overrides
         .iter()
