@@ -129,8 +129,27 @@ impl MetaStore for InMemoryMetaStore {
     }
 
     async fn delete(&self, table: TableId, key: &[u8], cond: DelCond) -> Result<()> {
-        let _ = (table, key, cond);
-        todo!("delete metadata records from the in-memory meta store")
+        let mut guard = self
+            .kv_records
+            .write()
+            .map_err(|_| crate::error::MonadChainDataError::Backend("poisoned lock".to_string()))?;
+
+        let record_key = (table, key.to_vec());
+        match cond {
+            DelCond::Any => {
+                guard.remove(&record_key);
+            }
+            DelCond::IfVersion(version) => {
+                if guard
+                    .get(&record_key)
+                    .is_some_and(|record| record.version == version)
+                {
+                    guard.remove(&record_key);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn scan_delete(
@@ -140,8 +159,27 @@ impl MetaStore for InMemoryMetaStore {
         clustering: &[u8],
         cond: DelCond,
     ) -> Result<()> {
-        let _ = (table, partition, clustering, cond);
-        todo!("delete scannable metadata records from the in-memory meta store")
+        let mut guard = self
+            .scan_records
+            .write()
+            .map_err(|_| crate::error::MonadChainDataError::Backend("poisoned lock".to_string()))?;
+
+        let record_key = (table, partition.to_vec(), clustering.to_vec());
+        match cond {
+            DelCond::Any => {
+                guard.remove(&record_key);
+            }
+            DelCond::IfVersion(version) => {
+                if guard
+                    .get(&record_key)
+                    .is_some_and(|record| record.version == version)
+                {
+                    guard.remove(&record_key);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn scan_list(

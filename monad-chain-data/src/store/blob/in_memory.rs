@@ -65,8 +65,12 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     async fn delete_blob(&self, table: BlobTableId, key: &[u8]) -> Result<()> {
-        let _ = (table, key);
-        todo!("delete blob values from the in-memory blob store")
+        let mut guard = self
+            .blobs
+            .write()
+            .map_err(|_| crate::error::MonadChainDataError::Backend("poisoned lock".to_string()))?;
+        guard.remove(&(table, key.to_vec()));
+        Ok(())
     }
 
     async fn list_prefix(
