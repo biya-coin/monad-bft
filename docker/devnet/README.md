@@ -2,7 +2,7 @@
 
 To start a consensus client, run the following:
 1. Run `bash docker/devnet/clean.sh` to clean all previously generated files
-2. Run `docker build -t monad-node -f docker/devnet/Dockerfile .` to build the docker image for the node
+2. Run `docker build -t monad-node -f docker/devnet/Dockerfile .` to build the docker image for the node (optional: `--build-arg GIT_TAG_VERSION=$(git describe --tags --always)`; default is `dev-local`)
 3. Run `docker run -d --volume $(pwd)/docker/devnet/monad:/monad monad-node` to run the docker container
 
 To start a JsonRpc server, run the following (the consensus node must be first started):

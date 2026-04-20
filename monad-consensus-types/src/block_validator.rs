@@ -43,7 +43,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -99,6 +99,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
+    EPT::FinalizedHeader: Default,
 {
     type BlockValidationError = MockBlockValidationError;
 

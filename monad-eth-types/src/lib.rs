@@ -204,7 +204,15 @@ impl Decodable for ProposedEthHeader {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, RlpEncodableWrapper, RlpDecodableWrapper, Serialize, Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
+    RlpEncodableWrapper,
+    RlpDecodableWrapper,
+    Serialize,
+    Deserialize,
 )]
 pub struct EthHeader(pub Header);
 

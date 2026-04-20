@@ -129,7 +129,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -162,7 +162,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -451,7 +451,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -560,7 +560,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {

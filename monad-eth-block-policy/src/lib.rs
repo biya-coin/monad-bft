@@ -620,7 +620,7 @@ where
     pub fn get_account_base_nonces<'a>(
         &self,
         consensus_block_seq_num: SeqNum,
-        state_backend: &impl StateBackend<ST, SCT>,
+        state_backend: &impl StateBackend<ST, SCT, EthExecutionProtocol>,
         extending_blocks: &Vec<&EthValidatedBlock<ST, SCT>>,
         addresses: impl Iterator<Item = &'a Address>,
     ) -> Result<BTreeMap<&'a Address, Nonce>, StateBackendError> {
@@ -762,7 +762,7 @@ where
 
     fn get_account_statuses<'a>(
         &self,
-        state_backend: &impl StateBackend<ST, SCT>,
+        state_backend: &impl StateBackend<ST, SCT, EthExecutionProtocol>,
         extending_blocks: &Option<&Vec<&EthValidatedBlock<ST, SCT>>>,
         addresses: impl Iterator<Item = &'a Address>,
         base_seq_num: &SeqNum,
@@ -780,7 +780,7 @@ where
     pub fn compute_account_base_balances<'a>(
         &self,
         consensus_block_seq_num: SeqNum,
-        state_backend: &impl StateBackend<ST, SCT>,
+        state_backend: &impl StateBackend<ST, SCT, EthExecutionProtocol>,
         chain_config: &CCT,
         extending_blocks: Option<&Vec<&EthValidatedBlock<ST, SCT>>>,
         addresses: impl Iterator<Item = &'a Address>,
@@ -1133,7 +1133,7 @@ impl<ST, SCT, SBT, CCT, CRT> BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, CCT
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,

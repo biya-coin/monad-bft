@@ -14,15 +14,12 @@ monad-chain-config = { workspace = true }
 monad-consensus-state = { workspace = true }
 monad-consensus-types = { workspace = true }
 monad-control-panel = { workspace = true }
+monad-cosmos-integration = { workspace = true }
 monad-crypto = { workspace = true }
 monad-dataplane = { workspace = true }
-monad-eth-block-policy = { workspace = true }
-monad-eth-block-validator = { workspace = true }
-monad-eth-txpool-executor = { workspace = true }
 monad-executor = { workspace = true }
 monad-executor-glue = { workspace = true }
 monad-keystore = { workspace = true }
-monad-ledger = { workspace = true }
 monad-node-config = { workspace = true, features = ["crypto"] }
 monad-peer-discovery = { workspace = true }
 monad-peer-score = { workspace = true }
@@ -32,9 +29,6 @@ monad-router-multi = { workspace = true}
 monad-secp = { workspace = true }
 monad-state = { workspace = true }
 monad-state-backend = { workspace = true }
-monad-state-backend-cache = { workspace = true }
-monad-statesync = { workspace = true }
-monad-triedb-utils = { workspace = true }
 monad-types = { workspace = true }
 monad-updaters = { workspace = true, features = ["monad-triedb", "tokio"] }
 monad-validator = { workspace = true }
@@ -44,6 +38,7 @@ monad-wireauth = { workspace = true }
 
 agent = { workspace = true }
 alloy-rlp = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }

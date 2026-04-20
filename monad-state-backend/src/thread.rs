@@ -22,8 +22,8 @@ use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
-use monad_types::{BlockId, Epoch, SeqNum, Stake};
+use monad_eth_types::EthAccount;
+use monad_types::{BlockId, Epoch, ExecutionProtocol, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use tracing::warn;
 
@@ -33,10 +33,11 @@ use crate::{StateBackend, StateBackendError};
 // sync context so a value of 16 allows 16 threads to simulatneously make state backend requests.
 const MAX_INFLIGHT_REQUESTS: usize = 16;
 
-enum StateBackendThreadRequest<ST, SCT>
+enum StateBackendThreadRequest<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
     GetAccountStatuses {
         block_id: BlockId,
@@ -49,7 +50,7 @@ where
         block_id: BlockId,
         seq_num: SeqNum,
         is_finalized: bool,
-        tx: mpsc::SyncSender<Result<EthHeader, StateBackendError>>,
+        tx: mpsc::SyncSender<Result<EPT::FinalizedHeader, StateBackendError>>,
     },
     RawReadEarliestFinalizedBlock {
         tx: mpsc::SyncSender<Option<SeqNum>>,
@@ -74,23 +75,25 @@ where
 }
 
 #[derive(Clone)]
-pub struct StateBackendThreadClient<ST, SCT>
+pub struct StateBackendThreadClient<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
     handle: Arc<std::thread::JoinHandle<()>>,
-    request_tx: mpsc::SyncSender<StateBackendThreadRequest<ST, SCT>>,
+    request_tx: mpsc::SyncSender<StateBackendThreadRequest<ST, SCT, EPT>>,
 }
 
-impl<ST, SCT> StateBackendThreadClient<ST, SCT>
+impl<ST, SCT, EPT> StateBackendThreadClient<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
     pub fn new<SBT>(state_backend: impl FnOnce() -> SBT + Send + 'static) -> Self
     where
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         let (request_tx, request_rx) = mpsc::sync_channel(MAX_INFLIGHT_REQUESTS);
 
@@ -103,7 +106,7 @@ where
 
     fn send_and_recv_request<T>(
         &self,
-        request: impl FnOnce(mpsc::SyncSender<T>) -> StateBackendThreadRequest<ST, SCT>,
+        request: impl FnOnce(mpsc::SyncSender<T>) -> StateBackendThreadRequest<ST, SCT, EPT>,
     ) -> T {
         if self.handle.is_finished() {
             panic!("StateBackendThread terminated!");
@@ -119,10 +122,11 @@ where
     }
 }
 
-impl<ST, SCT> StateBackend<ST, SCT> for StateBackendThreadClient<ST, SCT>
+impl<ST, SCT, EPT> StateBackend<ST, SCT, EPT> for StateBackendThreadClient<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -145,7 +149,7 @@ where
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
+    ) -> Result<EPT::FinalizedHeader, StateBackendError> {
         self.send_and_recv_request(|tx| StateBackendThreadRequest::GetExecutionResult {
             block_id: block_id.to_owned(),
             seq_num: seq_num.to_owned(),
@@ -183,27 +187,29 @@ where
     }
 }
 
-struct StateBackendThread<ST, SCT, SBT>
+struct StateBackendThread<ST, SCT, EPT, SBT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    EPT: ExecutionProtocol,
+    SBT: StateBackend<ST, SCT, EPT>,
 {
     state_backend: SBT,
-    request_rx: mpsc::Receiver<StateBackendThreadRequest<ST, SCT>>,
+    request_rx: mpsc::Receiver<StateBackendThreadRequest<ST, SCT, EPT>>,
 
-    _phantom: PhantomData<(ST, SCT)>,
+    _phantom: PhantomData<(ST, SCT, EPT)>,
 }
 
-impl<ST, SCT, SBT> StateBackendThread<ST, SCT, SBT>
+impl<ST, SCT, EPT, SBT> StateBackendThread<ST, SCT, EPT, SBT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    EPT: ExecutionProtocol,
+    SBT: StateBackend<ST, SCT, EPT>,
 {
     fn new(
         state_backend: impl FnOnce() -> SBT + Send + 'static,
-        request_rx: mpsc::Receiver<StateBackendThreadRequest<ST, SCT>>,
+        request_rx: mpsc::Receiver<StateBackendThreadRequest<ST, SCT, EPT>>,
     ) -> Self {
         let state_backend = state_backend();
 

@@ -86,7 +86,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
@@ -121,7 +121,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -355,6 +355,7 @@ where
             CRT,
         >,
     > {
+        let self_nodeid = self.nodeid.to_owned();
         let Some(consensus) = self.try_build_state_wrapper() else {
             match event {
                 MempoolEvent::Proposal { .. } => {
@@ -421,10 +422,18 @@ where
                 }
                 .sign(self.keypair);
 
-                vec![Command::RouterCommand(RouterCommand::Publish {
-                    target: RouterTarget::Raptorcast(epoch),
-                    message: VerifiedMonadMessage::Consensus(msg),
-                })]
+                vec![
+                    Command::LoopbackCommand(LoopbackCommand::Forward(
+                        MonadEvent::ConsensusEvent(ConsensusEvent::Message {
+                            sender: self_nodeid,
+                            unverified_message: msg.clone().into(),
+                        }),
+                    )),
+                    Command::RouterCommand(RouterCommand::Publish {
+                        target: RouterTarget::Raptorcast(epoch),
+                        message: VerifiedMonadMessage::Consensus(msg),
+                    }),
+                ]
             }
             MempoolEvent::ForwardedTxs { sender, txs } => {
                 vec![Command::TxPoolCommand(TxPoolCommand::InsertForwardedTxs {
@@ -645,7 +654,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -673,7 +682,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {

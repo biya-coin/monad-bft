@@ -104,6 +104,8 @@ To run a Monad consensus client, follow instructions [here](monad-node/README.md
  
 To run a JsonRpc server, follow instructions [here](monad-rpc/README.md).
 
+For the Cosmos ABCI integration debugging flow, see [docs/monad-cosmos-abci-debugging.md](docs/monad-cosmos-abci-debugging.md).
+
 ## Architecture
 
 ```mermaid

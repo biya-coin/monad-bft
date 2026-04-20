@@ -199,7 +199,7 @@ impl<S> EthTxPoolForwardingManagerProjected<'_, S> {
     ) where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
         CertificateSignaturePubKey<ST>: ExtractEthAddress,
         CCT: ChainConfig<CRT>,
         CRT: ChainRevision,

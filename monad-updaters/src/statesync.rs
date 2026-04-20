@@ -28,7 +28,7 @@ use monad_executor_glue::{
     MonadEvent, StateSyncCommand, StateSyncEvent, StateSyncNetworkMessage, StateSyncRequest,
     StateSyncResponse, StateSyncUpsertType, StateSyncUpsertV1, SELF_STATESYNC_VERSION,
 };
-use monad_state_backend::{InMemoryState, StateBackend};
+use monad_state_backend::InMemoryState;
 use monad_types::{ExecutionProtocol, FinalizedHeader, NodeId, SeqNum, GENESIS_SEQ_NUM};
 use monad_validator::signature_collection::SignatureCollection;
 
@@ -138,7 +138,7 @@ where
                             return;
                         }
                         let state = self.state_backend.lock().unwrap();
-                        let latest_finalized = state.raw_read_latest_finalized_block();
+                        let latest_finalized = state.latest_finalized_seq_num();
                         if latest_finalized.is_some_and(|latest_finalized| {
                             request.target.saturating_add(self.max_service_window.0)
                                 < latest_finalized.0

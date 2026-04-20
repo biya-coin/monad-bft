@@ -1,0 +1,16 @@
+[package]
+name = "monad-cosmos-types"
+version = "0.1.0"
+edition = "2021"
+description = "Cosmos execution protocol types for Monad consensus"
+
+[dependencies]
+monad-cometbft-proto = { workspace = true }
+monad-types = { workspace = true }
+
+alloy-rlp = { workspace = true, features = ["arrayvec"] }
+bytes = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_with = { workspace = true, features = ["hex"] }
+sha2 = { workspace = true }

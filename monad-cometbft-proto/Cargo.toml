@@ -1,0 +1,15 @@
+[package]
+name = "monad-cometbft-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Generated Rust bindings for CometBFT ABCI protos"
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true, features = ["codegen", "prost"] }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+tonic-build = { workspace = true, features = ["prost"] }

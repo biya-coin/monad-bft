@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package gogoproto;
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FileOptions {
+  bool goproto_getters_all = 62001;
+  bool equal_all = 62002;
+}
+
+extend google.protobuf.MessageOptions {
+  bool compare = 63001;
+  bool equal = 63002;
+  bool populate = 63003;
+}
+
+extend google.protobuf.FieldOptions {
+  bool nullable = 64001;
+  bool stdtime = 64002;
+  bool stdduration = 64003;
+  string jsontag = 64004;
+  string customname = 64005;
+}
+
+extend google.protobuf.EnumOptions {
+  bool goproto_enum_prefix = 65001;
+  bool goproto_enum_stringer = 65002;
+}
+
+extend google.protobuf.EnumValueOptions {
+  string enumvalue_customname = 66001;
+}

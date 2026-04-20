@@ -63,15 +63,24 @@ RUN apt update && apt install -y \
   libboost-stacktrace1.83-dev \
   libboost1.83-dev
 
+
+ENV HTTP_PROXY="http://192.168.2.107:7897" \
+  HTTPS_PROXY="http://192.168.2.107:7897" \
+  NO_PROXY="localhost,127.0.0.1,::1" \
+  http_proxy="http://192.168.2.107:7897" \
+  https_proxy="http://192.168.2.107:7897" \
+  no_proxy="localhost,127.0.0.1,::1"
+
+
 # install cargo
 ARG CARGO_ROOT="/root/.cargo"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
+RUN bash -lc "set -o pipefail && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y"
 ENV PATH="${CARGO_ROOT}/bin:$PATH"
 RUN rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu
 ARG TRIEDB_TARGET=triedb_driver
 
-ARG GIT_TAG_VERSION
-RUN test -n "$GIT_TAG_VERSION"
+# CI 可传 --build-arg GIT_TAG_VERSION=$(git describe --tags)；本地省略时用默认值
+ARG GIT_TAG_VERSION=dev-local
 ENV MONAD_VERSION=$GIT_TAG_VERSION
 
 ARG GIT_COMMIT=""
@@ -87,14 +96,20 @@ ENV GIT_MODIFIED=$GIT_MODIFIED
 # Builder
 COPY . .
 RUN ASMFLAGS="-march=haswell" CFLAGS="-march=haswell -fno-omit-frame-pointer" CXXFLAGS="-march=haswell -fno-omit-frame-pointer" \
-    RUSTFLAGS="-C target-cpu=haswell -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo build --release --bin monad-node --bin monad-keystore --bin monad-debug-node --example ledger-tail --example wal2json --example triedb-bench --example sign-name-record && \
+    RUSTFLAGS="-C target-cpu=haswell -C force-frame-pointers=yes" CC=gcc-15 CXX=g++-15 cargo build --release \
+      -p monad-node --bin monad-node --example ledger-tail \
+      -p monad-keystore --bin monad-keystore \
+      -p monad-debug-node --bin monad-debug-node \
+      -p monad-peer-discovery --bin sign-name-record \
+      -p monad-wal --example wal2json \
+      -p monad-triedb-utils --example triedb-bench && \
     mv target/release/monad-node monad-node && \
     mv target/release/monad-keystore keystore && \
     mv target/release/monad-debug-node monad-debug-node && \
+    mv target/release/sign-name-record sign-name-record && \
     mv target/release/examples/ledger-tail ledger-tail && \
     mv target/release/examples/wal2json wal2json && \
     mv target/release/examples/triedb-bench triedb-bench && \
-    mv target/release/examples/sign-name-record sign-name-record && \
     cp `ls -Lt $(find target/release | grep -e "libtriedb_driver.so")` . && \
     ldd $(ls -Lt $(find target/release | grep -e "libtriedb_driver.so")) | docker/filter-dependent-shared-objects.py | xargs -I {} cp {} .
 
@@ -102,7 +117,8 @@ RUN ASMFLAGS="-march=haswell" CFLAGS="-march=haswell -fno-omit-frame-pointer" CX
 FROM base AS runner
 
 WORKDIR /usr/src/monad-bft
-ENV LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+# 不展开 $LD_LIBRARY_PATH：base 镜像未定义时会触发 BuildKit UndefinedVar 警告
+ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 

@@ -14,10 +14,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use alloy_primitives::Address;
+use monad_cosmos_types::CosmosExecutionProtocol;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{serde::deserialize_eth_address_from_str, EthExecutionProtocol};
+use monad_eth_types::serde::deserialize_eth_address_from_str;
 use monad_peer_score::ema;
 use serde::Deserialize;
 
@@ -84,7 +85,7 @@ pub type SignatureType = monad_secp::SecpSignature;
 #[cfg(feature = "crypto")]
 pub type SignatureCollectionType =
     monad_bls::BlsSignatureCollection<CertificateSignaturePubKey<SignatureType>>;
-pub type ExecutionProtocolType = EthExecutionProtocol;
+pub type ExecutionProtocolType = CosmosExecutionProtocol;
 #[cfg(feature = "crypto")]
 pub type ForkpointConfig = monad_consensus_types::checkpoint::Checkpoint<
     SignatureType,

@@ -32,16 +32,16 @@ use monad_chain_config::ChainConfig;
 use monad_consensus_state::ConsensusConfig;
 use monad_consensus_types::{metrics::Metrics, validator_data::ValidatorSetDataWithEpoch};
 use monad_control_panel::ipc::ControlPanelIpcReceiver;
+use monad_cosmos_integration::{
+    cosmos_txpool_ipc, CosmosBlockPolicy, CosmosBlockValidator, CosmosCommitStore, CosmosLedger,
+    CosmosStateBackend, CosmosTxPoolExecutor,
+};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
-use monad_eth_block_policy::EthBlockPolicy;
-use monad_eth_block_validator::EthBlockValidator;
-use monad_eth_txpool_executor::{EthTxPoolExecutor, EthTxPoolIpcConfig};
 use monad_executor::{Executor, ExecutorMetricsChain};
-use monad_executor_glue::{LogFriendlyMonadEvent, Message, MonadEvent};
-use monad_ledger::MonadBlockFileLedger;
+use monad_executor_glue::{Command, LogFriendlyMonadEvent, Message, MonadEvent, TxPoolCommand};
 use monad_node_config::{
     ExecutionProtocolType, FullNodeIdentityConfig, NodeBootstrapConfig, NodeConfig,
     PeerDiscoveryConfig, SignatureCollectionType, SignatureType,
@@ -58,15 +58,12 @@ use monad_raptorcast::{
 };
 use monad_router_multi::MultiRouter;
 use monad_state::{MonadMessage, MonadStateBuilder, VerifiedMonadMessage};
-use monad_state_backend::StateBackendThreadClient;
-use monad_state_backend_cache::StateBackendCache;
-use monad_statesync::StateSync;
-use monad_triedb_utils::TriedbReader;
-use monad_types::{DropTimer, Epoch, NodeId, Round, SeqNum, GENESIS_SEQ_NUM};
+use monad_state_backend::InMemoryStateInner;
+use monad_types::{DropTimer, Epoch, NodeId, Round, SeqNum};
 use monad_updaters::{
     config_file::ConfigFile, config_loader::ConfigLoader, loopback::LoopbackExecutor,
-    parent::ParentExecutor, timer::TokioTimer, tokio_timestamp::TokioTimestamp,
-    triedb_val_set::ValSetUpdater,
+    parent::ParentExecutor, statesync::MockStateSyncExecutor, timer::TokioTimer,
+    tokio_timestamp::TokioTimestamp, val_set::MockValSetUpdaterNop,
 };
 use monad_validator::{
     signature_collection::SignatureCollection, validator_set::ValidatorSetFactory,
@@ -76,6 +73,7 @@ use monad_wal::wal::WALoggerConfig;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+use bytes::Bytes;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, event, info, warn, Instrument, Level};
 
@@ -190,93 +188,55 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     _ = std::fs::remove_file(node_state.control_panel_ipc_path.as_path());
     _ = std::fs::remove_file(node_state.statesync_ipc_path.as_path());
 
-    // FIXME this is super jank... we should always just pass the 1 file in monad-node
-    let mut statesync_triedb_path = node_state.triedb_path.clone();
-    if let Ok(files) = std::fs::read_dir(&statesync_triedb_path) {
-        let mut files: Vec<_> = files.collect();
-        assert_eq!(files.len(), 1, "nothing in triedb path");
-        statesync_triedb_path = files
-            .pop()
-            .unwrap()
-            .expect("failed to read triedb path")
-            .path();
-    }
-
     let mut bootstrap_nodes = Vec::new();
     for peer_config in &node_state.node_config.bootstrap.peers {
         let peer_id = NodeId::new(peer_config.secp256k1_pubkey);
         bootstrap_nodes.push(peer_id);
     }
 
-    let state_sync_init_peers = node_state
-        .node_config
-        .statesync
-        .init_peers
-        .into_iter()
-        .map(|p| NodeId::new(p.secp256k1_pubkey))
-        .collect();
-
-    // TODO: use PassThruBlockPolicy and NopStateBackend for consensus only mode
-    let create_block_policy = || {
-        EthBlockPolicy::new(
-            GENESIS_SEQ_NUM, // FIXME: MonadStateBuilder is responsible for updating this to forkpoint root if necessary
-            EXECUTION_DELAY,
-        )
-    };
-
-    let state_backend = StateBackendThreadClient::new({
-        let triedb_path = node_state.triedb_path.clone();
-
-        move || {
-            let triedb_handle =
-                TriedbReader::try_new(triedb_path.as_path()).expect("triedb should exist in path");
-
-            StateBackendCache::new(triedb_handle, SeqNum(EXECUTION_DELAY))
-        }
-    });
+    let abci_endpoint = std::env::var("MONAD_ABCI_ENDPOINT")
+        .or_else(|_| std::env::var("MONAD_ABCI_GRPC_ENDPOINT"))
+        .unwrap_or_else(|_| "unix:///tmp/biyachain-abci.sock".to_owned());
+    let cosmos_genesis_path = std::env::var("MONAD_COSMOS_GENESIS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                .join(".biyachaind/config/genesis.json")
+        });
+    let mut genesis_store = CosmosCommitStore::new(node_state.ledger_path.join("cosmos-commits"))
+        .expect("cosmos commit store should initialize");
+    genesis_store
+        .ensure_genesis_from_cosmos_genesis(&abci_endpoint, &cosmos_genesis_path)
+        .expect("cosmos genesis should initialize commit store");
+    genesis_store
+        .sync_with_abci_app(&abci_endpoint)
+        .expect("cosmos commit store should match ABCI app height (see docs/monad-cosmos-abci-debugging.md if this fails)");
+    let commit_store = Arc::new(std::sync::Mutex::new(genesis_store));
+    let create_block_policy = || CosmosBlockPolicy;
+    let state_backend = CosmosStateBackend::new(commit_store.clone());
 
     let mut executor = ParentExecutor {
         metrics: Default::default(),
         router,
         timer: TokioTimer::default(),
-        ledger: MonadBlockFileLedger::new(node_state.ledger_path),
+        ledger: CosmosLedger::new(node_state.ledger_path.clone()),
         config_file: ConfigFile::new(
             node_state.forkpoint_path,
             node_state.validators_path.clone(),
             node_state.chain_config,
         ),
-        val_set: ValSetUpdater::new(
-            node_state.validators_path,
+        val_set: MockValSetUpdaterNop::new(
+            locked_epoch_validators
+                .first()
+                .expect("locked validators should exist")
+                .validators
+                .clone(),
             node_state.chain_config.get_epoch_length(),
-            node_state.chain_config.get_staking_activation(),
-            state_backend.clone(),
         ),
         timestamp: TokioTimestamp::new(Duration::from_millis(5), 100, 10001),
-        txpool: EthTxPoolExecutor::start(
-            create_block_policy(),
-            state_backend.clone(),
-            EthTxPoolIpcConfig {
-                bind_path: node_state.mempool_ipc_path,
-                tx_batch_size: node_state.node_config.ipc_tx_batch_size as usize,
-                max_queued_batches: node_state.node_config.ipc_max_queued_batches as usize,
-                queued_batches_watermark: node_state.node_config.ipc_queued_batches_watermark
-                    as usize,
-            },
-            // TODO(andr-dev): Add tx_expiry to node config
-            Duration::from_secs(15),
-            Duration::from_secs(5 * 60),
-            node_state.chain_config,
-            node_state
-                .forkpoint_config
-                .high_certificate
-                .qc()
-                .get_round(),
-            // TODO(andr-dev): Use timestamp from last commit in ledger
-            0,
-            score_provider,
-            score_reader,
-        )
-        .expect("txpool ipc succeeds"),
+        txpool: CosmosTxPoolExecutor::new(abci_endpoint.clone(), commit_store.clone()),
         control_panel: ControlPanelIpcReceiver::new(
             node_state.control_panel_ipc_path,
             node_state.reload_handle,
@@ -284,22 +244,12 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         )
         .expect("uds bind failed"),
         loopback: LoopbackExecutor::default(),
-        state_sync: StateSync::<SignatureType, SignatureCollectionType>::new(
-            vec![statesync_triedb_path.to_string_lossy().to_string()],
-            node_state.statesync_sq_thread_cpu,
-            state_sync_init_peers,
-            node_state
-                .node_config
-                .statesync_max_concurrent_requests
-                .into(),
-            STATESYNC_REQUEST_TIMEOUT,
-            STATESYNC_REQUEST_TIMEOUT,
-            node_state
-                .statesync_ipc_path
-                .to_str()
-                .expect("invalid file name")
-                .to_owned(),
-        ),
+        state_sync: MockStateSyncExecutor::new(
+            InMemoryStateInner::<SignatureType, SignatureCollectionType>::genesis(SeqNum(
+                EXECUTION_DELAY,
+            )),
+        )
+        .with_max_service_window(SeqNum(statesync_threshold as u64)),
         config_loader: ConfigLoader::new(node_state.node_config_path),
     };
 
@@ -343,10 +293,12 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 
     let mut last_ledger_tip: Option<SeqNum> = None;
 
+    let local_node_id = NodeId::new(node_state.secp256k1_identity.pubkey());
+
     let builder = MonadStateBuilder {
         validator_set_factory: ValidatorSetFactory::default(),
         leader_election: WeightedRoundRobin::default(),
-        block_validator: EthBlockValidator::default(),
+        block_validator: CosmosBlockValidator::new(abci_endpoint),
         block_policy: create_block_policy(),
         state_backend,
         key: node_state.secp256k1_identity,
@@ -376,6 +328,31 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 
     let (mut state, init_commands) = builder.build();
     executor.exec(init_commands);
+
+    enum CosmosTxpoolIpcIngress {
+        Active(tokio::sync::mpsc::Receiver<Vec<Bytes>>),
+        Inactive,
+    }
+
+    let mut cosmos_txpool_ipc_ingress = match cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_server(
+        node_state.mempool_ipc_path.clone(),
+    ) {
+        Ok(rx) => {
+            info!(
+                path = %node_state.mempool_ipc_path.display(),
+                "Cosmos raw-tx IPC listening (same path as ETH mempool.sock; feed signed SDK bytes)"
+            );
+            CosmosTxpoolIpcIngress::Active(rx)
+        }
+        Err(e) => {
+            warn!(
+                ?e,
+                path = %node_state.mempool_ipc_path.display(),
+                "Cosmos txpool IPC bind failed; inbound txs only via P2P forward path"
+            );
+            CosmosTxpoolIpcIngress::Inactive
+        }
+    };
 
     let mut ledger_span = tracing::info_span!(
         "ledger_span",
@@ -437,6 +414,29 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 let executor_metrics = executor.metrics();
                 send_metrics(otel_meter, &mut gauge_cache, state_metrics, executor_metrics, &process_start, &total_state_update_elapsed);
             }
+
+            maybe_cosmos_txs = async {
+                match &mut cosmos_txpool_ipc_ingress {
+                    CosmosTxpoolIpcIngress::Active(rx) => rx.recv().await,
+                    CosmosTxpoolIpcIngress::Inactive => std::future::pending().await,
+                }
+            }, if matches!(cosmos_txpool_ipc_ingress, CosmosTxpoolIpcIngress::Active(_)) => {
+                match maybe_cosmos_txs {
+                    Some(txs) => {
+                        executor.exec(vec![Command::TxPoolCommand(
+                            TxPoolCommand::InsertForwardedTxs {
+                                sender: local_node_id,
+                                txs,
+                            },
+                        )]);
+                    }
+                    None => {
+                        warn!("Cosmos txpool IPC channel closed");
+                        cosmos_txpool_ipc_ingress = CosmosTxpoolIpcIngress::Inactive;
+                    }
+                }
+            }
+
             event = executor.next().instrument(ledger_span.clone()) => {
                 let Some(event) = event else {
                     event!(Level::ERROR, "parent executor returned none!");

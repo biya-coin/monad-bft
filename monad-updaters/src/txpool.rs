@@ -74,7 +74,7 @@ pub trait MockableTxPool:
         Self::ChainConfig,
         Self::ChainRevision,
     >;
-    type StateBackend: StateBackend<Self::Signature, Self::SignatureCollection>;
+    type StateBackend: StateBackend<Self::Signature, Self::SignatureCollection, Self::ExecutionProtocol>;
 
     type Event;
 
@@ -113,7 +113,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT> + StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -134,7 +134,7 @@ impl<ST, SCT, BPT, SBT, CCT, CRT> Default
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, MockExecutionProtocol> + StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT> + Default,
     CRT: ChainRevision,
 {
@@ -166,7 +166,7 @@ impl<ST, SCT, SBT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
@@ -201,7 +201,7 @@ impl<ST, SCT, BPT, SBT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, MockExecutionProtocol> + StateBackend<ST, SCT, EthExecutionProtocol>,
 {
     pub fn with_chain_params(mut self, chain_params: &'static ChainParams) -> Self {
         self.chain_config = MockChainConfig::new(chain_params);
@@ -223,7 +223,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, MockExecutionProtocol> + StateBackend<ST, SCT, EthExecutionProtocol>,
 {
     type Command =
         TxPoolCommand<ST, SCT, MockExecutionProtocol, BPT, SBT, MockChainConfig, MockChainRevision>;
@@ -305,7 +305,7 @@ impl<ST, SCT, SBT> Executor
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
     type Command = TxPoolCommand<
@@ -472,7 +472,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT> + StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 
@@ -504,7 +504,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     BPT: BlockPolicy<ST, SCT, MockExecutionProtocol, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, MockExecutionProtocol> + StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 
@@ -545,7 +545,7 @@ impl<ST, SCT, SBT> MockableTxPool
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 
     Self: Executor<

@@ -1,3 +1,10 @@
 [submodule "monad-execution"]
 	path = monad-execution
 	url = https://github.com/category-labs/monad.git
+[submodule "biyachain-core"]
+	path = biyachain-core
+	url = https://github.com/biya-coin/biyachain-core
+	branch = feat/convert_market_order_to_atomic_monad
+[submodule "cometbft"]
+	path = cometbft
+	url = https://github.com/biya-coin/cometbft

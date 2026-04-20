@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{net::SocketAddrV4, panic, path::PathBuf};
+use std::{net::SocketAddrV4, path::PathBuf};
 
 use clap::Parser;
 use monad_keystore::keystore::Keystore;
@@ -21,10 +21,9 @@ use monad_node_config::MonadNodeConfig;
 use monad_peer_discovery::{MonadNameRecord, NameRecord};
 use monad_secp::SecpSignature;
 
-/// Example command to run the following program:
 /// sign-name-record -- --address 0.0.0.0:8888 --authenticated-udp-port 8889 --node-config <...> --keystore-path <...> --password ""
 #[derive(Debug, Parser)]
-#[command(name = "monad-peer-discovery", about)]
+#[command(name = "sign-name-record", about = "Sign a peer discovery name record for node.toml")]
 struct Args {
     /// SocketV4 address in format x.x.x.x:<port>
     #[arg(long)]
@@ -71,8 +70,9 @@ fn main() {
             toml::from_str(&contents).expect("Invalid format in node toml file");
         node_config.peer_discovery.self_record_seq_num + 1
     } else {
-        args.self_record_seq_num
-            .unwrap_or_else(|| panic!("Either node_config or self_record_seq_num must be provided"))
+        args.self_record_seq_num.expect(
+            "Either node_config or self_record_seq_num must be provided",
+        )
     };
     let self_address = args.address;
     let name_record = NameRecord::new_with_ports(

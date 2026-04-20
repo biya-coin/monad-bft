@@ -49,7 +49,7 @@ pub struct TrackedTxMap<ST, SCT, SBT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
 {
     // By using IndexMap, we can iterate through the map with Vec-like performance and are able to
     // evict expired txs through the entry API.
@@ -64,7 +64,7 @@ impl<ST, SCT, SBT, CCT, CRT> TrackedTxMap<ST, SCT, SBT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,

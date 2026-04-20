@@ -82,7 +82,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -154,7 +154,7 @@ pub struct EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     TIS: EthTxPoolTxInputStream,
@@ -184,7 +184,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
-    SBT: StateBackend<ST, SCT> + Send + 'static,
+    SBT: StateBackend<ST, SCT, EPT> + Send + 'static,
     CCT: ChainConfig<CRT> + Send + 'static,
     CRT: ChainRevision + Send + 'static,
     Self: Unpin,
@@ -267,7 +267,7 @@ impl<ST, SCT, SBT, CCT, CRT, TIS> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
@@ -395,7 +395,7 @@ impl<ST, SCT, SBT, CCT, CRT, TIS> Executor for EthTxPoolExecutor<ST, SCT, SBT, C
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
@@ -582,7 +582,7 @@ impl<ST, SCT, SBT, CCT, CRT, TIS> Stream for EthTxPoolExecutor<ST, SCT, SBT, CCT
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,

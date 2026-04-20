@@ -25,39 +25,41 @@ use itertools::Itertools;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
+use monad_eth_types::EthAccount;
 use monad_state_backend::{StateBackend, StateBackendError};
-use monad_types::{BlockId, DropTimer, Epoch, SeqNum, Stake};
+use monad_types::{BlockId, DropTimer, Epoch, ExecutionProtocol, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use tracing::warn;
 
 #[derive(Debug)]
-struct BlockCache {
+struct BlockCache<EPT: ExecutionProtocol> {
     seq_num: SeqNum,
     accounts: BTreeMap<Address, Option<EthAccount>>,
-    execution_result: Option<EthHeader>,
+    execution_result: Option<EPT::FinalizedHeader>,
 }
 
 #[derive(Debug)]
-pub struct StateBackendCache<ST, SCT, SBT>
+pub struct StateBackendCache<ST, SCT, SBT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
+    EPT: ExecutionProtocol,
 {
     // used so that StateBackendCache can maintain a logically immutable interface
-    cache: Arc<Mutex<HashMap<BlockId, BlockCache>>>,
+    cache: Arc<Mutex<HashMap<BlockId, BlockCache<EPT>>>>,
     state_backend: SBT,
     execution_delay: SeqNum,
 
-    _phantom: PhantomData<(ST, SCT)>,
+    _phantom: PhantomData<(ST, SCT, EPT)>,
 }
 
-impl<ST, SCT, SBT> StateBackendCache<ST, SCT, SBT>
+impl<ST, SCT, SBT, EPT> StateBackendCache<ST, SCT, SBT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
+    EPT: ExecutionProtocol,
 {
     pub fn new(state_backend: SBT, execution_delay: SeqNum) -> Self {
         Self {
@@ -69,11 +71,12 @@ where
     }
 }
 
-impl<ST, SCT, SBT> StateBackend<ST, SCT> for StateBackendCache<ST, SCT, SBT>
+impl<ST, SCT, SBT, EPT> StateBackend<ST, SCT, EPT> for StateBackendCache<ST, SCT, SBT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
+    EPT: ExecutionProtocol,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -162,7 +165,7 @@ where
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
+    ) -> Result<EPT::FinalizedHeader, StateBackendError> {
         let mut cache = self.cache.lock().unwrap();
 
         if let Some(block_cache) = cache.get(block_id) {

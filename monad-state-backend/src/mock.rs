@@ -15,13 +15,12 @@
 
 use std::collections::BTreeMap;
 
-use alloy_consensus::Header;
 use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
-use monad_types::{Balance, BlockId, Nonce, SeqNum, Stake};
+use monad_eth_types::EthAccount;
+use monad_types::{Balance, BlockId, ExecutionProtocol, Nonce, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 
 use crate::{StateBackend, StateBackendError};
@@ -32,10 +31,12 @@ pub struct NopStateBackend {
     pub balances: BTreeMap<Address, Balance>,
 }
 
-impl<ST, SCT> StateBackend<ST, SCT> for NopStateBackend
+impl<ST, SCT, EPT> StateBackend<ST, SCT, EPT> for NopStateBackend
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
+    EPT::FinalizedHeader: Default,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -61,8 +62,8 @@ where
         _block_id: &BlockId,
         _seq_num: &SeqNum,
         _is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
-        Ok(EthHeader(Header::default()))
+    ) -> Result<EPT::FinalizedHeader, StateBackendError> {
+        Ok(EPT::FinalizedHeader::default())
     }
 
     /// Fetches earliest block from storage backend
@@ -77,8 +78,8 @@ where
 
     fn read_valset_at_block(
         &self,
-        block_num: SeqNum,
-        requested_epoch: monad_types::Epoch,
+        _block_num: SeqNum,
+        _requested_epoch: monad_types::Epoch,
     ) -> Vec<(
         <SCT as SignatureCollection>::NodeIdPubKey,
         SignatureCollectionPubKeyType<SCT>,

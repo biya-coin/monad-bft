@@ -20,8 +20,8 @@ use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
-use monad_types::{BlockId, Epoch, Round, SeqNum, Stake};
+use monad_eth_types::{EthAccount, EthExecutionProtocol};
+use monad_types::{BlockId, Epoch, ExecutionProtocol, Round, SeqNum, Stake};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 
 pub use self::{
@@ -43,10 +43,11 @@ pub enum StateBackendError {
 }
 
 /// Backend provider of account data: balance and nonce
-pub trait StateBackend<ST, SCT>
+pub trait StateBackend<ST, SCT, EPT = EthExecutionProtocol>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -61,7 +62,7 @@ where
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError>;
+    ) -> Result<EPT::FinalizedHeader, StateBackendError>;
 
     /// Fetches earliest block from storage backend
     fn raw_read_earliest_finalized_block(&self) -> Option<SeqNum>;
@@ -94,11 +95,12 @@ where
     fn ledger_commit(&mut self, block_id: &BlockId, seq_num: &SeqNum);
 }
 
-impl<ST, SCT, T> StateBackend<ST, SCT> for Arc<Mutex<T>>
+impl<ST, SCT, EPT, T> StateBackend<ST, SCT, EPT> for Arc<Mutex<T>>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    T: StateBackend<ST, SCT>,
+    EPT: ExecutionProtocol,
+    T: StateBackend<ST, SCT, EPT>,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -116,7 +118,7 @@ where
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
+    ) -> Result<EPT::FinalizedHeader, StateBackendError> {
         let state = self.lock().unwrap();
         state.get_execution_result(block_id, seq_num, is_finalized)
     }

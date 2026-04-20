@@ -343,7 +343,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -421,6 +421,7 @@ where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
+    EPT::FinalizedHeader: Default,
 {
     type ValidatedBlock = PassthruWrappedBlock<ST, SCT, EPT>;
 
@@ -614,6 +615,13 @@ pub struct MockExecutionBody {
 pub struct MockExecutionFinalizedHeader {
     number: SeqNum,
 }
+impl Default for MockExecutionFinalizedHeader {
+    fn default() -> Self {
+        Self {
+            number: GENESIS_SEQ_NUM,
+        }
+    }
+}
 impl FinalizedHeader for MockExecutionFinalizedHeader {
     fn seq_num(&self) -> SeqNum {
         self.number
@@ -633,7 +641,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -667,7 +675,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {

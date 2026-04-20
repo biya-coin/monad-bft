@@ -81,7 +81,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -115,7 +115,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT> + PartialEq,
     CRT: ChainRevision + PartialEq,
 {
@@ -134,7 +134,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT> + Debug,
     CRT: ChainRevision + Debug,
 {
@@ -170,7 +170,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
@@ -248,7 +248,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -387,7 +387,7 @@ where
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
     BPT: BlockPolicy<ST, SCT, EPT, SBT, CCT, CRT>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EPT>,
     VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     BVT: BlockValidator<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
@@ -2119,7 +2119,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<
             ST,
             SCT,
@@ -2166,7 +2166,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<
             ST,
             SCT,
@@ -2447,7 +2447,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT> + MockExecution<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT> + MockExecution<ST, SCT>,
         BVT: BlockValidator<ST, SCT, EthExecutionProtocol, BPT, SBT, MockChainConfig, MockChainRevision>,
         VTF: ValidatorSetTypeFactory<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Clone,
         LT: LeaderElection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Clone,
@@ -2597,7 +2597,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.into_iter()
             .filter_map(|c| match c {
@@ -2630,7 +2630,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.into_iter()
             .filter_map(|c| match c {
@@ -2663,7 +2663,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.into_iter()
             .filter_map(|c| match c {
@@ -2696,7 +2696,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.into_iter()
             .filter_map(|c| match c {
@@ -2724,7 +2724,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>
             + std::fmt::Debug,
-        SBT: StateBackend<ST, SCT> + std::fmt::Debug,
+        SBT: StateBackend<ST, SCT, EPT> + std::fmt::Debug,
     {
         cmds.iter()
             .find_map(|c| match c {
@@ -2751,7 +2751,7 @@ mod test {
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         BPT: BlockPolicy<ST, SCT, EthExecutionProtocol, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.into_iter()
             .filter_map(|c| match c {
@@ -2769,7 +2769,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter().find_map(|c| match c {
             ConsensusCommand::Publish {
@@ -2791,7 +2791,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter().find(|c| match c {
             ConsensusCommand::Publish {
@@ -2810,7 +2810,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter()
             .filter_map(|c| match c {
@@ -2830,7 +2830,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter()
             .find(|c| matches!(c, ConsensusCommand::RequestSync { .. }))
@@ -2844,7 +2844,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter()
             .filter_map(|c| match c {
@@ -2864,7 +2864,7 @@ mod test {
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
         BPT: BlockPolicy<ST, SCT, EPT, SBT, MockChainConfig, MockChainRevision>,
-        SBT: StateBackend<ST, SCT>,
+        SBT: StateBackend<ST, SCT, EPT>,
     {
         cmds.iter()
             .find(|c| matches!(c, ConsensusCommand::TimestampUpdate(_)))

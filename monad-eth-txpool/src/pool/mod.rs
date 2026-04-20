@@ -77,7 +77,7 @@ pub struct EthTxPool<ST, SCT, SBT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
 {
@@ -94,7 +94,7 @@ impl<ST, SCT, SBT, CCT, CRT> EthTxPool<ST, SCT, SBT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
@@ -731,7 +731,7 @@ impl<ST, SCT, SBT> EthTxPool<ST, SCT, SBT, MockChainConfig, MockChainRevision>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
-    SBT: StateBackend<ST, SCT>,
+    SBT: StateBackend<ST, SCT, EthExecutionProtocol>,
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
 {
     pub fn default_testing() -> Self {

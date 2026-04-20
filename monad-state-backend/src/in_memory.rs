@@ -22,15 +22,15 @@ use std::{
     },
 };
 
-use alloy_consensus::{transaction::SignerRecoverable as _, Header, Transaction, TxEnvelope};
+use alloy_consensus::{transaction::SignerRecoverable as _, Transaction, TxEnvelope};
 use alloy_primitives::Address;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_eth_types::{EthAccount, EthHeader};
+use monad_eth_types::EthAccount;
 use monad_types::{
-    Balance, BlockId, Epoch, Nonce, Round, SeqNum, Stake, GENESIS_BLOCK_ID, GENESIS_ROUND,
-    GENESIS_SEQ_NUM,
+    Balance, BlockId, Epoch, ExecutionProtocol, Nonce, Round, SeqNum, Stake, GENESIS_BLOCK_ID,
+    GENESIS_ROUND, GENESIS_SEQ_NUM,
 };
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,10 @@ where
         self.commits.get(block)
     }
 
+    pub fn latest_finalized_seq_num(&self) -> Option<SeqNum> {
+        self.commits.last_key_value().map(|(block, _)| *block)
+    }
+
     pub fn reset_state(&mut self, state: InMemoryBlockState) {
         self.proposals = Default::default();
         self.commits = std::iter::once((state.seq_num, state)).collect();
@@ -215,7 +219,9 @@ where
 
         if seq_num
             <= self
-                .raw_read_latest_finalized_block()
+                .commits
+                .last_key_value()
+                .map(|(block, _)| *block)
                 .expect("latest_finalized doesn't exist")
         {
             return; //already finalized
@@ -417,7 +423,9 @@ where
 
         if *seq_num
             <= self
-                .raw_read_latest_finalized_block()
+                .commits
+                .last_key_value()
+                .map(|(block, _)| *block)
                 .expect("latest_finalized doesn't exist")
         {
             return; //already finalized
@@ -453,10 +461,12 @@ where
     }
 }
 
-impl<ST, SCT> StateBackend<ST, SCT> for InMemoryStateInner<ST, SCT>
+impl<ST, SCT, EPT> StateBackend<ST, SCT, EPT> for InMemoryStateInner<ST, SCT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
+    EPT::FinalizedHeader: Default,
 {
     fn get_account_statuses<'a>(
         &self,
@@ -467,11 +477,15 @@ where
     ) -> Result<Vec<Option<EthAccount>>, StateBackendError> {
         let state = if is_finalized
             && self
-                .raw_read_latest_finalized_block()
+                .commits
+                .last_key_value()
+                .map(|(block, _)| *block)
                 .is_some_and(|latest_finalized| &latest_finalized >= seq_num)
         {
             if self
-                .raw_read_earliest_finalized_block()
+                .commits
+                .first_key_value()
+                .map(|(block, _)| *block)
                 .is_some_and(|earliest_finalized| &earliest_finalized > seq_num)
             {
                 return Err(StateBackendError::NeverAvailable);
@@ -509,14 +523,18 @@ where
         block_id: &BlockId,
         seq_num: &SeqNum,
         is_finalized: bool,
-    ) -> Result<EthHeader, StateBackendError> {
+    ) -> Result<EPT::FinalizedHeader, StateBackendError> {
         let block = if is_finalized
             && self
-                .raw_read_latest_finalized_block()
+                .commits
+                .last_key_value()
+                .map(|(block, _)| *block)
                 .is_some_and(|latest_seq_num| &latest_seq_num >= seq_num)
         {
             if self
-                .raw_read_earliest_finalized_block()
+                .commits
+                .first_key_value()
+                .map(|(block, _)| *block)
                 .is_some_and(|earliest_finalized| &earliest_finalized > seq_num)
             {
                 return Err(StateBackendError::NeverAvailable);
@@ -531,11 +549,7 @@ where
         assert_eq!(&block.block_id, block_id);
         assert_eq!(&block.seq_num, seq_num);
 
-        Ok(EthHeader(Header {
-            number: block.seq_num.0,
-            gas_limit: self.extra_data,
-            ..Default::default()
-        }))
+        Ok(EPT::FinalizedHeader::default())
     }
 
     fn raw_read_earliest_finalized_block(&self) -> Option<SeqNum> {
