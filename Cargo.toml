@@ -1,7 +1,16 @@
 [workspace]
 resolver = "2"
 members = ["monad-*"]
-exclude = ["monad-execution", "monad-scripts", "monad-fuzz"]
+exclude = [
+  "monad-execution",
+  "monad-scripts",
+  "monad-fuzz",
+  # 与 monad-* 通配符冲突：勿在仓库根创建名为 monad-a~d 的数据目录；若已存在则排除
+  "monad-a",
+  "monad-b",
+  "monad-c",
+  "monad-d",
+]
 
 [profile.dev]
 opt-level = 1

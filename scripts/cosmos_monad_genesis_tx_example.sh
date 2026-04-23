@@ -2,8 +2,11 @@
 # 从 genesis.json 读取链 ID、denom、创世账户；演示「查询」与「转账」并生成可交给 monad-node 的 tx.raw。
 #
 # 前置：
-#   - 已用 biyachain-core/scripts/init-standalone-abci.sh（或等价流程）生成 BIYAHOME，且 key 名为 validator（可改 KEY_NAME）
-#   - transfer 需要 keyring 里已有名为 recipient 的收款 key（须手动 keys add，勿依赖脚本自动生成）
+#   - BIYAHOME 下 config/genesis.json 与 monad 使用的 MONAD_COSMOS_GENESIS_PATH 为同一条链
+#   - 发送方：keyring 中 $KEY_NAME（默认 validator）对应地址须在 genesis 的 bank 中有记录。
+#     多节点合并 genesis 时 bank[0] 常不是本机 key，故请先 export KEY_NAME=val-a 等；若该 key 存在，脚本以其地址
+#     为 FROM，不再用 bank[0]。
+#   - 收款方：keyring 中须有名為 recipient 的 key（须手动 keys add，勿由脚本自动创建）
 #   - 已编译：biyachaind、cargo build -p monad-cosmos-integration --bin cosmos-txpool-feed
 #
 # 用法：
@@ -45,12 +48,19 @@ die() { echo "error: $*" >&2; exit 1; }
 CHAIN_ID="$(jq -r '.chain_id' "$GENESIS")"
 [[ -n "$CHAIN_ID" && "$CHAIN_ID" != "null" ]] || die "genesis 中无 chain_id"
 
-# 创世注资账户：取 bank balances 第一条（与 init 脚本「单验证人 + add-genesis-account」一致）
-FROM_ADDR="$(jq -r '.app_state.bank.balances[0].address // empty' "$GENESIS")"
-[[ -n "$FROM_ADDR" ]] || die "无法从 genesis 解析 app_state.bank.balances[0].address"
-
-DENOM="$(jq -r '.app_state.bank.balances[0].coins[0].denom // empty' "$GENESIS")"
-[[ -n "$DENOM" ]] || die "无法从 genesis 解析 denom"
+# 发送方地址、denom、account_number（多节点：bank[0] 与「本机 val-a」常不一致，故优先用 keyring 中 KEY_NAME）
+if "${BIYACHAIND_BIN}" keys show "$KEY_NAME" --home "$BIYAHOME" --keyring-backend "$KEYRING_BACKEND" &>/dev/null; then
+  FROM_ADDR="$("${BIYACHAIND_BIN}" keys show "$KEY_NAME" -a --home "$BIYAHOME" --keyring-backend "$KEYRING_BACKEND")"
+  DENOM="$(
+    jq -r --arg a "$FROM_ADDR" '.app_state.bank.balances[]? | select(.address == $a) | .coins[0].denom // empty' "$GENESIS" | head -1
+  )"
+  [[ -n "$DENOM" ]] || die "genesis 的 bank 中无地址 $FROM_ADDR（KEY_NAME=$KEY_NAME 与当前 genesis 是否同一条链？）"
+else
+  FROM_ADDR="$(jq -r '.app_state.bank.balances[0].address // empty' "$GENESIS")"
+  [[ -n "$FROM_ADDR" ]] || die "无法从 genesis 解析 app_state.bank.balances[0].address"
+  DENOM="$(jq -r '.app_state.bank.balances[0].coins[0].denom // empty' "$GENESIS")"
+  [[ -n "$DENOM" ]] || die "无法从 genesis 解析 denom"
+fi
 
 # account_number：从 auth 账户里找与 FROM_ADDR 匹配的 BaseAccount（兼容多种 JSON 形态）
 if [[ -z "${ACCOUNT_NUMBER:-}" ]]; then
@@ -65,7 +75,7 @@ if [[ -z "${ACCOUNT_NUMBER:-}" ]]; then
     ' "$GENESIS" | head -1
   )"
 fi
-[[ -n "${ACCOUNT_NUMBER:-}" ]] || die "无法从 genesis 解析 ACCOUNT_NUMBER，请手动 export ACCOUNT_NUMBER=…"
+[[ -n "${ACCOUNT_NUMBER:-}" ]] || die "无法从 genesis 为 $FROM_ADDR 解析 ACCOUNT_NUMBER，请手动 export ACCOUNT_NUMBER=…"
 
 # 从 app.toml 读取 [grpc] enable / address（供提示与默认连接地址）
 read_app_toml_grpc() {
@@ -210,12 +220,14 @@ build_transfer_tx() {
   if ! "${BIYACHAIND_BIN}" keys show "$KEY_NAME" --home "$BIYAHOME" --keyring-backend "$KEYRING_BACKEND" &>/dev/null; then
     die "keyring 里找不到发送方密钥「${KEY_NAME}」: key not found
 
-原因：genesis 里的注资地址来自 init 时生成的 key，但当前 \$BIYAHOME 里没有同名 key。
+本脚本会签名「genesis 中第一条 app_state.bank.balances」的地址: ${FROM_ADDR}
+（多节点/level-b 常见为 val-a、val-b；单节点 init-standalone-abci 默认为 validator。）
 
 处理：
-  - 确认 export BIYAHOME= 与 init-standalone-abci.sh 时一致（同一目录）
-  - 或 export KEY_NAME= 你本机 keys list 里存在的、且对应 genesis 注资地址的 key 名
-  - 若换了新 home，需重新 init 并 gentx，或从备份恢复 key"
+  - 列出 key，找到地址等于上面地址的条目，再: export KEY_NAME=该条目的名字
+      ${BIYACHAIND_BIN} keys list --home \"\${BIYAHOME}\" --keyring-backend ${KEYRING_BACKEND}
+  - 确认 export BIYAHOME= 与当时生成本 genesis 的目录一致
+  - 若曾丢失 keyring、仍有助记词: ${BIYACHAIND_BIN} keys add \"\${KEY_NAME}\" --recover --home \"\${BIYAHOME}\" --keyring-backend ${KEYRING_BACKEND}"
   fi
 
   mkdir -p "$OUT_DIR"

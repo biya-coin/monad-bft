@@ -1,0 +1,309 @@
+services:
+  biyachaind-a:
+    image: golang:1.23-bookworm
+    working_dir: /chain
+    volumes:
+      - ./biyachain-home-a:/chain:rw
+      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-lib:/biyachain-lib:ro
+      - abci-a:/shared:rw
+    ports:
+      - "19900:9900"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/biyachain-lib
+        chmod +x /usr/local/bin/biyachaind
+        rm -f /shared/abci.sock
+        exec /usr/local/bin/biyachaind start \
+          --home /chain \
+          --with-comet=false \
+          --transport socket \
+          --address unix:///shared/abci.sock \
+          --grpc.enable=true \
+          --grpc.address=0.0.0.0:9900 \
+          --json-rpc.enable=false \
+          --minimum-gas-prices 1byb
+
+  monad-a:
+    image: monad-node:local
+    depends_on: [biyachaind-a]
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
+      MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
+      RUST_LOG: info
+    volumes:
+      - ./monad-a:/monad:rw
+      - ./genesis.json.reference:/monad/genesis.json:ro
+      - abci-a:/shared:rw
+    networks:
+      monad_net:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "18000:8000"
+      - "18001:8001"
+ 
+    command:
+      - monad-node
+      - --secp-identity
+      - /monad/id-secp
+      - --bls-identity
+      - /monad/id-bls
+      - --node-config
+      - /monad/node.toml
+      - --forkpoint-config
+      - /monad/forkpoint.toml
+      - --validators-path
+      - /monad/validators.toml
+      - --wal-path
+      - /monad/wal
+      - --mempool-ipc-path
+      - /monad/mempool.sock
+      - --control-panel-ipc-path
+      - /monad/controlpanel.sock
+      - --ledger-path
+      - /monad/ledger
+      - --statesync-ipc-path
+      - /monad/statesync.sock
+      - --triedb-path
+      - /monad
+      - --persisted-peers-path
+      - /monad/peers.toml
+
+  biyachaind-b:
+    image: golang:1.23-bookworm
+    working_dir: /chain
+    volumes:
+      - ./biyachain-home-b:/chain:rw
+      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-lib:/biyachain-lib:ro
+      - abci-b:/shared:rw
+    ports:
+      - "29900:9900"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/biyachain-lib
+        chmod +x /usr/local/bin/biyachaind
+        rm -f /shared/abci.sock
+        exec /usr/local/bin/biyachaind start \
+          --home /chain \
+          --with-comet=false \
+          --transport socket \
+          --address unix:///shared/abci.sock \
+          --grpc.enable=true \
+          --grpc.address=0.0.0.0:9900 \
+          --json-rpc.enable=false \
+          --minimum-gas-prices 1byb
+
+  monad-b:
+    image: monad-node:local
+    depends_on: [biyachaind-b]
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
+      MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
+      RUST_LOG: info
+    volumes:
+      - ./monad-b:/monad:rw
+      - ./genesis.json.reference:/monad/genesis.json:ro
+      - abci-b:/shared:rw
+    networks:
+      monad_net:
+        ipv4_address: 172.28.0.20
+    ports:
+      - "28000:8000"
+      - "28001:8001"
+    command:
+      - monad-node
+      - --secp-identity
+      - /monad/id-secp
+      - --bls-identity
+      - /monad/id-bls
+      - --node-config
+      - /monad/node.toml
+      - --forkpoint-config
+      - /monad/forkpoint.toml
+      - --validators-path
+      - /monad/validators.toml
+      - --wal-path
+      - /monad/wal
+      - --mempool-ipc-path
+      - /monad/mempool.sock
+      - --control-panel-ipc-path
+      - /monad/controlpanel.sock
+      - --ledger-path
+      - /monad/ledger
+      - --statesync-ipc-path
+      - /monad/statesync.sock
+      - --triedb-path
+      - /monad
+      - --persisted-peers-path
+      - /monad/peers.toml
+
+  biyachaind-c:
+    image: golang:1.23-bookworm
+    working_dir: /chain
+    volumes:
+      - ./biyachain-home-c:/chain:rw
+      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-lib:/biyachain-lib:ro
+      - abci-c:/shared:rw
+    ports:
+      - "39900:9900"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/biyachain-lib
+        chmod +x /usr/local/bin/biyachaind
+        rm -f /shared/abci.sock
+        exec /usr/local/bin/biyachaind start \
+          --home /chain \
+          --with-comet=false \
+          --transport socket \
+          --address unix:///shared/abci.sock \
+          --grpc.enable=true \
+          --grpc.address=0.0.0.0:9900 \
+          --json-rpc.enable=false \
+          --minimum-gas-prices 1byb
+
+  monad-c:
+    image: monad-node:local
+    depends_on: [biyachaind-c]
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
+      MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
+      RUST_LOG: info
+    volumes:
+      - ./monad-c:/monad:rw
+      - ./genesis.json.reference:/monad/genesis.json:ro
+      - abci-c:/shared:rw
+    ports:
+      - "38000:8000"
+      - "38001:8001"
+    networks:
+      monad_net:
+        ipv4_address: 172.28.0.30
+    command:
+      - monad-node
+      - --secp-identity
+      - /monad/id-secp
+      - --bls-identity
+      - /monad/id-bls
+      - --node-config
+      - /monad/node.toml
+      - --forkpoint-config
+      - /monad/forkpoint.toml
+      - --validators-path
+      - /monad/validators.toml
+      - --wal-path
+      - /monad/wal
+      - --mempool-ipc-path
+      - /monad/mempool.sock
+      - --control-panel-ipc-path
+      - /monad/controlpanel.sock
+      - --ledger-path
+      - /monad/ledger
+      - --statesync-ipc-path
+      - /monad/statesync.sock
+      - --triedb-path
+      - /monad
+      - --persisted-peers-path
+      - /monad/peers.toml
+
+  biyachaind-d:
+    image: golang:1.23-bookworm
+    working_dir: /chain
+    volumes:
+      - ./biyachain-home-d:/chain:rw
+      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-lib:/biyachain-lib:ro
+      - abci-d:/shared:rw
+    ports:
+      - "49900:9900"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/biyachain-lib
+        chmod +x /usr/local/bin/biyachaind
+        rm -f /shared/abci.sock
+        exec /usr/local/bin/biyachaind start \
+          --home /chain \
+          --with-comet=false \
+          --transport socket \
+          --address unix:///shared/abci.sock \
+          --grpc.enable=true \
+          --grpc.address=0.0.0.0:9900 \
+          --json-rpc.enable=false \
+          --minimum-gas-prices 1byb
+
+  monad-d:
+    image: monad-node:local
+    depends_on: [biyachaind-d]
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
+      MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
+      RUST_LOG: info
+    volumes:
+      - ./monad-d:/monad:rw
+      - ./genesis.json.reference:/monad/genesis.json:ro
+      - abci-d:/shared:rw
+    networks:
+      monad_net:
+        ipv4_address: 172.28.0.40
+    ports:
+      - "48000:8000"
+      - "48001:8001"
+    command:
+      - monad-node
+      - --secp-identity
+      - /monad/id-secp
+      - --bls-identity
+      - /monad/id-bls
+      - --node-config
+      - /monad/node.toml
+      - --forkpoint-config
+      - /monad/forkpoint.toml
+      - --validators-path
+      - /monad/validators.toml
+      - --wal-path
+      - /monad/wal
+      - --mempool-ipc-path
+      - /monad/mempool.sock
+      - --control-panel-ipc-path
+      - /monad/controlpanel.sock
+      - --ledger-path
+      - /monad/ledger
+      - --statesync-ipc-path
+      - /monad/statesync.sock
+      - --triedb-path
+      - /monad
+      - --persisted-peers-path
+      - /monad/peers.toml
+networks:
+  monad_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+volumes:
+  abci-a:
+  abci-b:
+  abci-c:
+  abci-d:
