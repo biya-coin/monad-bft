@@ -25,3 +25,5 @@ perf.data*
 **/proptest-regressions/
 /reports
 deployed_contracts.json
+
+.monad

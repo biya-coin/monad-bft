@@ -4,7 +4,7 @@ services:
     working_dir: /chain
     volumes:
       - ./biyachain-home-a:/chain:rw
-      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-core/bin/biyachaind:/usr/local/bin/biyachaind
       - ./biyachain-lib:/biyachain-lib:ro
       - abci-a:/shared:rw
     ports:
@@ -79,7 +79,7 @@ services:
     working_dir: /chain
     volumes:
       - ./biyachain-home-b:/chain:rw
-      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-core/bin/biyachaind:/usr/local/bin/biyachaind
       - ./biyachain-lib:/biyachain-lib:ro
       - abci-b:/shared:rw
     ports:
@@ -153,7 +153,7 @@ services:
     working_dir: /chain
     volumes:
       - ./biyachain-home-c:/chain:rw
-      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-core/bin/biyachaind:/usr/local/bin/biyachaind
       - ./biyachain-lib:/biyachain-lib:ro
       - abci-c:/shared:rw
     ports:
@@ -227,7 +227,7 @@ services:
     working_dir: /chain
     volumes:
       - ./biyachain-home-d:/chain:rw
-      - ./biyachaind:/usr/local/bin/biyachaind
+      - ./biyachain-core/bin/biyachaind:/usr/local/bin/biyachaind
       - ./biyachain-lib:/biyachain-lib:ro
       - abci-d:/shared:rw
     ports:

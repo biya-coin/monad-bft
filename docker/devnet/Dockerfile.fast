@@ -1,0 +1,40 @@
+# 轻量级 Dockerfile - 使用宿主机编译好的二进制文件
+# 用法: docker build -t monad-node:local -f docker/devnet/Dockerfile.fast .
+
+FROM ubuntu:22.04
+
+# 安装运行时依赖
+RUN apt update && apt install -y \
+  libboost-atomic1.74.0 \
+  libboost-container1.74.0 \
+  libboost-fiber1.74.0 \
+  libboost-filesystem1.74.0 \
+  libboost-graph1.74.0 \
+  libboost-regex1.74.0 \
+  libstdc++6 \
+  libgmp10 \
+  liburing2 \
+  libzstd1 \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/monad-bft
+
+# 设置环境变量
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
+# 从宿主机拷贝编译好的二进制文件
+COPY target/release/monad-node /usr/local/bin/monad-node
+COPY target/release/monad-keystore /usr/local/bin/keystore
+COPY target/release/sign-name-record /usr/local/bin/sign-name-record
+
+# 设置执行权限
+RUN chmod +x /usr/local/bin/monad-node \
+  /usr/local/bin/keystore \
+  /usr/local/bin/sign-name-record
+
+# 默认命令
+CMD ["monad-node"]
+

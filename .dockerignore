@@ -14,6 +14,7 @@
 **/.git
 
 **/target
+!**/target/release
 
 **/*.data
 **/*.data.old

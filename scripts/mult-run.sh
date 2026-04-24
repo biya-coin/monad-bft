@@ -2,16 +2,15 @@
 
 # prepare environment
 
-
-export MONAD_BFT_ROOT="/home/bryce/vs_workplace/monad-bft"
-export WORK="/home/bryce/vs_workplace/monad-bft/data-monad-multinode"
-export CHAIN_ID="${CHAIN_ID:-biya-local}"
-export BIYACHAIND_BIN="$WORK/biyachaind"
+export MONAD_BFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export WORK="$MONAD_BFT_ROOT/.monad"
+export CHAIN_ID="${CHAIN_ID:-biyachain-1}"
+export BIYACHAIND_BIN="$MONAD_BFT_ROOT/biyachain-core/bin/biyachaind"
 export KEYRING="${KEYRING:-test}"
 export GENESIS_BALANCE="${GENESIS_BALANCE:-1000000000000000000000byb}"
 export GENTX_STAKE="${GENTX_STAKE:-500000000000000000000byb}"
 
-# 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 data-monad-multinode 内维护）
+# 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 .monad 内维护）
 init_workspace_templates() {
     mkdir -p "$WORK"
     cp -a "$MONAD_BFT_ROOT/docker/devnet/compose.yaml" "$WORK/compose.yaml"
@@ -50,11 +49,6 @@ setup_environment_and_generate_keys() {
           fi
       done
   done
-
-  cd "$MONAD_BFT_ROOT/biyachain-core"
-  go build -o "$WORK/biyachaind" ./cmd/biyachaind
-  test -f "$WORK/biyachaind" && test -x "$WORK/biyachaind"
-
 
   for node in a b c d; do
     docker run --rm -v "$WORK/monad-$node:/out" monad-node:local \
@@ -196,7 +190,7 @@ init_monad_node() {
         NODE_TOML_SRC="$MONAD_BFT_ROOT/docker/devnet/monad/config/node.toml"
     fi
     if [[ ! -f "$NODE_TOML_SRC" ]]; then
-        echo "错误: 找不到 node.toml 模板（已试 \$WORK/node.toml、data-monad-multinode/node.toml、docker/devnet/...）" >&2
+        echo "错误: 找不到 node.toml 模板（已试 \$WORK/node.toml、.monad/node.toml、docker/devnet/...）" >&2
         exit 1
     fi
     for n in a b c d; do
@@ -315,10 +309,6 @@ path.write_text(text)
 # 防止在未跑完 mult-run 就先 compose，导致 Docker 把绑定源建成目录。
 verify_compose_mount_sources() {
     local err=0
-    if [[ ! -f "$WORK/biyachaind" ]] || [[ ! -x "$WORK/biyachaind" ]]; then
-        echo "错误: $WORK/biyachaind 必须是可执行文件（当前: $(ls -ld "$WORK/biyachaind" 2>&1)）。" >&2
-        err=1
-    fi
     for n in a b c d; do
         for f in id-secp id-bls; do
             p="$WORK/monad-$n/$f"

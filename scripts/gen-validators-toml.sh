@@ -6,7 +6,7 @@
 #
 # 用法：
 #   MONAD_BFT_ROOT=/path/to/monad-bft ./scripts/gen-validators-toml.sh
-#   WORK=/path/to/data-monad-multinode ./scripts/gen-validators-toml.sh -o /tmp/v.toml
+#   WORK=/path/to/.monad ./scripts/gen-validators-toml.sh -o /tmp/v.toml
 # 环境变量：
 #   WORK            多节点数据根目录（默认 $MONAD_BFT_ROOT/data-monad-multinode）
 #   MONAD_IMAGE     Docker 镜像（默认 monad-node:local）
@@ -25,7 +25,7 @@ usage() {
 }
 
 MONAD_BFT_ROOT="${MONAD_BFT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-WORK="${WORK:-$MONAD_BFT_ROOT/data-monad-multinode}"
+WORK="${WORK:-$MONAD_BFT_ROOT/.monad}"
 MONAD_IMAGE="${MONAD_IMAGE:-monad-node:local}"
 KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD:-}"
 NODES="${NODES:-a b c d}"
