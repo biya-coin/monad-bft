@@ -51,20 +51,16 @@ setup_environment_and_generate_keys() {
   done
 
   for node in a b c d; do
-    docker run --rm -v "$WORK/monad-$node:/out" monad-node:local \
-      keystore create --keystore-path /out/id-secp --password "" --key-type secp
-    docker run --rm -v "$WORK/monad-$node:/out" monad-node:local \
-      keystore create --keystore-path /out/id-bls --password "" --key-type bls
+    "$MONAD_BFT_ROOT/target/release/monad-keystore" create --keystore-path "$WORK/monad-$node/id-secp" --password "" --key-type secp
+    "$MONAD_BFT_ROOT/target/release/monad-keystore" create --keystore-path "$WORK/monad-$node/id-bls" --password "" --key-type bls
   done
 
 
     for n in a b c d; do
         echo "=== monad-$n secp ==="
-        docker run --rm -v "$WORK/monad-$n:/k:ro" monad-node:local \
-        keystore recover --keystore-path /k/id-secp --password "" --key-type secp
+        "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$WORK/monad-$n/id-secp" --password "" --key-type secp
         echo "=== monad-$n bls ==="
-        docker run --rm -v "$WORK/monad-$n:/k:ro" monad-node:local \
-        keystore recover --keystore-path /k/id-bls --password "" --key-type bls
+        "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$WORK/monad-$n/id-bls" --password "" --key-type bls
     done
 
     "$MONAD_BFT_ROOT/scripts/gen-validators-toml.sh"
@@ -133,6 +129,30 @@ PY
             --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-a"
     done
 
+    echo "--------------------------------"
+    echo "add test user with large balance"
+    echo "--------------------------------"
+    TEST_USER_KEY="testuser"
+    TEST_USER_MNEMONIC="copper push brief egg scan entry inform record adjust fossil boss egg comic alien upon aspect dry avoid interest fury window hint race symptom"
+    NEWLINE=$'\n'
+    
+    # Add test user key (use same mnemonic as USER1 from setup.sh for consistency)
+    if [[ "$KEYRING" == "test" ]]; then
+        yes "$TEST_USER_MNEMONIC$NEWLINE" | "$BIYACHAIND_BIN" keys add $TEST_USER_KEY --recover \
+            --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING"
+    else
+        echo "$TEST_USER_MNEMONIC" | "$BIYACHAIND_BIN" keys add $TEST_USER_KEY --recover \
+            --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING"
+    fi
+    
+    # Add test user with large balance (100M byb, 100M USDT, 10M WBTC)
+    TEST_USER_ADDR="$("$BIYACHAIND_BIN" keys show $TEST_USER_KEY -a --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING")"
+    "$BIYACHAIND_BIN" genesis add-genesis-account "$TEST_USER_ADDR" \
+        100000000000000000000000000000000000000byb,100000000000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7,10000000000000000peggy0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599 \
+        --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-a"
+    
+    echo "Test user created: $TEST_USER_ADDR"
+
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-b/config/genesis.json"
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-c/config/genesis.json"
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-d/config/genesis.json"
@@ -149,7 +169,68 @@ PY
     cp -a "$WORK/biyachain-home-c/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
     cp -a "$WORK/biyachain-home-d/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
 
+    echo "--------------------------------"
+    echo "configure exchange state (markets + denom decimals)"
+    echo "--------------------------------"
+    INITIAL_GENESIS_DIR="$MONAD_BFT_ROOT/biyachain-core/scripts/local-genesis"
+    if [[ -d "$INITIAL_GENESIS_DIR" ]]; then
+        # 先替换时间戳占位符到临时文件，再用 jq 读取（同 setup.sh 顺序）
+        CURRENT_UNIX_TIMESTAMP=$(date +%s)
+        NEXT_FUNDING_TIMESTAMP=$((CURRENT_UNIX_TIMESTAMP + 600))
+        EXCHANGE_GENESIS_TMP=$(mktemp)
+        sed "s/XXX-FUNDING-TIMESTAMP-PLACEHOLDER-XXX/${NEXT_FUNDING_TIMESTAMP}/g" \
+            "$INITIAL_GENESIS_DIR/initial_exchange_genesis.json" > "$EXCHANGE_GENESIS_TMP"
+        EXCHANGE_GENESIS_STATE=$(jq -r '.state' "$EXCHANGE_GENESIS_TMP")
+        rm -f "$EXCHANGE_GENESIS_TMP"
+        cat "$WORK/biyachain-home-a/config/genesis.json" | \
+            jq '.app_state["exchange"]='"${EXCHANGE_GENESIS_STATE}" > \
+            "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
+            mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
+
+        # 注入 trading_reward_pool_campaign_schedule（与 biyachain-core/setup.sh 保持一致）。
+        # 否则当 trading_reward_campaign_info 非空、schedule 为空时，exchange InitGenesis 在
+        # data.TradingRewardPoolCampaignSchedule[0] 处 index out of range，导致 InitChain panic。
+        CAMPAIGN_TMP=$(mktemp)
+        {
+            echo '['
+            EPOCH_UNIX_TIMESTAMP=$CURRENT_UNIX_TIMESTAMP
+            for i in $(seq 1 35); do
+                EPOCH_UNIX_TIMESTAMP=$((EPOCH_UNIX_TIMESTAMP + 600))
+                sep=','
+                [[ $i -eq 35 ]] && sep=''
+                echo '{"start_timestamp": '"$EPOCH_UNIX_TIMESTAMP"', "max_campaign_rewards": [{"denom": "byb", "amount": "1000000000000000000000"}]}'"$sep"
+            done
+            echo ']'
+        } >"$CAMPAIGN_TMP"
+        INITIAL_TRADING_CAMPAIGNS=$(cat "$CAMPAIGN_TMP")
+        rm -f "$CAMPAIGN_TMP"
+        cat "$WORK/biyachain-home-a/config/genesis.json" | \
+            jq '.app_state["exchange"]["trading_reward_pool_campaign_schedule"]='"${INITIAL_TRADING_CAMPAIGNS}" > \
+            "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
+            mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
+
+        # devnet 不需要因 downtime 自动进入 post-only 模式（会导致链启动后 ~1000 个块内所有穿透 TOB 的限价单被拒）
+        # 不能设为空（校验不通过），改为最大枚举值 DURATION_48H，devnet 运行时间极短，不会触发；
+        # 同时将持续块数改为 1，即使触发也会在下一个块立即解除
+        cat "$WORK/biyachain-home-a/config/genesis.json" | \
+            jq '.app_state["exchange"]["params"]["min_post_only_mode_downtime_duration"]="DURATION_48H"
+              | .app_state["exchange"]["params"]["post_only_mode_blocks_amount_after_downtime"]="1"' > \
+            "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
+            mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
+
+        echo "已从 $INITIAL_GENESIS_DIR 加载 exchange genesis state（含现货市场、denom decimals 和 trading rewards）"
+    else
+        echo "警告: 未找到 $INITIAL_GENESIS_DIR，跳过 exchange genesis 注入" >&2
+    fi
+
     "$BIYACHAIND_BIN" genesis collect-gentxs --home "$WORK/biyachain-home-a"
+
+    # 设置区块最大 gas 为-1
+    cat "$WORK/biyachain-home-a/config/genesis.json" | \
+        jq '.consensus["params"]["block"]["max_gas"]="-1"' > \
+        "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
+        mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
+
     "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-a"
 
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-b/config/genesis.json"
@@ -202,7 +283,7 @@ init_monad_node() {
     # Compose --validators-path /monad/validators.toml；清理数据后常丢失，须与各 id-secp 一致。
     if [[ ! -f "$WORK/monad-a/validators.toml" ]]; then
         echo "未找到 $WORK/monad-a/validators.toml，正在从 keystore 生成…"
-        "$(dirname "$0")/gen-validators-toml.sh" || exit 1
+        KEYSTORE_BIN="$MONAD_BFT_ROOT/target/release/monad-keystore" "$(dirname "$0")/gen-validators-toml.sh" || exit 1
     fi
     for n in a b c d; do
         cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
@@ -223,8 +304,7 @@ init_monad_node() {
     recover_secp_pubhex() {
         local dir="$1" raw
         raw="$(
-            docker run --rm -v "$dir:/k:ro" monad-node:local \
-                keystore recover --keystore-path /k/id-secp --password "" --key-type secp 2>&1 \
+            "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$dir/id-secp" --password "" --key-type secp 2>&1 \
                 | awk -F': ' '$0 ~ /Secp public key/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }'
         )"
         if [[ -z "$raw" ]]; then
@@ -243,12 +323,11 @@ init_monad_node() {
         addr="172.28.0.${octet}:8000"
         MONAD_DIR="$WORK/monad-$n"
         out="$(
-            docker run --rm -v "$MONAD_DIR:/cfg:ro" monad-node:local \
-                sign-name-record \
+            "$MONAD_BFT_ROOT/target/release/sign-name-record" \
                 --address "$addr" \
                 --authenticated-udp-port 8001 \
                 --self-record-seq-num 0 \
-                --keystore-path /cfg/id-secp \
+                --keystore-path "$MONAD_DIR/id-secp" \
                 --password "" 2>&1
         )"
         sig=$(printf '%s\n' "$out" | sed -n 's/^self_name_record_sig = "\(.*\)"$/\1/p')

@@ -3,6 +3,9 @@
 
 .github
 
+# 排除 .monad 运行时目录
+.monad/
+
 /docker/devnet/monad/ledger
 /docker/devnet/monad/bft-ledger
 /docker/devnet/monad/block-payload
@@ -14,7 +17,9 @@
 **/.git
 
 **/target
-!**/target/release
+!target/release/monad-node
+!target/release/monad-keystore
+!target/release/sign-name-record
 
 **/*.data
 **/*.data.old
