@@ -39,6 +39,7 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tonic = { workspace = true, features = ["transport"] }
 tracing = { workspace = true }

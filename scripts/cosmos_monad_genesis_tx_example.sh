@@ -23,6 +23,8 @@
 #   SEQUENCE=                  # 离线签名；不设时 transfer 会 gRPC 读链上 sequence（避免与 query 不一致导致拒单）
 #   SKIP_LIVE_AUTH=1           # 跳过 gRPC，仅用 genesis 的 ACCOUNT_NUMBER 与 SEQUENCE 回退值
 #   AMOUNT=1000000             # 转账数量（仅币数量，不含 denom）
+#   FEES_AMOUNT=300000         # 与 --gas 一起须满足：fees >= gas * biyachaind 的 minimum-gas-prices
+#                              #（例如 run.sh 里 1byb、gas=200000 时至少 200000；默认 300000 留余量）
 
 set -euo pipefail
 
@@ -35,6 +37,7 @@ GENESIS="${BIYAHOME}/config/genesis.json"
 KEY_NAME="${KEY_NAME:-validator}"
 KEYRING_BACKEND="${KEYRING_BACKEND:-test}"
 AMOUNT="${AMOUNT:-1000000000}"
+FEES_AMOUNT="${FEES_AMOUNT:-300000}"
 SEQUENCE="${SEQUENCE:-}"
 
 MONAD_MEMPOOL_SOCK="${MONAD_MEMPOOL_SOCK:-}"
@@ -251,12 +254,12 @@ build_transfer_tx() {
     SEQUENCE="1"
   fi
 
-  echo "sign: account_number=$ACCOUNT_NUMBER sequence=$SEQUENCE BIYAHOME=$BIYAHOME"
+  echo "sign: account_number=$ACCOUNT_NUMBER sequence=$SEQUENCE fees=${FEES_AMOUNT}${DENOM} BIYAHOME=$BIYAHOME"
 
   # 使用 key 名（与 genesis 注资对应）；generate-only 写 STDOUT，勿用 -o 当路径（-o 是 text|json）
   "${BIYACHAIND_BIN}" tx bank send "$KEY_NAME" "$TO_ADDR" "${AMOUNT}${DENOM}" \
     --chain-id "$CHAIN_ID" \
-    --fees "5000${DENOM}" \
+    --fees "${FEES_AMOUNT}${DENOM}" \
     --gas "200000" \
     --generate-only \
     --home "$BIYAHOME" \

@@ -432,7 +432,10 @@ where
                         last_delay_committed_blocks,
                     );
                 }
-                TxPoolCommand::InsertForwardedTxs { sender, txs } => {
+                TxPoolCommand::InsertForwardedTxs {
+                    sender,
+                    txs,
+                } => {
                     pool.insert_txs(
                         &mut event_tracker,
                         block_policy,

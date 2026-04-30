@@ -18,9 +18,10 @@ use chrono::{DateTime, Utc};
 use monad_block_persist::{BlockPersist, FileBlockPersist};
 use monad_chain_config::{revision::ChainRevision, ChainConfig};
 use monad_cometbft_proto::cometbft::abci::v1::{
-    abci_service_client::AbciServiceClient, request, response, CommitInfo, CommitRequest,
-    ExtendedCommitInfo, FinalizeBlockRequest, InfoRequest, InitChainRequest, Misbehavior,
-    PrepareProposalRequest, ProcessProposalRequest, Request, Response,
+    abci_service_client::AbciServiceClient, request, response, CheckTxRequest, CheckTxType,
+    CommitInfo, CommitRequest, ExtendedCommitInfo, FinalizeBlockRequest, InfoRequest,
+    InitChainRequest, Misbehavior, PrepareProposalRequest, ProcessProposalRequest, Request,
+    Response,
 };
 use monad_cometbft_proto::cometbft::types::v1::{
     BlockParams, ConsensusParams, EvidenceParams, FeatureParams, SynchronyParams, ValidatorParams,
@@ -52,12 +53,17 @@ use once_cell::sync::Lazy;
 use prost::Message;
 use prost_types::Timestamp;
 use serde_json::Value;
+use futures::StreamExt;
 use thiserror::Error;
 use tokio::runtime::{Handle, Runtime};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
 pub mod cosmos_txpool_ipc;
+
+mod indexed_cosmos_mempool;
+use indexed_cosmos_mempool::IndexedCosmosMempool;
 
 monad_executor::metric_consts! {
     GAUGE_COSMOS_LEDGER_NUM_COMMITS {
@@ -71,6 +77,8 @@ monad_executor::metric_consts! {
 }
 
 const COSMOS_MAX_AHEAD_BLOCKS: u64 = 4;
+
+const COSMOS_FORWARD_EGRESS_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum CosmosIntegrationError {
@@ -468,6 +476,51 @@ fn socket_roundtrip(
                     Err(err)
                 }
             }
+        }
+    }
+}
+
+pub async fn check_tx_via_transport(
+    endpoint: &str,
+    tx_bytes: &[u8],
+) -> Result<monad_cometbft_proto::cometbft::abci::v1::CheckTxResponse, CosmosIntegrationError> {
+    let request_msg = CheckTxRequest {
+        tx: tx_bytes.to_vec(),
+        r#type: CheckTxType::Check as i32,
+    };
+    match parse_abci_transport(endpoint) {
+        AbciTransport::Grpc(endpoint) => {
+            let mut client = connect_client(endpoint).await?;
+            client
+                .check_tx(request_msg)
+                .await
+                .map(|resp| resp.into_inner())
+                .map_err(|err| CosmosIntegrationError::GrpcStatus(err.to_string()))
+        }
+        AbciTransport::Unix(_) | AbciTransport::Tcp(_) => {
+            let endpoint_owned = endpoint.to_string();
+            tokio::task::spawn_blocking(move || {
+                let response = socket_roundtrip(
+                    &endpoint_owned,
+                    Request {
+                        value: Some(request::Value::CheckTx(request_msg)),
+                    },
+                )?;
+                match response.value {
+                    Some(response::Value::CheckTx(resp)) => Ok(resp),
+                    Some(response::Value::Exception(resp)) => {
+                        Err(CosmosIntegrationError::Transport(resp.error))
+                    }
+                    other => Err(CosmosIntegrationError::Transport(format!(
+                        "unexpected response for CheckTx: {:?}",
+                        other.map(|_| "other")
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| {
+                CosmosIntegrationError::Transport(format!("check_tx spawn_blocking: {e}"))
+            })?
         }
     }
 }
@@ -1205,7 +1258,10 @@ pub struct CosmosTxPoolExecutor<
     CRT: ChainRevision,
 > {
     endpoint: String,
-    pending_txs: VecDeque<Bytes>,
+    pending_txs: IndexedCosmosMempool,
+    /// IPC path (post-CheckTx): polled in [`Stream::poll_next`] like ETH `poll_txs`.
+    ipc_checked: Option<ReceiverStream<Vec<Bytes>>>,
+    forward_egress: VecDeque<Bytes>,
     pending_app_commits: BTreeMap<SeqNum, BPT::ValidatedBlock>,
     events: VecDeque<MonadEvent<ST, SCT, CosmosExecutionProtocol>>,
     waker: Option<Waker>,
@@ -1226,10 +1282,13 @@ where
     pub fn new(
         endpoint: impl Into<String>,
         store: std::sync::Arc<std::sync::Mutex<CosmosCommitStore>>,
+        ipc_checked_rx: Option<tokio::sync::mpsc::Receiver<Vec<Bytes>>>,
     ) -> Self {
         Self {
             endpoint: endpoint.into(),
-            pending_txs: VecDeque::new(),
+            pending_txs: IndexedCosmosMempool::new(),
+            ipc_checked: ipc_checked_rx.map(ReceiverStream::new),
+            forward_egress: VecDeque::new(),
             pending_app_commits: BTreeMap::new(),
             events: VecDeque::new(),
             waker: None,
@@ -1239,14 +1298,106 @@ where
         }
     }
 
+    /// Txs that already passed ABCI CheckTx (IPC pipeline): insert pool + schedule P2P forward.
+    fn apply_checked_ingress_batch(&mut self, txs: Vec<Bytes>) {
+        let n = txs.len();
+        let wire_bytes: usize = txs.iter().map(|b| b.len()).sum();
+        let mut accepted = 0usize;
+        let mut duplicates = 0usize;
+        for tx in txs {
+            let fwd = tx.clone();
+            if self.pending_txs.try_push(tx) {
+                accepted += 1;
+                self.forward_egress.push_back(fwd);
+            } else {
+                duplicates += 1;
+            }
+        }
+        if n > 0 {
+            info!(
+                count = n,
+                accepted,
+                duplicates,
+                wire_bytes,
+                pending_after = self.pending_txs.pending_len(),
+                "cosmos txpool: IPC ingress (CheckTx already applied)"
+            );
+        }
+        if accepted > 0 {
+            self.wake();
+        }
+    }
+
     fn wake(&mut self) {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
     }
 
+    /// Drop txs from the local mempool whose raw bytes appear in this committed execution body
+    /// (e.g. included via `PrepareProposal` or matching forwarded txs).
+    fn purge_mempool_txs_for_committed_block(&mut self, block: &BPT::ValidatedBlock) {
+        for tx in block.body().execution_body.txs.iter() {
+            self.pending_txs.remove_by_raw(tx.as_slice());
+        }
+    }
+
+    fn cosmos_synthetic_finalized_header(height: u64, app_hash: Vec<u8>) -> CosmosFinalizedHeader {
+        CosmosFinalizedHeader {
+            height,
+            app_hash,
+            tx_results_hash: Vec::new(),
+            validator_updates_hash: Vec::new(),
+            finalize_block_response: Vec::new(),
+            commit_response: Vec::new(),
+            retain_height: 0,
+        }
+    }
+
+    /// If [`CosmosCommitStore`] was advanced (e.g. [`CosmosCommitStore::sync_with_abci_app`]) past
+    /// heights still present in `pending_app_commits`, drop those entries and purge mempool by the
+    /// corresponding block bodies so we do not stall waiting for a height already on disk.
+    fn flush_stale_pending_app_commits(&mut self) {
+        let latest = self
+            .store
+            .lock()
+            .unwrap()
+            .latest()
+            .unwrap_or(GENESIS_SEQ_NUM);
+        let stale: Vec<SeqNum> = self
+            .pending_app_commits
+            .range(..=latest)
+            .map(|(k, _)| *k)
+            .collect();
+        for h in stale {
+            if let Some(block) = self.pending_app_commits.remove(&h) {
+                self.purge_mempool_txs_for_committed_block(&block);
+                info!(
+                    height = h.0,
+                    latest_disk = latest.0,
+                    "cosmos txpool: removed stale pending commit (already persisted on disk)"
+                );
+            }
+        }
+    }
+
     fn drain_app_commits(&mut self) {
+        if let Err(err) = self
+            .store
+            .lock()
+            .unwrap()
+            .sync_with_abci_app(&self.endpoint)
+        {
+            warn!(
+                ?err,
+                endpoint = %self.endpoint,
+                "CosmosCommitStore::sync_with_abci_app failed; if the ABCI app is >1 height ahead of disk, drain will stall until state is aligned (see error text)"
+            );
+        }
+
         loop {
+            self.flush_stale_pending_app_commits();
+
             let latest_app_height = self
                 .store
                 .lock()
@@ -1277,26 +1428,22 @@ where
                         next_height = next_height.0,
                         "ABCI app already committed this height; persisting local header from Info (no duplicate FinalizeBlock)"
                     );
-                    let synthetic = CosmosFinalizedHeader {
-                        height: next_height.0,
-                        app_hash: info.last_block_app_hash.clone(),
-                        tx_results_hash: Vec::new(),
-                        validator_updates_hash: Vec::new(),
-                        finalize_block_response: Vec::new(),
-                        commit_response: Vec::new(),
-                        retain_height: 0,
-                    };
+                    let synthetic = Self::cosmos_synthetic_finalized_header(
+                        next_height.0,
+                        info.last_block_app_hash.clone(),
+                    );
                     if let Err(err) = self.store.lock().unwrap().commit(synthetic) {
                         warn!(?err, "failed to persist synthetic cosmos commit");
                         self.pending_app_commits.insert(next_height, block);
                         break;
                     }
+                    self.purge_mempool_txs_for_committed_block(&block);
                     continue;
                 }
                 warn!(
                     next_height = next_height.0,
                     abci_height,
-                    "ABCI app is more than one height ahead of the block we are trying to commit; put back and stop drain"
+                    "ABCI last_block_height is ahead of the pending height we would commit; cannot use Info app_hash for this height and FinalizeBlock would be invalid. Align with CosmosCommitStore::sync_with_abci_app, reset app home, or remove cosmos-commits when the gap is >1"
                 );
                 self.pending_app_commits.insert(next_height, block);
                 break;
@@ -1320,6 +1467,7 @@ where
                                 self.pending_app_commits.insert(next_height, block);
                                 break;
                             }
+                            self.purge_mempool_txs_for_committed_block(&block);
                         }
                         Err(err) => {
                             warn!(?err, "failed to encode cosmos commit");
@@ -1361,7 +1509,7 @@ where
                     round_signature,
                     last_round_tc,
                     fresh_proposal_certificate,
-                    tx_limit,
+                    tx_limit: _,
                     proposal_byte_limit,
                     timestamp_ns,
                     delayed_execution_results,
@@ -1384,19 +1532,6 @@ where
                         continue;
                     }
 
-                    let mut candidate_txs = Vec::new();
-                    let mut total_bytes = 0usize;
-                    while let Some(tx) = self.pending_txs.pop_front() {
-                        let next_bytes = total_bytes.saturating_add(tx.len());
-                        if candidate_txs.len() >= tx_limit || next_bytes > proposal_byte_limit as usize {
-                            self.pending_txs.push_front(tx);
-                            break;
-                        }
-                        total_bytes = next_bytes;
-                        candidate_txs.push(tx.to_vec());
-                    }
-                    let n_candidates = candidate_txs.len();
-
                     let header = ProposedCosmosHeader {
                         height: seq_num.0,
                         max_tx_bytes: proposal_byte_limit,
@@ -1408,21 +1543,19 @@ where
                         proposer_address: Vec::new(),
                     };
 
-                    let txs_snapshot_for_restore = if latest_app_height == GENESIS_SEQ_NUM {
-                        None
-                    } else {
-                        Some(candidate_txs.clone())
-                    };
-
+                    // Tx list for the block comes from ABCI `PrepareProposal` (application layer), not
+                    // from the local mempool. Mempool is only pruned after commit (see
+                    // `purge_mempool_txs_for_committed_block`).
                     let prepared_txs = if latest_app_height == GENESIS_SEQ_NUM {
                         info!(
                             seq_num = seq_num.0,
                             "bypassing PrepareProposal while application is still at genesis state"
                         );
-                        Ok(candidate_txs)
+                        Ok(Vec::new())
                     } else {
                         let endpoint = self.endpoint.clone();
-                        let prepare_request = prepare_request_from_header(&header, candidate_txs);
+                        let prepare_request =
+                            prepare_request_from_header(&header, Vec::new());
                         block_on_async(async move {
                             prepare_proposal_via_transport(&endpoint, prepare_request)
                                 .await
@@ -1434,24 +1567,14 @@ where
                         Ok(txs) => {
                             let n_included = txs.len();
                             let included_bytes: usize = txs.iter().map(|t| t.len()).sum();
-                            if n_candidates > 0 || n_included > 0 {
+                            if n_included > 0 {
                                 info!(
                                     seq_num = seq_num.0,
                                     latest_app_height = latest_app_height.0,
-                                    n_candidates,
                                     n_included,
                                     included_bytes,
-                                    "cosmos txpool: txs in proposal (candidates from mempool vs after PrepareProposal)"
-                                );
-                            }
-                            if n_candidates > 0
-                                && n_included == 0
-                                && latest_app_height != GENESIS_SEQ_NUM
-                            {
-                                warn!(
-                                    seq_num = seq_num.0,
-                                    n_candidates,
-                                    "PrepareProposal returned no txs though mempool had candidates — ABCI app likely rejected or filtered them"
+                                    mempool_pending = self.pending_txs.pending_len(),
+                                    "cosmos txpool: proposal txs from PrepareProposal (app); local mempool unchanged"
                                 );
                             }
                             let body = CosmosBlockBody {
@@ -1479,26 +1602,60 @@ where
                         }
                         Err(err) => {
                             warn!(?err, "PrepareProposal failed");
-                            if let Some(snapshot) = txs_snapshot_for_restore {
-                                for tx in snapshot.into_iter().rev() {
-                                    self.pending_txs.push_front(Bytes::from(tx));
-                                }
-                            }
                         }
                     }
                 }
-                TxPoolCommand::InsertForwardedTxs { txs, .. } => {
+                TxPoolCommand::InsertForwardedTxs {
+                    txs,
+                    sender: _,
+                } => {
                     let n = txs.len();
-                    let total_bytes: usize = txs.iter().map(|b| b.len()).sum();
+                    let wire_bytes: usize = txs.iter().map(|b| b.len()).sum();
+                    let mut accepted = 0usize;
+                    let mut duplicates = 0usize;
+                    let mut check_reject = 0usize;
+                    let endpoint = self.endpoint.clone();
+                    let mut to_apply = Vec::new();
+                    for tx in txs {
+                        match block_on_async(async {
+                            check_tx_via_transport(&endpoint, tx.as_ref()).await
+                        }) {
+                            Ok(resp) => {
+                                if resp.code == 0 {
+                                    to_apply.push(tx);
+                                } else {
+                                    check_reject += 1;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(?err, "cosmos txpool: CheckTx failed");
+                                check_reject += 1;
+                            }
+                        };
+                    }
+                    // 这里其他节点过来的数据不需要二次转发
+                    for tx in to_apply {
+                        if self.pending_txs.try_push(tx) {
+                            accepted += 1;
+                        } else {
+                            duplicates += 1;
+                        }
+                    }
+            
                     if n > 0 {
                         info!(
                             count = n,
-                            total_bytes,
-                            pending_after = self.pending_txs.len() + n,
-                            "cosmos txpool: received forwarded raw txs (e.g. cosmos-txpool-feed)"
+                            accepted,
+                            check_reject,
+                            duplicates,
+                            wire_bytes,
+                            pending_after = self.pending_txs.pending_len(),
+                            "cosmos txpool: InsertForwardedTxs (P2P / exec path)"
                         );
                     }
-                    self.pending_txs.extend(txs);
+                    if accepted > 0 {
+                        self.wake();
+                    }
                 }
                 TxPoolCommand::BlockCommit(committed_blocks) => {
                     for block in committed_blocks {
@@ -1524,14 +1681,52 @@ where
     SBT: StateBackend<ST, SCT, CosmosExecutionProtocol>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
+    Self: Unpin,
 {
     type Item = MonadEvent<ST, SCT, CosmosExecutionProtocol>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         if let Some(event) = this.events.pop_front() {
             return Poll::Ready(Some(event));
         }
+
+        if let Some(stream) = this.ipc_checked.as_mut() {
+            match stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(batch)) => {
+                    this.apply_checked_ingress_batch(batch);
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Ready(None) => {
+                    this.ipc_checked = None;
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if !this.forward_egress.is_empty() {
+            let mut batch = Vec::new();
+            let mut total = 0usize;
+            while let Some(front) = this.forward_egress.front() {
+                let next = total.saturating_add(front.len());
+                if next > COSMOS_FORWARD_EGRESS_MAX_BYTES && !batch.is_empty() {
+                    break;
+                }
+                let tx = this.forward_egress.pop_front().expect("non-empty");
+                total = next;
+                batch.push(tx);
+            }
+            if !batch.is_empty() {
+                if !this.forward_egress.is_empty() {
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Ready(Some(MonadEvent::MempoolEvent(MempoolEvent::ForwardTxs(
+                    batch,
+                ))));
+            }
+        }
+
         this.waker = Some(cx.waker().clone());
         Poll::Pending
     }

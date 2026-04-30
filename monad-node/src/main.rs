@@ -41,7 +41,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
 use monad_executor::{Executor, ExecutorMetricsChain};
-use monad_executor_glue::{Command, LogFriendlyMonadEvent, Message, MonadEvent, TxPoolCommand};
+use monad_executor_glue::{LogFriendlyMonadEvent, Message, MonadEvent};
 use monad_node_config::{
     ExecutionProtocolType, FullNodeIdentityConfig, NodeBootstrapConfig, NodeConfig,
     PeerDiscoveryConfig, SignatureCollectionType, SignatureType,
@@ -73,7 +73,6 @@ use monad_wal::wal::WALoggerConfig;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
-use bytes::Bytes;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, event, info, warn, Instrument, Level};
 
@@ -217,6 +216,19 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
     let create_block_policy = || CosmosBlockPolicy;
     let state_backend = CosmosStateBackend::new(commit_store.clone());
 
+    let cosmos_ipc_checked = cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_checked_ingress(
+        node_state.mempool_ipc_path.clone(),
+        abci_endpoint.clone(),
+    )
+    .map(Some)
+    .unwrap_or_else(|e| {
+        warn!(
+            ?e,
+            path = %node_state.mempool_ipc_path.display(),
+            "Cosmos txpool IPC bind failed; inbound txs only via P2P forward path"
+        );
+        None
+    });
     let mut executor = ParentExecutor {
         metrics: Default::default(),
         router,
@@ -236,7 +248,11 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             node_state.chain_config.get_epoch_length(),
         ),
         timestamp: TokioTimestamp::new(Duration::from_millis(5), 100, 10001),
-        txpool: CosmosTxPoolExecutor::new(abci_endpoint.clone(), commit_store.clone()),
+        txpool: CosmosTxPoolExecutor::new(
+            abci_endpoint.clone(),
+            commit_store.clone(),
+            cosmos_ipc_checked,
+        ),
         control_panel: ControlPanelIpcReceiver::new(
             node_state.control_panel_ipc_path,
             node_state.reload_handle,
@@ -293,12 +309,10 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 
     let mut last_ledger_tip: Option<SeqNum> = None;
 
-    let local_node_id = NodeId::new(node_state.secp256k1_identity.pubkey());
-
     let builder = MonadStateBuilder {
         validator_set_factory: ValidatorSetFactory::default(),
         leader_election: WeightedRoundRobin::default(),
-        block_validator: CosmosBlockValidator::new(abci_endpoint),
+        block_validator: CosmosBlockValidator::new(abci_endpoint.clone()),
         block_policy: create_block_policy(),
         state_backend,
         key: node_state.secp256k1_identity,
@@ -328,31 +342,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
 
     let (mut state, init_commands) = builder.build();
     executor.exec(init_commands);
-
-    enum CosmosTxpoolIpcIngress {
-        Active(tokio::sync::mpsc::Receiver<Vec<Bytes>>),
-        Inactive,
-    }
-
-    let mut cosmos_txpool_ipc_ingress = match cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_server(
-        node_state.mempool_ipc_path.clone(),
-    ) {
-        Ok(rx) => {
-            info!(
-                path = %node_state.mempool_ipc_path.display(),
-                "Cosmos raw-tx IPC listening (same path as ETH mempool.sock; feed signed SDK bytes)"
-            );
-            CosmosTxpoolIpcIngress::Active(rx)
-        }
-        Err(e) => {
-            warn!(
-                ?e,
-                path = %node_state.mempool_ipc_path.display(),
-                "Cosmos txpool IPC bind failed; inbound txs only via P2P forward path"
-            );
-            CosmosTxpoolIpcIngress::Inactive
-        }
-    };
 
     let mut ledger_span = tracing::info_span!(
         "ledger_span",
@@ -413,28 +402,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 let state_metrics = state.metrics();
                 let executor_metrics = executor.metrics();
                 send_metrics(otel_meter, &mut gauge_cache, state_metrics, executor_metrics, &process_start, &total_state_update_elapsed);
-            }
-
-            maybe_cosmos_txs = async {
-                match &mut cosmos_txpool_ipc_ingress {
-                    CosmosTxpoolIpcIngress::Active(rx) => rx.recv().await,
-                    CosmosTxpoolIpcIngress::Inactive => std::future::pending().await,
-                }
-            }, if matches!(cosmos_txpool_ipc_ingress, CosmosTxpoolIpcIngress::Active(_)) => {
-                match maybe_cosmos_txs {
-                    Some(txs) => {
-                        executor.exec(vec![Command::TxPoolCommand(
-                            TxPoolCommand::InsertForwardedTxs {
-                                sender: local_node_id,
-                                txs,
-                            },
-                        )]);
-                    }
-                    None => {
-                        warn!("Cosmos txpool IPC channel closed");
-                        cosmos_txpool_ipc_ingress = CosmosTxpoolIpcIngress::Inactive;
-                    }
-                }
             }
 
             event = executor.next().instrument(ledger_span.clone()) => {

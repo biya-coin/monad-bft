@@ -58,8 +58,7 @@ pub async fn feed_raw_txs(path: impl AsRef<Path>, txs: Vec<Vec<u8>>) -> io::Resu
     Ok(())
 }
 
-/// Bind `bind_path`, spawn accept loop, return a receiver of raw tx batches for
-/// [`monad_executor_glue::TxPoolCommand::InsertForwardedTxs`].
+/// Bind `bind_path`, spawn accept loop, return a receiver of raw tx batches.
 ///
 /// Each IPC frame yields one `Vec<Bytes>` of length 1.
 pub fn spawn_cosmos_txpool_ipc_server(
@@ -120,4 +119,44 @@ async fn handle_connection(
             .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "ingress channel closed"))?;
     }
     Ok(())
+}
+
+/// Raw IPC → ABCI `CheckTx` (async) → batches for [`crate::CosmosTxPoolExecutor`] to ingest from its
+/// [`futures::Stream`] (`poll_next`), mirroring ETH `EthTxPoolIpcServer` feeding the txpool poll loop.
+pub fn spawn_cosmos_txpool_ipc_checked_ingress(
+    bind_path: std::path::PathBuf,
+    abci_endpoint: String,
+) -> Result<tokio::sync::mpsc::Receiver<Vec<Bytes>>, io::Error> {
+    let raw_rx = spawn_cosmos_txpool_ipc_server(bind_path)?;
+    let (checked_tx, checked_rx) = tokio::sync::mpsc::channel::<Vec<Bytes>>(1024);
+    tokio::spawn(cosmos_txpool_ipc_check_bridge(raw_rx, checked_tx, abci_endpoint));
+    Ok(checked_rx)
+}
+
+async fn cosmos_txpool_ipc_check_bridge(
+    mut raw_rx: tokio::sync::mpsc::Receiver<Vec<Bytes>>,
+    out: tokio::sync::mpsc::Sender<Vec<Bytes>>,
+    endpoint: String,
+) {
+    use crate::check_tx_via_transport;
+    while let Some(batch) = raw_rx.recv().await {
+        let mut accepted = Vec::new();
+        for tx in batch {
+            tracing::info!("check_tx_via_transport: {}", tx.len());
+            match check_tx_via_transport(&endpoint, tx.as_ref()).await {
+                Ok(resp) if resp.code == 0 => accepted.push(tx),
+                Ok(resp) => {
+                    tracing::info!(
+                        code = resp.code,
+                        codespace = %resp.codespace,
+                        "cosmos txpool IPC CheckTx rejected"
+                    );
+                }
+                Err(e) => warn!(?e, "cosmos txpool IPC CheckTx transport error"),
+            }
+        }
+        if !accepted.is_empty() && out.send(accepted).await.is_err() {
+            break;
+        }
+    }
 }
