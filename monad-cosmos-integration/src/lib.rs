@@ -46,6 +46,7 @@ use monad_crypto::certificate_signature::{
 };
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{BlockSyncEvent, LedgerCommand, MempoolEvent, MonadEvent, TxPoolCommand};
+use monad_performance_monitor as performance_monitor;
 use monad_state_backend::{StateBackend, StateBackendError};
 use monad_types::{BlockId, Epoch, FinalizedHeader, Round, SeqNum, Stake, GENESIS_SEQ_NUM};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
@@ -1462,12 +1463,18 @@ where
                         &commit,
                     ) {
                         Ok(header) => {
+                            let committed_height = header.height;
                             if let Err(err) = self.store.lock().unwrap().commit(header) {
                                 warn!(?err, "failed to persist cosmos commit");
                                 self.pending_app_commits.insert(next_height, block);
                                 break;
                             }
                             self.purge_mempool_txs_for_committed_block(&block);
+                            let _ = performance_monitor::record_stage_timestamp(
+                                committed_height,
+                                "finalize_commit_done",
+                            );
+                            let _ = performance_monitor::mark_block_committed(committed_height);
                         }
                         Err(err) => {
                             warn!(?err, "failed to encode cosmos commit");

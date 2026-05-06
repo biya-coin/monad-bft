@@ -20,6 +20,7 @@ monad-eth-types = { workspace = true }
 monad-executor = { workspace = true }
 monad-executor-glue = { workspace = true }
 monad-multi-sig = { workspace = true }
+monad-performance-monitor = { workspace = true }
 monad-state-backend = { workspace = true }
 monad-types = { workspace = true }
 monad-validator = { workspace = true }
