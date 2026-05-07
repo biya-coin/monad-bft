@@ -121,7 +121,7 @@ const CHAIN_PARAMS_V_0_11_0: ChainParams = chain_params! {
     proposal_gas_limit: 200_000_000,
     proposal_byte_limit: 2_000_000,
     max_reserve_balance: 10_000_000_000_000_000_000, // 10 MON
-    vote_pace: Duration::from_millis(400),
+    vote_pace: Duration::from_millis(0), // 原值400ms，改为0ms快速投票
 };
 
 // NOTE: when adding a new revision, chain_params! asserts that tx_limit is <= MAX_TRANSACTIONS_PER_BLOCK

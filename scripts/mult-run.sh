@@ -6,9 +6,14 @@ export MONAD_BFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export WORK="$MONAD_BFT_ROOT/.monad"
 export CHAIN_ID="${CHAIN_ID:-biyachain-1}"
 export BIYACHAIND_BIN="$MONAD_BFT_ROOT/biyachain-core/bin/biyachaind"
+export CHAIN_STRESSER_ROOT="${CHAIN_STRESSER_ROOT:-$(cd "$MONAD_BFT_ROOT/.." && pwd)/chain-stresser}"
 export KEYRING="${KEYRING:-test}"
 export GENESIS_BALANCE="${GENESIS_BALANCE:-1000000000000000000000byb}"
 export GENTX_STAKE="${GENTX_STAKE:-500000000000000000000byb}"
+export STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
+export STRESS_ACCOUNTS_DIR="$WORK/instances/0"
+export STRESS_ACCOUNT_BALANCE_BYB="${STRESS_ACCOUNT_BALANCE_BYB:-1000000000000000000000000000byb}"
+export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-10000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
 
 # 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 .monad 内维护）
 init_workspace_templates() {
@@ -19,6 +24,89 @@ init_workspace_templates() {
         rm -rf "$WORK/biyachain-lib"
         cp -a "$MONAD_BFT_ROOT/biyachain-lib" "$WORK/biyachain-lib"
     fi
+    if [[ -e "$MONAD_BFT_ROOT/docker/devnet/rpc-lib" ]]; then
+        rm -rf "$WORK/rpc-lib"
+        cp -a "$MONAD_BFT_ROOT/docker/devnet/rpc-lib" "$WORK/rpc-lib"
+    fi
+}
+
+generate_stress_accounts() {
+    echo "--------------------------------"
+    echo "generate $STRESS_ACCOUNTS_NUM stress accounts"
+    echo "--------------------------------"
+
+    if [[ ! -d "$CHAIN_STRESSER_ROOT" ]]; then
+        echo "错误: 找不到 chain-stresser 仓库目录 $CHAIN_STRESSER_ROOT" >&2
+        exit 1
+    fi
+
+    local keyring_dir="$WORK/stress-keyring"
+    rm -rf "$keyring_dir"
+    mkdir -p "$STRESS_ACCOUNTS_DIR"
+
+    local gen_bin="$CHAIN_STRESSER_ROOT/bin/gen-accounts"
+    if [[ ! -x "$gen_bin" ]]; then
+        echo "building gen-accounts..."
+        (
+            cd "$CHAIN_STRESSER_ROOT"
+            go build -o "$gen_bin" ./cmd/gen-accounts/
+        )
+    fi
+
+    "$gen_bin" generate \
+        --num "$STRESS_ACCOUNTS_NUM" \
+        --out "$STRESS_ACCOUNTS_DIR"
+
+    if [[ ! -f "$STRESS_ACCOUNTS_DIR/accounts.json" ]] || [[ ! -f "$STRESS_ACCOUNTS_DIR/addresses.json" ]]; then
+        echo "错误: gen-accounts 未生成 accounts.json/addresses.json" >&2
+        exit 1
+    fi
+
+    echo "stress accounts written to $STRESS_ACCOUNTS_DIR/accounts.json"
+    echo "stress keyring written to $keyring_dir"
+}
+
+ensure_stress_accounts_generated() {
+    local accounts_file="$STRESS_ACCOUNTS_DIR/accounts.json"
+    local addresses_file="$STRESS_ACCOUNTS_DIR/addresses.json"
+
+    if [[ -f "$accounts_file" ]] && [[ -f "$addresses_file" ]]; then
+        local existed_num
+        existed_num="$(jq 'length' "$addresses_file")"
+
+        if [[ "$existed_num" == "$STRESS_ACCOUNTS_NUM" ]]; then
+            echo "stress accounts already exists: $addresses_file ($existed_num)"
+            return 0
+        fi
+
+        echo "已存在账户数量($existed_num)与 STRESS_ACCOUNTS_NUM($STRESS_ACCOUNTS_NUM)不一致，重新生成"
+    fi
+
+    generate_stress_accounts
+}
+
+add_stress_accounts_to_genesis() {
+    local addresses_file="$STRESS_ACCOUNTS_DIR/addresses.json"
+    if [[ ! -f "$addresses_file" ]]; then
+        echo "错误: 未找到压力测试账户地址文件 $addresses_file" >&2
+        exit 1
+    fi
+
+    echo "--------------------------------"
+    echo "add $STRESS_ACCOUNTS_NUM stress accounts to genesis"
+    echo "--------------------------------"
+
+    local gen_bin="$CHAIN_STRESSER_ROOT/bin/gen-accounts"
+    if [[ ! -x "$gen_bin" ]]; then
+        echo "building gen-accounts..."
+        (cd "$CHAIN_STRESSER_ROOT" && go build -o "$gen_bin" ./cmd/gen-accounts/)
+    fi
+
+    "$gen_bin" genesis-add \
+        --addresses "$addresses_file" \
+        --genesis "$WORK/biyachain-home-a/config/genesis.json" \
+        --balance-byb "$STRESS_ACCOUNT_BALANCE_BYB" \
+        --balance-usdt "$STRESS_ACCOUNT_BALANCE_USDT"
 }
 
 setup_environment_and_generate_keys() {
@@ -28,6 +116,7 @@ setup_environment_and_generate_keys() {
   echo "--------------------------------"
 
   init_workspace_templates
+    ensure_stress_accounts_generated
 
   for node in a b c d; do
       mkdir -p "$WORK/biyachain-home-$node"
@@ -79,6 +168,9 @@ init_biyachaind() {
     echo "--------------------------------"
     echo "step 2: init biyachaind"
     echo "--------------------------------"
+
+    # 支持单独执行 ./scripts/mult-run.sh init-biyachain：缺失时自动生成压测账户 json
+    ensure_stress_accounts_generated
 
     # 若以 root 在容器内写过 $WORK，宿主机上 rm -rf .../* 往往删不干净，biyachaind init 也写不进 genesis.json。
     # 同时 Docker 在缺少源文件时会把 ./genesis.json.reference 建成目录，需删掉再生成文件。
@@ -152,6 +244,8 @@ PY
         --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-a"
     
     echo "Test user created: $TEST_USER_ADDR"
+
+    add_stress_accounts_to_genesis
 
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-b/config/genesis.json"
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-c/config/genesis.json"
@@ -227,7 +321,7 @@ PY
 
     # 设置区块最大 gas 为-1
     cat "$WORK/biyachain-home-a/config/genesis.json" | \
-        jq '.consensus["params"]["block"]["max_gas"]="-1"' > \
+        jq '.consensus["params"]["block"]["max_gas"]="2000000000"' > \
         "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
         mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
 
