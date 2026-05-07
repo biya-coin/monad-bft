@@ -261,4 +261,20 @@ pub struct Cli {
 
     #[arg(long)]
     pub manytrace_socket: Option<String>,
+
+    // -----------------------------------------------------------------------
+    // CometBFT RPC (port 26657)
+    // -----------------------------------------------------------------------
+
+    /// Enable the CometBFT-compatible RPC server and set its port.
+    /// When set, monad-rpc will bind an additional listener on this port that
+    /// speaks the CometBFT JSON-RPC protocol (used by Cosmos SDK tooling).
+    #[arg(long)]
+    pub comet_port: Option<u16>,
+
+    /// Unix-socket path of the Cosmos tx-pool IPC server inside monad-bft.
+    /// Required for broadcast_tx_* endpoints on the CometBFT RPC port.
+    /// Typically points to cosmos.sock next to mempool.sock.
+    #[arg(long)]
+    pub cosmos_ipc_path: Option<PathBuf>,
 }

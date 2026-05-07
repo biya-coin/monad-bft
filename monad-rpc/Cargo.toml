@@ -24,6 +24,7 @@ jemallocator = ["tikv-jemallocator", "monad-pprof/jemallocator"]
 [dependencies]
 monad-archive = { workspace = true }
 monad-chain-config = { workspace = true }
+monad-cosmos-integration = { workspace = true }
 monad-eth-txpool-ipc = { workspace = true }
 monad-eth-txpool-types = { workspace = true }
 monad-eth-types = { workspace = true }
@@ -50,6 +51,7 @@ alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-rpc-types = { workspace = true, features = ["eth"] }
 async-stream = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
@@ -70,6 +72,7 @@ schemars = { workspace = true, features = ["preserve_order", "raw_value"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_cbor = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "fs"] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }

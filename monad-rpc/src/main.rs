@@ -23,6 +23,7 @@ use monad_event_ring::{EventRing, EventRingPath};
 use monad_node_config::MonadNodeConfig;
 use monad_pprof::start_pprof_server;
 use monad_rpc::{
+    node_rpc::{resources::NodeRpcResources, server::configure_routes as node_rpc_configure_routes},
     comparator::RpcComparator,
     data::{
         buffer::ExecEventsBuffer,
@@ -416,7 +417,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(app_state.clone()))
                 .service(web::resource("/").route(web::post().to(rpc_handler)))
         })
-        .bind((args.rpc_addr, args.rpc_port))?
+        .bind((args.rpc_addr.clone(), args.rpc_port))?
         .shutdown_timeout(1)
         .workers(args.worker_threads)
         .run(),
@@ -429,13 +430,35 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(app_state.clone()))
                 .service(web::resource("/").route(web::post().to(rpc_handler)))
         })
-        .bind((args.rpc_addr, args.rpc_port))?
+        .bind((args.rpc_addr.clone(), args.rpc_port))?
         .shutdown_timeout(1)
         .workers(args.worker_threads)
         .run(),
     };
 
     let ws_fut = ws_server_handle.map(|ws| ws.run());
+
+    // Start the Node RPC server (CometBFT-compatible) if --comet-port is specified.
+    let node_rpc_server_fut = if let Some(comet_port) = args.comet_port {
+        let chain_id_str = node_config.chain_id.to_string();
+        let node_res = NodeRpcResources::new(chain_id_str, args.cosmos_ipc_path);
+
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(node_res.clone()))
+                .configure(node_rpc_configure_routes)
+        })
+        .bind((args.rpc_addr.clone(), comet_port))
+        .expect("Failed to bind Node RPC server")
+        .shutdown_timeout(1)
+        .workers(2)
+        .run();
+
+        info!(port = comet_port, "Node RPC server listening");
+        Some(server)
+    } else {
+        None
+    };
 
     tokio::select! {
         result = app => {
@@ -444,6 +467,16 @@ async fn main() -> std::io::Result<()> {
 
         result = async {
             if let Some(fut) = ws_fut {
+                fut.await
+            } else {
+                futures::future::pending().await
+            }
+        } => {
+            let () = result?;
+        }
+
+        result = async {
+            if let Some(fut) = node_rpc_server_fut {
                 fut.await
             } else {
                 futures::future::pending().await
