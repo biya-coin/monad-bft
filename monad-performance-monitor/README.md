@@ -5,7 +5,8 @@
 当前日志格式示例：
 
 ```text
-msg=block_total_duration height=123 total_ms=87.421 committed_ms=84.115 stage_durations=prepare_proposal:10.002,process_proposal:12.337,finalize_block:61.776
+msg=consensus height=123 new_height=4.228 new_round=8.120 propose=11.004 prevote=17.553 precommit=22.331 commit=28.108 total=87.421
+msg=txs height=123 txs=42
 ```
 
 ## 目录说明
@@ -49,31 +50,31 @@ msg=block_total_duration height=123 total_ms=87.421 committed_ms=84.115 stage_du
 
 ## Dashboard 内容
 
-这个 dashboard 基于 `msg=block_total_duration` 日志，主要展示：
+这个 dashboard 基于 `msg=consensus` 和 `msg=txs` 日志，主要展示：
 
 - 观测窗口内区块数
-- 平均总耗时 `total_ms`
-- 平均提交耗时 `committed_ms`
-- 最大总耗时
-- 总耗时趋势
-- 提交耗时趋势
-- 原始区块耗时日志（包含 `height` 和 `stage_durations`）
+- 观测窗口内总交易数
+- 平均出块时间 `total`
+- 平均 TPS
+- 共识阶段耗时趋势（包含 `new_height / new_round / propose / prevote / precommit / commit / total`）
 
 ## 验证采集是否成功
 
 如果日志已经打到容器标准输出，可以在 Grafana Explore 里先跑这条 Loki 查询：
 
 ```logql
-{job="monad-docker", service=~"monad-a"} |= "msg=block_total_duration"
+{job="monad-docker", service=~"monad-a"} |= "msg=consensus"
 ```
 
 如果能看到类似下面的日志，说明链路是通的：
 
 ```text
-msg=block_total_duration height=123 total_ms=87.421 committed_ms=84.115 stage_durations=prepare_proposal:10.002,process_proposal:12.337,finalize_block:61.776
+msg=consensus height=123 new_height=4.228 new_round=8.120 propose=11.004 prevote=17.553 precommit=22.331 commit=28.108 total=87.421
+msg=txs height=123 txs=42
 ```
 
 ## 说明
 
-- `stage_durations` 当前是字符串字段，dashboard 里保留了日志明细面板用于逐块查看各阶段耗时。
-- 如果后续希望把每个阶段单独做成曲线，建议把阶段耗时改成结构化日志字段，或者为每个阶段单独输出一条日志。
+- `msg=consensus` 采用固定字段结构化日志，Grafana 可直接按字段出图。
+- TPS 不需要单独埋点计算，只依赖 `msg=txs height=... txs=...` 日志在 Grafana 中聚合统计。
+- 阶段耗时与总耗时的展示风格对齐 [monad-bft/biyachain-core/monitor/grafana/grafana-loki.json](monad-bft/biyachain-core/monitor/grafana/grafana-loki.json) 中的参考面板。

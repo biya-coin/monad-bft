@@ -1464,17 +1464,20 @@ where
                     ) {
                         Ok(header) => {
                             let committed_height = header.height;
+                            let committed_txs = body.txs.len();
                             if let Err(err) = self.store.lock().unwrap().commit(header) {
                                 warn!(?err, "failed to persist cosmos commit");
                                 self.pending_app_commits.insert(next_height, block);
                                 break;
                             }
                             self.purge_mempool_txs_for_committed_block(&block);
-                            let _ = performance_monitor::record_stage_timestamp(
+                            println!(
+                                "msg=txs height={} txs={}",
                                 committed_height,
-                                "finalize_commit_done",
+                                committed_txs,
                             );
-                            let _ = performance_monitor::mark_block_committed(committed_height);
+                            let _ = performance_monitor::record_step(committed_height, "new_height");
+                            performance_monitor::flush_block(committed_height);
                         }
                         Err(err) => {
                             warn!(?err, "failed to encode cosmos commit");

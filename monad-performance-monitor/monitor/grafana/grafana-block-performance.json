@@ -25,7 +25,7 @@
         "type": "loki",
         "uid": "${DS_LOKI}"
       },
-      "description": "观测窗口内 block_total_duration 日志条数，即已记录提交耗时的区块数量",
+      "description": "观测窗口内的出块数量",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -75,7 +75,7 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "count_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=block_total_duration\" [$__range])",
+          "expr": "count_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" [$__range])",
           "instant": true,
           "queryType": "instant",
           "legendFormat": "区块数",
@@ -90,7 +90,7 @@
         "type": "loki",
         "uid": "${DS_LOKI}"
       },
-      "description": "平均总耗时：对 total_ms 做窗口均值，单位 ms",
+      "description": "平均出块时间 = avg_over_time(total [$__range])，窗口内所有区块总耗时的平均值，单位 ms",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -140,14 +140,14 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=block_total_duration\" | logfmt | unwrap total_ms [$__range]))",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap total | __error__=\"\" [$__range]))",
           "instant": true,
           "queryType": "instant",
-          "legendFormat": "平均总耗时",
+          "legendFormat": "均值",
           "refId": "A"
         }
       ],
-      "title": "平均总耗时",
+      "title": "平均出块时间",
       "type": "stat"
     },
     {
@@ -155,12 +155,12 @@
         "type": "loki",
         "uid": "${DS_LOKI}"
       },
-      "description": "平均提交耗时：对 committed_ms 做窗口均值，单位 ms",
+      "description": "观测窗口内打包的总交易数",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "fixed",
-            "fixedColor": "orange"
+            "fixedColor": "purple"
           },
           "mappings": [],
           "thresholds": {
@@ -172,8 +172,8 @@
               }
             ]
           },
-          "unit": "ms",
-          "decimals": 2
+          "unit": "locale",
+          "decimals": 0
         },
         "overrides": []
       },
@@ -205,14 +205,14 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=block_total_duration\" | logfmt | unwrap committed_ms [$__range]))",
+          "expr": "sum by () (sum_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=txs\" | logfmt | unwrap txs | __error__=\"\" [$__range]))",
           "instant": true,
           "queryType": "instant",
-          "legendFormat": "平均提交耗时",
+          "legendFormat": "总交易数",
           "refId": "A"
         }
       ],
-      "title": "平均提交耗时",
+      "title": "总交易数（观测窗口）",
       "type": "stat"
     },
     {
@@ -220,13 +220,79 @@
         "type": "loki",
         "uid": "${DS_LOKI}"
       },
-      "description": "总耗时趋势：按时间窗口查看 total_ms 变化",
+      "description": "sum(txs in range) / $__range_s，反映观测窗口内的平均 TPS",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "purple",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "sum by () (sum_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=txs\" | logfmt | unwrap txs | __error__=\"\" [$__range])) / $__range_s",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "TPS",
+          "refId": "A"
+        }
+      ],
+      "title": "TPS（总交易数÷窗口秒数）",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "description": "共识各阶段每块耗时（Loki），同时展示总出块时间与各阶段耗时",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
           "custom": {
+            "axisLabel": "耗时 (ms)",
             "drawStyle": "line",
             "fillOpacity": 8,
             "lineWidth": 2,
@@ -262,8 +328,8 @@
         },
         "tooltip": {
           "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -273,14 +339,86 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=block_total_duration\" | logfmt | unwrap total_ms [$__interval]))",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap total | __error__=\"\" [$__interval]))",
           "instant": false,
           "queryType": "range",
-          "legendFormat": "total_ms",
+          "legendFormat": "出块时间",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap new_height | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[1] NewHeight",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap new_round | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[2] NewRound",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap propose | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[3] Propose",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap prevote | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[4] Prevote",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap precommit | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[5] Precommit",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=consensus\" | logfmt | unwrap commit | __error__=\"\" [$__interval]))",
+          "instant": false,
+          "queryType": "range",
+          "legendFormat": "[6] Commit",
+          "refId": "G"
         }
       ],
-      "title": "总耗时趋势",
+      "title": "共识阶段耗时趋势",
       "type": "timeseries"
     },
     {
@@ -288,13 +426,79 @@
         "type": "loki",
         "uid": "${DS_LOKI}"
       },
-      "description": "提交耗时趋势：按时间窗口查看 committed_ms 变化",
+      "description": "平均每块交易数 = avg_over_time(txs [$__range])，窗口内每个区块 txs 的平均值，等价于总交易数 ÷ 总块数",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "purple",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 12
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "${DS_LOKI}"
+          },
+          "editorMode": "code",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=txs\" | logfmt | unwrap txs | __error__=\"\" [$__range]))",
+          "instant": true,
+          "queryType": "instant",
+          "legendFormat": "均值",
+          "refId": "A"
+        }
+      ],
+      "title": "平均每块交易数",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "description": "每个点表示 $__interval 窗口内各区块 txs 的平均值，用于观察每块交易数随时间的变化趋势",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "palette-classic"
           },
           "custom": {
+            "axisLabel": "交易数",
             "drawStyle": "line",
             "fillOpacity": 8,
             "lineWidth": 2,
@@ -309,18 +513,18 @@
               "mode": "off"
             }
           },
-          "unit": "ms",
+          "unit": "none",
           "decimals": 2
         },
         "overrides": []
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
-        "x": 0,
+        "w": 18,
+        "x": 6,
         "y": 12
       },
-      "id": 5,
+      "id": 7,
       "options": {
         "legend": {
           "calcs": [],
@@ -341,14 +545,14 @@
             "uid": "${DS_LOKI}"
           },
           "editorMode": "code",
-          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=block_total_duration\" | logfmt | unwrap committed_ms [$__interval]))",
+          "expr": "avg by () (avg_over_time({job=\"monad-docker\", service=~\"$SERVICE\"} |= \"msg=txs\" | logfmt | unwrap txs | __error__=\"\" [$__interval]))",
           "instant": false,
           "queryType": "range",
-          "legendFormat": "committed_ms",
+          "legendFormat": "交易数",
           "refId": "A"
         }
       ],
-      "title": "提交耗时趋势",
+      "title": "区块交易数",
       "type": "timeseries"
     }
   ],
@@ -421,6 +625,6 @@
   "timezone": "browser",
   "title": "Block Performance 统计",
   "uid": "block_performance_loki",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

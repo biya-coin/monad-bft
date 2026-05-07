@@ -49,6 +49,7 @@ use monad_consensus_types::{
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
+use monad_performance_monitor as performance_monitor;
 use monad_state_backend::StateBackend;
 use monad_types::{BlockId, Epoch, ExecutionProtocol, NodeId, Round, RouterTarget, SeqNum};
 use monad_validator::{
