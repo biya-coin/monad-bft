@@ -1,27 +1,58 @@
-# Runtime-only image for monad-node
-# Binary files should be mounted from host at runtime
-FROM ubuntu:22.04
+# Runtime-only image for monad-node and monad-rpc
+# Binaries are compiled on ubuntu:22.04 with boost 1.83 (ppa:mhier/libboost-latest).
+# Runtime image must use the same OS + same PPA to match sonames.
+FROM ubuntu:25.04 AS base
 
 WORKDIR /usr/src/monad-bft
 
-# Install runtime dependencies only
 RUN apt update && apt install -y \
-  libboost-atomic1.74.0 \
-  libboost-container1.74.0 \
-  libboost-fiber1.74.0 \
-  libboost-filesystem1.74.0 \
-  libboost-graph1.74.0 \
-  libboost-regex1.74.0 \
-  libstdc++6 \
-  libgmp10 \
-  liburing2 \
-  libzstd1 \
+  binutils \
+  iproute2 \
+  clang \
+  curl \
+  make \
   ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+  pkg-config \
+  gnupg \
+  software-properties-common \
+  wget \
+  git \
+  python-is-python3 \
+  cgroup-tools \
+  libstdc++-15-dev \
+  gcc-15 \
+  g++-15
+
+RUN apt update && apt install -y \
+  libboost-atomic1.83.0 \
+  libboost-container1.83.0 \
+  libboost-fiber1.83.0 \
+  libboost-filesystem1.83.0 \
+  libboost-graph1.83.0 \
+  libboost-json1.83.0 \
+  libboost-regex1.83.0 \
+  libboost-stacktrace1.83.0
+
+RUN apt update && apt install -y \
+  libabsl-dev \
+  libarchive-dev \
+  libbenchmark-dev \
+  libbrotli-dev \
+  libcap-dev \
+  libcgroup-dev \
+  libcli11-dev \
+  libcrypto++-dev \
+  libgmock-dev \
+  libgmp-dev \
+  libgtest-dev \
+  libhugetlbfs-dev \
+  libmagicenum-dev \
+  libmimalloc-dev \
+  libtbb-dev \
+  liburing-dev \
+  libzstd-dev
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
-# Binary will be mounted at /usr/local/bin/monad-node from host
-# Shared libraries will be mounted at /usr/local/lib from host (if needed)

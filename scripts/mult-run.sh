@@ -6,7 +6,7 @@ export MONAD_BFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export WORK="$MONAD_BFT_ROOT/.monad"
 export CHAIN_ID="${CHAIN_ID:-biyachain-1}"
 export BIYACHAIND_BIN="$MONAD_BFT_ROOT/biyachain-core/bin/biyachaind"
-export CHAIN_STRESSER_ROOT="${CHAIN_STRESSER_ROOT:-$(cd "$MONAD_BFT_ROOT/.." && pwd)/chain-stresser}"
+export GEN_ACCOUNTS_BIN="$MONAD_BFT_ROOT/biyachain-core/bin/gen-accounts"
 export KEYRING="${KEYRING:-test}"
 export GENESIS_BALANCE="${GENESIS_BALANCE:-1000000000000000000000byb}"
 export GENTX_STAKE="${GENTX_STAKE:-500000000000000000000byb}"
@@ -35,25 +35,17 @@ generate_stress_accounts() {
     echo "generate $STRESS_ACCOUNTS_NUM stress accounts"
     echo "--------------------------------"
 
-    if [[ ! -d "$CHAIN_STRESSER_ROOT" ]]; then
-        echo "错误: 找不到 chain-stresser 仓库目录 $CHAIN_STRESSER_ROOT" >&2
-        exit 1
-    fi
-
-    local keyring_dir="$WORK/stress-keyring"
-    rm -rf "$keyring_dir"
     mkdir -p "$STRESS_ACCOUNTS_DIR"
 
-    local gen_bin="$CHAIN_STRESSER_ROOT/bin/gen-accounts"
-    if [[ ! -x "$gen_bin" ]]; then
+    if [[ ! -x "$GEN_ACCOUNTS_BIN" ]]; then
         echo "building gen-accounts..."
         (
-            cd "$CHAIN_STRESSER_ROOT"
-            go build -o "$gen_bin" ./cmd/gen-accounts/
+            cd "$MONAD_BFT_ROOT/biyachain-core"
+            go build -o "$GEN_ACCOUNTS_BIN" ./cmd/gen-accounts/
         )
     fi
 
-    "$gen_bin" generate \
+    "$GEN_ACCOUNTS_BIN" generate \
         --num "$STRESS_ACCOUNTS_NUM" \
         --out "$STRESS_ACCOUNTS_DIR"
 
@@ -63,7 +55,6 @@ generate_stress_accounts() {
     fi
 
     echo "stress accounts written to $STRESS_ACCOUNTS_DIR/accounts.json"
-    echo "stress keyring written to $keyring_dir"
 }
 
 ensure_stress_accounts_generated() {
@@ -96,13 +87,12 @@ add_stress_accounts_to_genesis() {
     echo "add $STRESS_ACCOUNTS_NUM stress accounts to genesis"
     echo "--------------------------------"
 
-    local gen_bin="$CHAIN_STRESSER_ROOT/bin/gen-accounts"
-    if [[ ! -x "$gen_bin" ]]; then
+    if [[ ! -x "$GEN_ACCOUNTS_BIN" ]]; then
         echo "building gen-accounts..."
-        (cd "$CHAIN_STRESSER_ROOT" && go build -o "$gen_bin" ./cmd/gen-accounts/)
+        (cd "$MONAD_BFT_ROOT/biyachain-core" && go build -o "$GEN_ACCOUNTS_BIN" ./cmd/gen-accounts/)
     fi
 
-    "$gen_bin" genesis-add \
+    "$GEN_ACCOUNTS_BIN" genesis-add \
         --addresses "$addresses_file" \
         --genesis "$WORK/biyachain-home-a/config/genesis.json" \
         --balance-byb "$STRESS_ACCOUNT_BALANCE_BYB" \
