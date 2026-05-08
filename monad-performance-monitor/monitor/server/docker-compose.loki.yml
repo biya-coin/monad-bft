@@ -15,7 +15,6 @@ services:
     container_name: promtail
     volumes:
       - ./promtail.yaml:/etc/promtail/config.yaml
-      - /home/ubuntu/biyachain/chain-stresser/node-log:/var/log:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command: -config.file=/etc/promtail/config.yaml
