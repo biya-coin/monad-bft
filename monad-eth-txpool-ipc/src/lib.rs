@@ -183,7 +183,8 @@ impl EthTxPoolIpcClient {
             )
         })??;
 
-        let snapshot = bincode::deserialize::<EthTxPoolSnapshot>(&snapshot_bytes).unwrap();
+        let snapshot = bincode::deserialize::<EthTxPoolSnapshot>(&snapshot_bytes)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
 
         Ok((Self { stream }, snapshot))
     }

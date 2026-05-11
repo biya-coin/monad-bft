@@ -25,6 +25,7 @@ services:
           --grpc.enable=true \
           --grpc.address=0.0.0.0:9900 \
           --json-rpc.enable=false \
+          --optimistic-execution-enabled=${OPTIMISTIC_EXECUTION_ENABLED:-false} \
           --minimum-gas-prices 1byb
 
   monad-a:
@@ -104,6 +105,7 @@ services:
           --grpc.enable=true \
           --grpc.address=0.0.0.0:9900 \
           --json-rpc.enable=false \
+          --optimistic-execution-enabled=${OPTIMISTIC_EXECUTION_ENABLED:-false} \
           --minimum-gas-prices 1byb
 
   monad-b:
@@ -182,6 +184,7 @@ services:
           --grpc.enable=true \
           --grpc.address=0.0.0.0:9900 \
           --json-rpc.enable=false \
+          --optimistic-execution-enabled=${OPTIMISTIC_EXECUTION_ENABLED:-false} \
           --minimum-gas-prices 1byb
 
   monad-c:
@@ -260,6 +263,7 @@ services:
           --grpc.enable=true \
           --grpc.address=0.0.0.0:9900 \
           --json-rpc.enable=false \
+          --optimistic-execution-enabled=${OPTIMISTIC_EXECUTION_ENABLED:-false} \
           --minimum-gas-prices 1byb
 
   monad-d:
@@ -322,11 +326,11 @@ services:
         soft: 65536
         hard: 65536
     environment:
-      LD_LIBRARY_PATH: /usr/local/lib/rpc-lib
+      LD_LIBRARY_PATH: /biyachain-lib:/usr/local/lib
     volumes:
       - ./monad-a:/monad:ro
       - ../target/release/monad-rpc:/usr/local/bin/monad-rpc:ro
-      - ./rpc-lib:/usr/local/lib/rpc-lib:ro
+      - ./biyachain-lib:/biyachain-lib:ro
     networks:
       monad_net:
         ipv4_address: 172.28.0.50

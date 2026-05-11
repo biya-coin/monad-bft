@@ -24,10 +24,6 @@ init_workspace_templates() {
         rm -rf "$WORK/biyachain-lib"
         cp -a "$MONAD_BFT_ROOT/biyachain-lib" "$WORK/biyachain-lib"
     fi
-    if [[ -e "$MONAD_BFT_ROOT/docker/devnet/rpc-lib" ]]; then
-        rm -rf "$WORK/rpc-lib"
-        cp -a "$MONAD_BFT_ROOT/docker/devnet/rpc-lib" "$WORK/rpc-lib"
-    fi
 }
 
 generate_stress_accounts() {
