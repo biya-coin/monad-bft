@@ -1,0 +1,17 @@
+[package]
+name = "monad-abci-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+monad-cometbft-proto = { workspace = true }
+once_cell = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "net"] }
+tonic = { workspace = true, features = ["transport"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
