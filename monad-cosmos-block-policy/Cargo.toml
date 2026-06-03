@@ -1,0 +1,22 @@
+[package]
+name = "monad-cosmos-block-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Cosmos block policy, state backend and block validator for Monad consensus"
+
+[lib]
+bench = false
+
+[dependencies]
+monad-chain-config = { workspace = true }
+monad-consensus-types = { workspace = true }
+monad-cosmos-types = { workspace = true }
+monad-crypto = { workspace = true }
+monad-eth-types = { workspace = true }
+monad-state-backend = { workspace = true }
+monad-txpool = { workspace = true }
+monad-types = { workspace = true }
+monad-validator = { workspace = true }
+
+alloy-primitives = { workspace = true }
+tracing = { workspace = true }

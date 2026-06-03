@@ -32,13 +32,12 @@ use monad_chain_config::ChainConfig;
 use monad_consensus_state::ConsensusConfig;
 use monad_consensus_types::{metrics::Metrics, validator_data::ValidatorSetDataWithEpoch};
 use monad_control_panel::ipc::ControlPanelIpcReceiver;
-use monad_cosmos_integration::{
-    cosmos_txpool_ipc, CosmosBlockPolicy, CosmosBlockValidator, CosmosCommitStore, CosmosLedger,
-    CosmosStateBackend, CosmosTxPoolExecutor,
-};
+use monad_cosmos_block_policy::{CosmosBlockPolicy, CosmosBlockValidator, CosmosStateBackend};
+use monad_cosmos_ledger::CosmosLedger;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
+use monad_txpool::{cosmos_txpool_ipc, CosmosCommitStore, CosmosTxPoolExecutor};
 use monad_dataplane::{DataplaneBuilder, TcpSocketId, UdpSocketId};
 use monad_executor::{Executor, ExecutorMetricsChain};
 use monad_executor_glue::{LogFriendlyMonadEvent, Message, MonadEvent};
@@ -213,7 +212,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .sync_with_abci_app(&abci_endpoint)
         .expect("cosmos commit store should match ABCI app height (see docs/monad-cosmos-abci-debugging.md if this fails)");
     let commit_store = Arc::new(std::sync::Mutex::new(genesis_store));
-    let create_block_policy = || CosmosBlockPolicy;
+    let create_block_policy = || CosmosBlockPolicy::new(EXECUTION_DELAY, abci_endpoint.clone());
     let state_backend = CosmosStateBackend::new(commit_store.clone());
 
     let cosmos_ipc_checked = cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_checked_ingress(
@@ -250,7 +249,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         timestamp: TokioTimestamp::new(Duration::from_millis(5), 100, 10001),
         txpool: CosmosTxPoolExecutor::new(
             abci_endpoint.clone(),
-            commit_store.clone(),
             cosmos_ipc_checked,
         ),
         control_panel: ControlPanelIpcReceiver::new(

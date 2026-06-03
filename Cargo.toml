@@ -28,10 +28,12 @@ ignored = [
 ]
 
 [workspace.dependencies]
+monad-abci-client = { path = "./monad-abci-client" }
 monad-archive = { path = "./monad-archive" }
 monad-block-persist = { path = "./monad-block-persist" }
 monad-blocksync = { path = "./monad-blocksync" }
 monad-blocktree = { path = "./monad-blocktree" }
+monad-txpool = { path = "./monad-txpool" }
 monad-bls = { path = "./monad-bls" }
 monad-chain-config = { path = "./monad-chain-config" }
 monad-cometbft-proto = { path = "./monad-cometbft-proto" }
@@ -40,7 +42,8 @@ monad-consensus = { path = "./monad-consensus" }
 monad-consensus-state = { path = "./monad-consensus-state" }
 monad-consensus-types = { path = "./monad-consensus-types" }
 monad-control-panel = { path = "./monad-control-panel" }
-monad-cosmos-integration = { path = "./monad-cosmos-integration" }
+monad-cosmos-block-policy = { path = "./monad-cosmos-block-policy" }
+monad-cosmos-ledger = { path = "./monad-cosmos-ledger" }
 monad-cosmos-types = { path = "./monad-cosmos-types" }
 monad-crypto = { path = "./monad-crypto" }
 monad-dataplane = { path = "./monad-dataplane" }

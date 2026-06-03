@@ -149,7 +149,7 @@ async fn forward_tx(
         json_err(id, -32603, "cosmos IPC path not configured; broadcast unavailable")
     })?;
 
-    monad_cosmos_integration::cosmos_txpool_ipc::feed_raw_txs(ipc_path, vec![tx_bytes])
+    monad_txpool::cosmos_txpool_ipc::feed_raw_txs(ipc_path, vec![tx_bytes])
         .await
         .map_err(|e| {
             warn!("broadcast_tx: IPC forward failed: {e}");

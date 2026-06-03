@@ -1,12 +1,8 @@
-//! Unix socket ingress for **Cosmos SDK raw transaction bytes** into `monad-node`, using the same
-//! framing style as `monad-eth-txpool-ipc`: length-delimited frames, first frame is a bincode
-//! snapshot, subsequent client→server frames are RLP-encoded [`CosmosTxPoolIpcTx`] (raw protobuf
-//! `Tx` / `TxRaw` bytes as produced by `biyachaind tx ... --generate-only` + signing).
-//!
-//! This is the Cosmos analogue of `EthTxPoolIpcClient` → `EthTxPoolIpcServer` → `InsertForwardedTxs`.
+//! Unix socket ingress for Cosmos SDK raw transactions into monad-node.
 
 use std::io::{self, ErrorKind};
 use std::path::Path;
+use std::time::Duration;
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use bytes::Bytes;
@@ -22,17 +18,14 @@ fn build_length_delimited_codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
-/// Handshake payload (mirrors `EthTxPoolSnapshot` role). Empty for now.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CosmosTxPoolSnapshot {}
 
-/// One transaction on the wire: raw bytes as CometBFT / SDK expect in `FinalizeBlock.txs`.
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct CosmosTxPoolIpcTx {
     pub tx: Vec<u8>,
 }
 
-/// Connect, read snapshot, send one or more raw txs (same connection semantics as the ETH bridge).
 pub async fn feed_raw_txs(path: impl AsRef<Path>, txs: Vec<Vec<u8>>) -> io::Result<()> {
     let path = path.as_ref();
     let stream = UnixStream::connect(path).await?;
@@ -58,9 +51,6 @@ pub async fn feed_raw_txs(path: impl AsRef<Path>, txs: Vec<Vec<u8>>) -> io::Resu
     Ok(())
 }
 
-/// Bind `bind_path`, spawn accept loop, return a receiver of raw tx batches.
-///
-/// Each IPC frame yields one `Vec<Bytes>` of length 1.
 pub fn spawn_cosmos_txpool_ipc_server(
     bind_path: std::path::PathBuf,
 ) -> Result<tokio::sync::mpsc::Receiver<Vec<Bytes>>, io::Error> {
@@ -84,6 +74,7 @@ pub fn spawn_cosmos_txpool_ipc_server(
                 }
                 Err(e) => {
                     warn!(?e, "cosmos txpool ipc accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -121,8 +112,6 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Raw IPC → ABCI `CheckTx` (async) → batches for [`crate::CosmosTxPoolExecutor`] to ingest from its
-/// [`futures::Stream`] (`poll_next`), mirroring ETH `EthTxPoolIpcServer` feeding the txpool poll loop.
 pub fn spawn_cosmos_txpool_ipc_checked_ingress(
     bind_path: std::path::PathBuf,
     abci_endpoint: String,
@@ -138,15 +127,14 @@ async fn cosmos_txpool_ipc_check_bridge(
     out: tokio::sync::mpsc::Sender<Vec<Bytes>>,
     endpoint: String,
 ) {
-    use crate::check_tx_via_transport;
     while let Some(batch) = raw_rx.recv().await {
         let mut accepted = Vec::new();
         for tx in batch {
-            tracing::info!("check_tx_via_transport: {}", tx.len());
-            match check_tx_via_transport(&endpoint, tx.as_ref()).await {
+            tracing::debug!("check_tx: {}", tx.len());
+            match crate::check_tx(&endpoint, tx.as_ref()).await {
                 Ok(resp) if resp.code == 0 => accepted.push(tx),
                 Ok(resp) => {
-                    tracing::info!(
+                    tracing::debug!(
                         code = resp.code,
                         codespace = %resp.codespace,
                         "cosmos txpool IPC CheckTx rejected"

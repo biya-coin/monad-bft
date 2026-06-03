@@ -4829,6 +4829,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "monad-abci-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "monad-cometbft-proto",
+ "once_cell",
+ "prost 0.13.5",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.12.3",
+ "tracing",
+]
+
+[[package]]
 name = "monad-archive"
 version = "0.1.0"
 dependencies = [
@@ -5067,42 +5082,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "monad-cosmos-integration"
+name = "monad-cosmos-block-policy"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "alloy-rlp",
- "bincode",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "monad-block-persist",
- "monad-blocksync",
  "monad-chain-config",
- "monad-cometbft-proto",
  "monad-consensus-types",
  "monad-cosmos-types",
  "monad-crypto",
  "monad-eth-types",
- "monad-executor",
- "monad-executor-glue",
- "monad-multi-sig",
- "monad-performance-monitor",
  "monad-state-backend",
+ "monad-txpool",
  "monad-types",
  "monad-validator",
- "once_cell",
- "prost 0.13.5",
- "prost-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "monad-cosmos-ledger"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "monad-block-persist",
+ "monad-blocksync",
+ "monad-consensus-types",
+ "monad-cosmos-types",
+ "monad-crypto",
+ "monad-executor",
+ "monad-executor-glue",
+ "monad-types",
+ "monad-validator",
  "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic 0.12.3",
  "tracing",
 ]
 
@@ -5699,7 +5709,8 @@ dependencies = [
  "monad-consensus-state",
  "monad-consensus-types",
  "monad-control-panel",
- "monad-cosmos-integration",
+ "monad-cosmos-block-policy",
+ "monad-cosmos-ledger",
  "monad-crypto",
  "monad-dataplane",
  "monad-executor",
@@ -5714,6 +5725,7 @@ dependencies = [
  "monad-secp",
  "monad-state",
  "monad-state-backend",
+ "monad-txpool",
  "monad-types",
  "monad-updaters",
  "monad-validator",
@@ -5988,7 +6000,6 @@ dependencies = [
  "itertools 0.13.0",
  "monad-archive",
  "monad-chain-config",
- "monad-cosmos-integration",
  "monad-eth-testutil",
  "monad-eth-txpool-ipc",
  "monad-eth-txpool-types",
@@ -6001,6 +6012,7 @@ dependencies = [
  "monad-rpc-docs",
  "monad-tracing-timing",
  "monad-triedb-utils",
+ "monad-txpool",
  "monad-types",
  "monad-version",
  "opentelemetry",
@@ -6333,6 +6345,39 @@ dependencies = [
  "rand_chacha 0.3.1",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "monad-txpool"
+version = "0.1.0"
+dependencies = [
+ "alloy-rlp",
+ "bincode",
+ "bytes",
+ "chrono",
+ "futures",
+ "monad-abci-client",
+ "monad-chain-config",
+ "monad-cometbft-proto",
+ "monad-consensus-types",
+ "monad-cosmos-types",
+ "monad-crypto",
+ "monad-executor",
+ "monad-executor-glue",
+ "monad-performance-monitor",
+ "monad-state-backend",
+ "monad-types",
+ "monad-validator",
+ "prost 0.13.5",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

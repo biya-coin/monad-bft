@@ -1,0 +1,23 @@
+[package]
+name = "monad-cosmos-ledger"
+version = "0.1.0"
+edition = "2021"
+description = "Cosmos ledger (BFT block persistence and blocksync) for Monad consensus"
+
+[lib]
+bench = false
+
+[dependencies]
+monad-block-persist = { workspace = true }
+monad-blocksync = { workspace = true }
+monad-consensus-types = { workspace = true }
+monad-cosmos-types = { workspace = true }
+monad-crypto = { workspace = true }
+monad-executor = { workspace = true }
+monad-executor-glue = { workspace = true }
+monad-types = { workspace = true }
+monad-validator = { workspace = true }
+
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }

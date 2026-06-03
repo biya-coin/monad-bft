@@ -34,6 +34,10 @@ services:
     privileged: true
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
       MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
@@ -114,6 +118,10 @@ services:
     privileged: true
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
       MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
@@ -193,6 +201,10 @@ services:
     privileged: true
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
       MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json
@@ -272,6 +284,10 @@ services:
     privileged: true
     security_opt:
       - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       MONAD_ABCI_ENDPOINT: unix:///shared/abci.sock
       MONAD_COSMOS_GENESIS_PATH: /monad/genesis.json

@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use monad_cosmos_integration::debug_abci_genesis_handshake;
+use monad_txpool::debug_abci_first_block;
 
 fn main() -> ExitCode {
     let endpoint =
@@ -14,7 +14,7 @@ fn main() -> ExitCode {
                 .join(".biyachaind/config/genesis.json")
         });
 
-    match debug_abci_genesis_handshake(&endpoint, &genesis_path) {
+    match debug_abci_first_block(&endpoint, &genesis_path) {
         Ok(info) => {
             println!("{}", serde_json::to_string_pretty(&info).unwrap());
             ExitCode::SUCCESS

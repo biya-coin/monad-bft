@@ -14,7 +14,8 @@ monad-chain-config = { workspace = true }
 monad-consensus-state = { workspace = true }
 monad-consensus-types = { workspace = true }
 monad-control-panel = { workspace = true }
-monad-cosmos-integration = { workspace = true }
+monad-cosmos-block-policy = { workspace = true }
+monad-cosmos-ledger = { workspace = true }
 monad-crypto = { workspace = true }
 monad-dataplane = { workspace = true }
 monad-executor = { workspace = true }
@@ -29,6 +30,7 @@ monad-router-multi = { workspace = true}
 monad-secp = { workspace = true }
 monad-state = { workspace = true }
 monad-state-backend = { workspace = true }
+monad-txpool = { workspace = true }
 monad-types = { workspace = true }
 monad-updaters = { workspace = true, features = ["monad-triedb", "tokio"] }
 monad-validator = { workspace = true }

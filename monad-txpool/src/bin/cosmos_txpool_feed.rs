@@ -1,15 +1,4 @@
-//! Feed raw Cosmos SDK transaction bytes to `monad-node` via the same Unix socket as the ETH
-//! mempool bridge (`--mempool-ipc-path`).
-//!
-//! Example:
-//! ```text
-//! biyachaind tx bank send ... --generate-only > unsigned.json
-//! biyachaind tx sign ... > signed.json
-//! biyachaind tx encode signed.json > tx.bin
-//! cargo run -p monad-cosmos-integration --bin cosmos-txpool-feed -- /tmp/monad/mempool.sock tx.bin
-//! export MONAD_MEMPOOL_SOCK=/tmp/monad/mempool.sock
-//! cargo run -p monad-cosmos-integration --bin cosmos-txpool-feed -- tx.bin
-//! ```
+//! Feed raw Cosmos SDK transaction bytes to monad-node via the mempool Unix socket.
 
 use std::env;
 use std::ffi::OsString;
@@ -51,9 +40,7 @@ async fn main() -> ExitCode {
             let mut socket = rest.pop().unwrap();
             if socket.is_empty() {
                 let Some(sock) = mempool_sock_from_env() else {
-                    eprintln!(
-                        "error: mempool socket path is empty; pass monad-node's --mempool-ipc-path or set MONAD_MEMPOOL_SOCK"
-                    );
+                    eprintln!("error: mempool socket path is empty; pass monad-node's --mempool-ipc-path or set MONAD_MEMPOOL_SOCK");
                     usage();
                     return ExitCode::FAILURE;
                 };
@@ -77,20 +64,15 @@ async fn main() -> ExitCode {
     let nbytes = raw.len();
     let sock_disp = socket.to_string_lossy().into_owned();
 
-    match monad_cosmos_integration::cosmos_txpool_ipc::feed_raw_txs(&socket, vec![raw]).await {
+    match monad_txpool::cosmos_txpool_ipc::feed_raw_txs(&socket, vec![raw]).await {
         Ok(()) => {
-            eprintln!(
-                "ok: sent 1 tx ({} bytes) to {} (exit 0)",
-                nbytes, sock_disp
-            );
+            eprintln!("ok: sent 1 tx ({} bytes) to {} (exit 0)", nbytes, sock_disp);
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("connect to monad-node mempool unix socket ({sock_disp}): {e}");
             if e.kind() == ErrorKind::NotFound {
-                eprintln!(
-                    "hint: socket file missing — start monad-node first, and use the same path as --mempool-ipc-path (not only MONAD_MEMPOOL_SOCK in your shell)"
-                );
+                eprintln!("hint: socket file missing — start monad-node first, and use the same path as --mempool-ipc-path (not only MONAD_MEMPOOL_SOCK in your shell)");
             }
             ExitCode::FAILURE
         }
