@@ -32,7 +32,10 @@ use monad_chain_config::ChainConfig;
 use monad_consensus_state::ConsensusConfig;
 use monad_consensus_types::{metrics::Metrics, validator_data::ValidatorSetDataWithEpoch};
 use monad_control_panel::ipc::ControlPanelIpcReceiver;
-use monad_cosmos_block_policy::{CosmosBlockPolicy, CosmosBlockValidator, CosmosStateBackend};
+use monad_cosmos_block_policy::{
+    compensate_recent_execution_results_from_abci, CosmosBlockPolicy, CosmosBlockValidator,
+    CosmosStateBackend,
+};
 use monad_cosmos_ledger::CosmosLedger;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
@@ -212,7 +215,26 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .sync_with_abci_app(&abci_endpoint)
         .expect("cosmos commit store should match ABCI app height (see docs/monad-cosmos-abci-debugging.md if this fails)");
     let commit_store = Arc::new(std::sync::Mutex::new(genesis_store));
-    let create_block_policy = || CosmosBlockPolicy::new(EXECUTION_DELAY, abci_endpoint.clone());
+    if let Ok(info) = monad_txpool::block_on_async(async { monad_txpool::info(&abci_endpoint).await })
+    {
+        let app_height = info.last_block_height.max(0) as u64;
+        if app_height > 0 {
+            if let Ok(mut store) = commit_store.lock() {
+                compensate_recent_execution_results_from_abci(
+                    &mut store,
+                    &abci_endpoint,
+                    app_height,
+                    EXECUTION_DELAY,
+                )
+                .expect("cosmos commit store should compensate recent execution results from ABCI");
+            }
+        }
+    }
+    let create_block_policy = {
+        let commit_store = commit_store.clone();
+        let abci_endpoint = abci_endpoint.clone();
+        move || CosmosBlockPolicy::new(EXECUTION_DELAY, abci_endpoint.clone(), commit_store.clone())
+    };
     let state_backend = CosmosStateBackend::new(commit_store.clone());
 
     let cosmos_ipc_checked = cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_checked_ingress(
