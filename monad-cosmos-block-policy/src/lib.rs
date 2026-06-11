@@ -18,7 +18,7 @@ use monad_txpool::{
 };
 use monad_types::{BlockId, Epoch, SeqNum, Stake, GENESIS_BLOCK_ID, GENESIS_SEQ_NUM};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
-use tracing::info;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // CosmosStateBackend
@@ -272,9 +272,20 @@ where
             };
 
         if block.get_seq_num() != extending_seq_num + SeqNum(1) {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                extending_seq_num = extending_seq_num.0,
+                "coherency fail: seq_num not consecutive"
+            );
             return Err(BlockPolicyError::BlockNotCoherent);
         }
         if block.get_timestamp() <= extending_timestamp {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                block_ts = block.get_timestamp(),
+                extending_ts = extending_timestamp,
+                "coherency fail: timestamp not increasing"
+            );
             return Err(BlockPolicyError::TimestampError);
         }
 
@@ -289,6 +300,10 @@ where
                     .map_err(BlockPolicyError::StateBackendError)?]
             };
         if block.get_execution_results() != &expected_execution_results {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                "coherency fail: execution result mismatch"
+            );
             return Err(BlockPolicyError::ExecutionResultMismatch);
         }
 
@@ -298,9 +313,23 @@ where
             &block.body().execution_body,
         );
         let endpoint = self.abci_endpoint.clone();
-        let resp = block_on_async(async move { process_proposal(&endpoint, req).await })
-            .map_err(|_| BlockPolicyError::BlockNotCoherent)?;
+        let resp = match block_on_async(async move { process_proposal(&endpoint, req).await }) {
+            Ok(resp) => resp,
+            Err(err) => {
+                warn!(
+                    seq_num = block.get_seq_num().0,
+                    ?err,
+                    "coherency fail: process_proposal ABCI call errored"
+                );
+                return Err(BlockPolicyError::BlockNotCoherent);
+            }
+        };
         if resp.status != 1 {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                status = resp.status,
+                "coherency fail: process_proposal returned non-accept status"
+            );
             return Err(BlockPolicyError::BlockNotCoherent);
         }
 

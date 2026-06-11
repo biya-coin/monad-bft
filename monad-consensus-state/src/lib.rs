@@ -1896,22 +1896,45 @@ where
                         )
                     };
 
-                let Ok(delayed_execution_results) =
-                    self.block_policy.get_expected_execution_results(
-                        try_propose_seq_num,
-                        pending_blocktree_blocks.clone(),
+                // If the pending branch runs ahead of the blocktree root (ledger finality),
+                // delayed execution results for the tip seq may not exist yet. Fall back to
+                // proposing root+1 one block at a time instead of stalling forever.
+                let root_next_seq =
+                    self.consensus.pending_block_tree.root().seq_num + SeqNum(1);
+                let mut propose_seq_num = try_propose_seq_num;
+                let mut propose_extending = pending_blocktree_blocks.clone();
+                let delayed_execution_results = loop {
+                    match self.block_policy.get_expected_execution_results(
+                        propose_seq_num,
+                        propose_extending.clone(),
                         self.state_backend,
-                    )
-                else {
-                    warn!(
-                        ?node_id,
-                        ?round,
-                        high_certificate =? self.consensus.pacemaker.high_certificate(),
-                        ?try_propose_seq_num,
-                        "no eth_header found, can't propose"
-                    );
-                    self.metrics.consensus_events.rx_execution_lagging += 1;
-                    return cmds;
+                    ) {
+                        Ok(results) => break results,
+                        Err(_) if propose_seq_num > root_next_seq => {
+                            warn!(
+                                ?node_id,
+                                ?round,
+                                ?try_propose_seq_num,
+                                ?root_next_seq,
+                                high_certificate =? self.consensus.pacemaker.high_certificate(),
+                                "execution result missing on ahead branch; proposing ledger root+1"
+                            );
+                            self.metrics.consensus_events.rx_execution_lagging += 1;
+                            propose_seq_num = root_next_seq;
+                            propose_extending.clear();
+                        }
+                        Err(_) => {
+                            warn!(
+                                ?node_id,
+                                ?round,
+                                high_certificate =? self.consensus.pacemaker.high_certificate(),
+                                ?propose_seq_num,
+                                "no eth_header found, can't propose"
+                            );
+                            self.metrics.consensus_events.rx_execution_lagging += 1;
+                            return cmds;
+                        }
+                    }
                 };
                 let _create_proposal_span =
                     tracing::info_span!("create_proposal_span", ?round).entered();
@@ -1922,7 +1945,7 @@ where
                     ?node_id,
                     ?round,
                     ?qc,
-                    ?try_propose_seq_num,
+                    ?propose_seq_num,
                     "emitting create proposal command to txpool"
                 );
 
@@ -1930,7 +1953,7 @@ where
                     node_id: *self.nodeid,
                     epoch,
                     round,
-                    seq_num: try_propose_seq_num,
+                    seq_num: propose_seq_num,
                     high_qc: qc,
                     round_signature,
                     last_round_tc,
@@ -1958,7 +1981,7 @@ where
                     beneficiary: *self.beneficiary,
                     timestamp_ns,
 
-                    extending_blocks: pending_blocktree_blocks.into_iter().cloned().collect(),
+                    extending_blocks: propose_extending.into_iter().cloned().collect(),
                     delayed_execution_results,
                 });
             }

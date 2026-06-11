@@ -1,0 +1,887 @@
+#!/usr/bin/env bash
+# Monad-BFT + chain-stresser 压测编排脚本
+#
+# 用法:
+#   ./scripts/monad-stress-bench.sh setup     # mult-run 初始化（账户 + genesis + monad 配置）
+#   ./scripts/monad-stress-bench.sh build       # 最小集：monad-node + keystore + cosmos-txpool-feed
+#   ./scripts/monad-stress-bench.sh build-full  # 可选：含 monad-rpc（build 已含 26657 serve）
+#   ./scripts/monad-stress-bench.sh run        # 打印本机四终端启动说明（推荐，无需 Docker 镜像）
+#   ./scripts/monad-stress-bench.sh biyachaind [a-d]
+#   ./scripts/monad-stress-bench.sh monad [a-d]
+#   ./scripts/monad-stress-bench.sh setup-ips  # 四节点 P2P 所需 loopback IP（一次性）
+#   ./scripts/monad-stress-bench.sh up        # 可选：docker compose（需镜像，不推荐）
+#   ./scripts/monad-stress-bench.sh stress    # chain-stresser tx-bank-send（可环境变量覆盖）
+#   ./scripts/monad-stress-bench.sh verify    # gRPC 查压测账户 sequence
+#   ./scripts/monad-stress-bench.sh rpc       # cosmos-txpool-feed serve :26657（单节点 test_run 用）
+#   ./scripts/monad-stress-bench.sh down      # docker compose down
+#   ./scripts/monad-stress-bench.sh status    # 检查端口与容器
+#
+# 环境变量（stress 子命令）:
+#   STRESS_ACCOUNTS_NUM  压测账户数（setup 时，默认 1000）
+#   STRESS_ACCOUNTS      accounts.json 路径
+#   STRESS_CMD           bank | spot-limit（默认 bank）
+#   STRESS_ACCOUNTS_NUM_RUN  实际参与压测账户数（默认 50）
+#   STRESS_TRANSACTIONS  每账户交易数（默认 20）
+#   STRESS_RATE_TPS      限速 TPS（默认 30）
+#   STRESS_NODE_ADDR     RPC（默认 127.0.0.1:26657）
+#   STRESS_GRPC_ADDR     gRPC（默认 127.0.0.1:19900）
+#   CHAIN_ID             默认 biyachain-1
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORK="${MONAD_WORK:-$REPO/.monad}"
+
+BIYACHAIND_BIN="${BIYACHAIND_BIN:-$REPO/biyachain-core/bin/biyachaind}"
+CHAIN_ID="${CHAIN_ID:-biyachain-1}"
+STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
+STRESS_ACCOUNTS="${STRESS_ACCOUNTS:-$WORK/instances/0/accounts.json}"
+STRESS_CMD="${STRESS_CMD:-bank}"
+STRESS_ACCOUNTS_NUM_RUN="${STRESS_ACCOUNTS_NUM_RUN:-50}"
+STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-20}"
+STRESS_RATE_TPS="${STRESS_RATE_TPS:-30}"
+STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
+STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
+MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"
+
+SPOT_MARKET_ID="${SPOT_MARKET_ID:-0xb322bce686ec25364be50728812e33741da1d82e9c91c2c89b91b91d26b0e9c5}"
+
+usage() {
+  cat <<EOF
+用法: $0 <command>
+
+  setup       mult-run 初始化（账户 + genesis + monad 配置）
+  build       最小编译：monad-node + keystore + cosmos-txpool-feed
+  build-full  可选：含 monad-rpc（26657 已由 build 的 cosmos-txpool-feed serve 提供）
+  run         打印本机原生启动步骤（推荐，无需 monad-node Docker 镜像）
+  setup-ips   配置四节点 P2P loopback IP（sudo，一次性）
+  biyachaind  前台启动 biyachaind（默认节点 a）
+  monad       前台启动 monad-node（默认节点 a）
+  repair-monad  重建 node.toml P2P 签名（密钥与 node.toml 不一致时用）
+  reset-consensus  清 WAL/ledger 并恢复 genesis forkpoint（共识卡住时用）
+  diagnose       检查高度 4 卡点（cosmos-commits / forkpoint / ABCI）
+  rpc         前台启动 cosmos-txpool-feed serve :26657
+  up          可选：docker compose up（需 monad-node:local 镜像）
+  down        docker compose down
+  nodes       四节点 biyachaind/monad/P2P 状态一览
+  status      端口探测（及 compose 状态）
+  stress      chain-stresser 压测（默认 bank send）
+  verify      gRPC 查压测账户 sequence
+
+文档: docs/monad-chain-stresser-bench.md
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "未找到命令: $1"
+}
+
+ensure_bindgen_clang_env() {
+  # Ubuntu 22.04 默认 clang-14 不支持 bindgen 里的 -std=c23。
+  # gnu2x 足够编 monad-node；monad-rpc 依赖的 exec-events 头文件含 C23 bool/constexpr，需 clang-19。
+  if [[ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ]]; then
+    if command -v clang-19 >/dev/null 2>&1; then
+      export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-19/lib}"
+    elif [[ -d /usr/lib/llvm-14/lib ]]; then
+      export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-14/lib}"
+      export BINDGEN_EXTRA_CLANG_ARGS="-std=gnu2x"
+      echo "note: clang-14 — 已设 BINDGEN_EXTRA_CLANG_ARGS=-std=gnu2x（仅够 build，不含 monad-rpc）"
+    fi
+  fi
+}
+
+ensure_execution_build_env() {
+  export TRIEDB_TARGET="${TRIEDB_TARGET:-triedb_driver}"
+  export ASMFLAGS="${ASMFLAGS:--march=haswell}"
+  export CFLAGS="${CFLAGS:--march=haswell}"
+  export CXXFLAGS="${CXXFLAGS:--march=haswell}"
+}
+
+ensure_c23_compiler_env() {
+  # monad-event-ring 的 CMake 用 c_std_23（bool/nullptr）；系统默认 cc（gcc-11）不支持。
+  if [[ -n "${CC:-}" && -n "${CXX:-}" ]]; then
+    return
+  fi
+  if command -v clang-19 >/dev/null 2>&1 && command -v clang++-19 >/dev/null 2>&1; then
+    export CC=clang-19
+    export CXX=clang++-19
+  elif command -v gcc-15 >/dev/null 2>&1 && command -v g++-15 >/dev/null 2>&1; then
+    export CC=gcc-15
+    export CXX=g++-15
+  fi
+}
+
+ensure_cmake_env() {
+  # 系统 cmake 3.22 不满足 monad-event-ring（需 ≥3.23）；优先用 pip 安装的 cmake。
+  if [[ -x "${HOME}/.local/bin/cmake" ]]; then
+    export PATH="${HOME}/.local/bin:${PATH}"
+  fi
+  local ver
+  ver="$(cmake --version 2>/dev/null | awk '/version/ {print $3; exit}')"
+  if [[ -n "$ver" ]]; then
+    local major minor
+    IFS=. read -r major minor _ <<<"$ver"
+    if (( major < 3 || (major == 3 && minor < 23) )); then
+      echo "note: cmake $ver < 3.23，尝试 pip install --user 'cmake>=3.23' ..."
+      pip3 install --user 'cmake>=3.23' >/dev/null 2>&1 || true
+      [[ -x "${HOME}/.local/bin/cmake" ]] && export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+  fi
+}
+
+have_deb_pkg() {
+  dpkg -s "$1" >/dev/null 2>&1
+}
+
+have_boost_183() {
+  # monad_execution 需 Boost 1.83+（含 json 组件）；Ubuntu 22.04 默认仅 1.74
+  if have_deb_pkg libboost1.83-dev; then
+    return 0
+  fi
+  local cfg
+  for cfg in \
+    /usr/lib/x86_64-linux-gnu/cmake/Boost-1.83.0/BoostConfig.cmake \
+    /usr/lib/cmake/Boost-1.83.0/BoostConfig.cmake; do
+    [[ -f "$cfg" ]] && return 0
+  done
+  return 1
+}
+
+check_build_full_prereqs() {
+  local missing=0
+  ensure_cmake_env
+  ver="$(cmake --version 2>/dev/null | awk '/version/ {print $3; exit}')"
+  if [[ -n "$ver" ]]; then
+    IFS=. read -r major minor _ <<<"$ver"
+    if (( major < 3 || (major == 3 && minor < 23) )); then
+      echo "error: cmake $ver < 3.23（pip3 install --user 'cmake>=3.23'）" >&2
+      missing=1
+    fi
+  fi
+  if ! command -v clang-19 >/dev/null 2>&1; then
+    echo "error: 未找到 clang-19。monad-rpc 的 bindgen 需要 C23（bool/constexpr），clang-14 不够。" >&2
+    echo "       安装: sudo bash monad-execution/scripts/ubuntu-build/install-tools.sh" >&2
+    missing=1
+  fi
+  if ! have_deb_pkg libbsd-dev; then
+    echo "error: 缺少 libbsd-dev（Ubuntu 22.04 上 strlcpy）→ sudo apt install libbsd-dev" >&2
+    missing=1
+  fi
+  if ! have_deb_pkg libgtest-dev; then
+    echo "error: 缺少 libgtest-dev（monad_execution 构建）→ sudo apt install libgtest-dev libgmock-dev" >&2
+    missing=1
+  fi
+  if ! have_deb_pkg libzstd-dev; then
+    echo "error: 缺少 libzstd-dev → sudo apt install libzstd-dev" >&2
+    missing=1
+  fi
+  if ! have_deb_pkg libhugetlbfs-dev; then
+    echo "error: 缺少 libhugetlbfs-dev → sudo apt install libhugetlbfs-dev" >&2
+    missing=1
+  fi
+  if ! have_boost_183; then
+    echo "warn: 未检测到 Boost 1.83（Ubuntu 22.04 默认 1.74 不含 boost::json）" >&2
+    echo "      monad-rpc 将尝试 Docker 编译；原生编译需 Ubuntu 24.04+ 或:" >&2
+    echo "      sudo bash monad-execution/scripts/ubuntu-build/install-boost.sh" >&2
+  fi
+  if (( missing != 0 )); then
+    echo "" >&2
+    echo "或一次性: sudo bash monad-execution/scripts/ubuntu-build/install-tools.sh && sudo bash monad-execution/scripts/ubuntu-build/install-deps.sh" >&2
+    echo "仅 monad-node 压测可先: $0 build" >&2
+    exit 1
+  fi
+}
+
+print_build_hints() {
+  echo "" >&2
+  echo "构建失败常见原因（见 docs/monad-chain-stresser-bench.md#构建故障对照表）：" >&2
+  echo "  1. cmake < 3.23  → pip3 install --user 'cmake>=3.23' 且 export PATH=\$HOME/.local/bin:\$PATH" >&2
+  echo "  2. libbsd-dev / libzstd-dev / libhugetlbfs-dev → sudo apt install libbsd-dev libzstd-dev libhugetlbfs-dev" >&2
+  echo "  3. monad-rpc 需 clang-19（C23 bool/constexpr）→ install-tools.sh" >&2
+  echo "  4. monad-event-ring CMake 勿用 gcc-11：需 CC=clang-19 或 gcc-15（build-full 已自动设置）" >&2
+  echo "  5. Could not find Boost / boost::json | monad_execution | Ubuntu 22.04: $0 build-rpc-docker" >&2
+  echo "  6. 仅压测 monad-node 可先: $0 build（不含 monad-rpc）" >&2
+}
+
+cmd_build_rpc_docker() {
+  need_cmd docker
+  local base_tag="${MONAD_RPC_BASE_IMAGE:-monad-rpc-base:local}"
+  local git_ver="${GIT_TAG_VERSION:-dev-local}"
+  local cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  local rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+  [[ -d "$cargo_home" ]] || die "未找到 Rust cargo 目录: $cargo_home"
+  [[ -d "$rustup_home" ]] || die "未找到 Rust rustup 目录: $rustup_home"
+
+  echo "==> 构建 monad-rpc 编译环境（ubuntu:25.04 + Boost 1.83）"
+  docker build --network=host -f "$REPO/docker/rpc/Dockerfile" --target base \
+    -t "$base_tag" "$REPO"
+
+  echo "==> 容器内编译 monad-rpc（复用宿主机 Rust，避免 sh.rustup.rs DNS 问题）"
+  mkdir -p "$REPO/target/release"
+  local -a docker_env=(
+    -e "TRIEDB_TARGET=triedb_driver"
+    -e "MONAD_VERSION=$git_ver"
+    -e "RUSTUP_HOME=/root/.rustup"
+    -e "CARGO_HOME=/root/.cargo"
+    -e "PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  )
+  if [[ -n "${HTTP_PROXY:-}" ]]; then
+    docker_env+=( -e "HTTP_PROXY=$HTTP_PROXY" -e "http_proxy=$HTTP_PROXY" )
+  fi
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    docker_env+=( -e "HTTPS_PROXY=$HTTPS_PROXY" -e "https_proxy=$HTTPS_PROXY" )
+  fi
+
+  docker run --rm --network=host \
+    -v "$REPO:/usr/src/monad-bft" \
+    -v "$cargo_home:/root/.cargo" \
+    -v "$rustup_home:/root/.rustup" \
+    "${docker_env[@]}" \
+    -w /usr/src/monad-bft \
+    "$base_tag" \
+    bash -c 'set -euo pipefail
+ASMFLAGS="-march=haswell" CFLAGS="-march=haswell -fno-omit-frame-pointer" \
+CXXFLAGS="-march=haswell -fno-omit-frame-pointer" \
+RUSTFLAGS="-C target-cpu=haswell -C force-frame-pointers=yes" \
+CC=gcc-15 CXX=g++-15 \
+cargo build --release -p monad-rpc
+triedb_so="$(find target/release -name "libtriedb_driver.so" -type f 2>/dev/null | head -1)"
+if [[ -n "$triedb_so" ]]; then
+  cp -a "$triedb_so" target/release/
+  ldd "$triedb_so" | python3 /usr/src/monad-bft/docker/filter-dependent-shared-objects.py | while read -r lib; do
+    [[ -f "$lib" ]] && cp -a "$lib" target/release/
+  done
+fi
+find target/release -maxdepth 4 -name "libmonad_execution.so" -type f -exec cp -a {} target/release/ \; 2>/dev/null || true'
+
+  chmod +x "$REPO/target/release/monad-rpc" 2>/dev/null || true
+  [[ -f "$REPO/target/release/monad-rpc" ]] || die "Docker 编译未产出 monad-rpc"
+  ln -sf monad-keystore "$REPO/target/release/keystore" 2>/dev/null || true
+  echo "build-rpc-docker done: $REPO/target/release/monad-rpc"
+}
+
+cmd_build() {
+  echo "==> build biyachaind"
+  (cd "$REPO/biyachain-core" && go build -o bin/biyachaind ./cmd/biyachaind)
+  ensure_bindgen_clang_env
+  ensure_cmake_env
+  ensure_c23_compiler_env
+  ensure_execution_build_env
+  echo "==> build monad-node / keystore / cosmos-txpool-feed"
+  if ! (cd "$REPO" && cargo build --release -p monad-node -p monad-keystore -p monad-peer-discovery --bin sign-name-record -p monad-txpool --bin cosmos-txpool-feed); then
+    print_build_hints
+    exit 1
+  fi
+  # compose 挂载 target/release/keystore，cargo 产物名为 monad-keystore
+  ln -sf monad-keystore "$REPO/target/release/keystore"
+  [[ -f "$REPO/target/release/monad-node" ]] || die "monad-node 未生成，请检查编译日志"
+  echo "build done（cosmos-txpool-feed serve :26657，可替代 monad-rpc 给 chain-stresser）"
+}
+
+cmd_build_full() {
+  check_build_full_prereqs
+  cmd_build
+  if ! have_boost_183; then
+    cmd_build_rpc_docker
+    echo "build-full done（monad-rpc 经 Docker 编译）。"
+    return
+  fi
+  # monad-rpc 必须用 clang-19 + C23，勿沿用 clang-14 的 gnu2x 覆盖
+  unset BINDGEN_EXTRA_CLANG_ARGS
+  export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-19/lib}"
+  ensure_cmake_env
+  ensure_c23_compiler_env
+  ensure_execution_build_env
+  echo "==> build monad-rpc (LIBCLANG_PATH=$LIBCLANG_PATH CC=${CC:-cc} CXX=${CXX:-c++} TRIEDB_TARGET=$TRIEDB_TARGET)"
+  if ! (cd "$REPO" && cargo build --release -p monad-rpc); then
+    print_build_hints
+    exit 1
+  fi
+  ln -sf monad-keystore "$REPO/target/release/keystore"
+  echo "build-full done."
+}
+
+need_setup_build() {
+  [[ ! -x "$BIYACHAIND_BIN" ]] && return 0
+  [[ ! -x "$REPO/target/release/monad-keystore" ]] && return 0
+  [[ ! -x "$REPO/target/release/sign-name-record" ]] && return 0
+  return 1
+}
+
+cmd_setup() {
+  need_cmd docker
+  need_cmd jq
+  if need_setup_build; then
+    cmd_build
+  fi
+  export MONAD_BFT_ROOT="$REPO"
+  export WORK
+  export STRESS_ACCOUNTS_NUM
+  export BIYACHAIND_BIN
+  "$REPO/scripts/mult-run.sh"
+  echo ""
+  echo "setup 完成。工作目录: $WORK"
+  echo "压测账户: $STRESS_ACCOUNTS"
+  echo "下一步: $0 run   # 按说明本机启动节点后 stress"
+}
+
+node_grpc_port() {
+  case "$1" in
+    a) echo 19900 ;;
+    b) echo 29900 ;;
+    c) echo 39900 ;;
+    d) echo 49900 ;;
+    *) die "未知节点: $1（a|b|c|d）" ;;
+  esac
+}
+
+node_monad_ip() {
+  case "$1" in
+    a) echo 172.28.0.10 ;;
+    b) echo 172.28.0.20 ;;
+    c) echo 172.28.0.30 ;;
+    d) echo 172.28.0.40 ;;
+    *) die "未知节点: $1（a|b|c|d）" ;;
+  esac
+}
+
+ensure_stress_workdir() {
+  [[ -d "$WORK" ]] || die "未找到 $WORK，请先: $0 setup"
+}
+
+ensure_genesis_reference() {
+  if [[ -f "$WORK/genesis.json.reference" ]]; then
+    return 0
+  fi
+  if [[ -d "$WORK/genesis.json.reference" ]]; then
+    rm -rf "$WORK/genesis.json.reference"
+  fi
+  local src="$WORK/biyachain-home-a/config/genesis.json"
+  if [[ -f "$src" ]]; then
+    cp -a "$src" "$WORK/genesis.json.reference"
+    echo "note: 已从 $src 生成 $WORK/genesis.json.reference"
+    return 0
+  fi
+  die "未找到 $WORK/genesis.json.reference，请先: $0 setup"
+}
+
+ensure_node_dirs() {
+  local n="$1"
+  local need_genesis="${2:-}"
+  ensure_stress_workdir
+  [[ -d "$WORK/biyachain-home-$n" ]] || die "未找到 $WORK/biyachain-home-$n，请先: $0 setup"
+  [[ -d "$WORK/monad-$n" ]] || die "未找到 $WORK/monad-$n，请先: $0 setup"
+  if [[ -n "$need_genesis" ]]; then
+    ensure_genesis_reference
+  fi
+}
+
+biyachain_lib_path() {
+  if [[ -d "$WORK/biyachain-lib" ]]; then
+    echo "$WORK/biyachain-lib"
+  elif [[ -d "$REPO/biyachain-lib" ]]; then
+    echo "$REPO/biyachain-lib"
+  fi
+}
+
+apply_monad_sysctl() {
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "note: 无 sudo，跳过 monad-node sysctl（大页/UDP buffer）"
+    return 0
+  fi
+  sudo sysctl -w vm.nr_hugepages=2048 >/dev/null 2>&1 || true
+  sudo sysctl -w net.core.rmem_max=62500000 >/dev/null 2>&1 || true
+  sudo sysctl -w net.core.rmem_default=62500000 >/dev/null 2>&1 || true
+  sudo sysctl -w net.core.wmem_max=62500000 >/dev/null 2>&1 || true
+  sudo sysctl -w net.core.wmem_default=62500000 >/dev/null 2>&1 || true
+  sudo sysctl -w net.ipv4.tcp_rmem='4096 12582912 12582912' >/dev/null 2>&1 || true
+  sudo sysctl -w net.ipv4.tcp_wmem='4096 12582912 12582912' >/dev/null 2>&1 || true
+}
+
+cmd_setup_ips() {
+  need_cmd sudo
+  local ip
+  for ip in 172.28.0.10 172.28.0.20 172.28.0.30 172.28.0.40; do
+    if ip -4 addr show dev lo | grep -q "${ip}/"; then
+      echo "  ok: $ip 已在 lo 上"
+    else
+      echo "==> sudo ip addr add $ip/32 dev lo"
+      sudo ip addr add "$ip/32" dev lo
+    fi
+  done
+  echo "loopback IP 就绪（四节点 monad P2P 需要）。"
+}
+
+cmd_biyachaind() {
+  local n="${1:-a}"
+  ensure_node_dirs "$n"
+  [[ -x "$BIYACHAIND_BIN" ]] || die "未找到 $BIYACHAIND_BIN，请先: $0 build"
+  local monad_dir="$WORK/monad-$n"
+  local abci_sock="$monad_dir/abci.sock"
+  local grpc_port lib
+  grpc_port="$(node_grpc_port "$n")"
+  rm -f "$abci_sock"
+  lib="$(biyachain_lib_path || true)"
+  if [[ -n "$lib" ]]; then
+    export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+  echo "==> biyachaind-$n"
+  echo "    home=$WORK/biyachain-home-$n"
+  echo "    grpc=0.0.0.0:$grpc_port  abci=unix://$abci_sock"
+  echo "    monad-ledger-path=$monad_dir/ledger"
+  exec "$BIYACHAIND_BIN" start \
+    --home "$WORK/biyachain-home-$n" \
+    --with-comet=false \
+    --transport socket \
+    --address "unix://$abci_sock" \
+    --grpc.enable=true \
+    --grpc.address="0.0.0.0:$grpc_port" \
+    --api.enable=false \
+    --json-rpc.enable=false \
+    --optimistic-execution-enabled="${OPTIMISTIC_EXECUTION_ENABLED:-false}" \
+    --monad-ledger-path="$monad_dir/ledger" \
+    --minimum-gas-prices "$MIN_GAS_PRICE"
+}
+
+cmd_monad() {
+  local n="${1:-a}"
+  ensure_node_dirs "$n" genesis
+  [[ -x "$REPO/target/release/monad-node" ]] || die "未找到 monad-node，请先: $0 build"
+  local monad_dir="$WORK/monad-$n"
+  local abci_sock="$monad_dir/abci.sock"
+  [[ -S "$abci_sock" ]] || die "ABCI socket 不存在: $abci_sock（请先: $0 biyachaind $n）"
+  export MONAD_ABCI_ENDPOINT="unix://$abci_sock"
+  export MONAD_COSMOS_GENESIS_PATH="$WORK/genesis.json.reference"
+  export RUST_LOG="${RUST_LOG:-info}"
+  apply_monad_sysctl
+  echo "==> monad-$n"
+  echo "    dir=$monad_dir"
+  echo "    P2P 绑定地址见 node.toml（默认 $(node_monad_ip "$n"):8000）"
+  echo "    四节点共识请先: $0 setup-ips"
+  exec "$REPO/target/release/monad-node" \
+    --secp-identity "$monad_dir/id-secp" \
+    --bls-identity "$monad_dir/id-bls" \
+    --node-config "$monad_dir/node.toml" \
+    --forkpoint-config "$monad_dir/forkpoint.toml" \
+    --validators-path "$monad_dir/validators.toml" \
+    --wal-path "$monad_dir/wal" \
+    --mempool-ipc-path "$monad_dir/mempool.sock" \
+    --control-panel-ipc-path "$monad_dir/controlpanel.sock" \
+    --ledger-path "$monad_dir/ledger" \
+    --statesync-ipc-path "$monad_dir/statesync.sock" \
+    --triedb-path "$monad_dir" \
+    --persisted-peers-path "$monad_dir/peers.toml"
+}
+
+cmd_repair_monad() {
+  ensure_stress_workdir
+  echo "==> 重建 monad node.toml / P2P 签名（不重建 id-secp/id-bls）"
+  MONAD_BFT_ROOT="$REPO" WORK="$WORK" "$REPO/scripts/mult-run.sh" init-monad-node
+  echo "完成。请重启 biyachaind 与 monad-node（先 biyachaind 再 monad）。"
+}
+
+cmd_run() {
+  ensure_stress_workdir
+  cat <<EOF
+==> Monad + chain-stresser 本机原生启动（无需 monad-node Docker 镜像）
+
+0) 一次性：四节点 P2P loopback IP
+   $0 setup-ips
+
+1) 编译 + 初始化（若尚未完成）
+   $0 build && $0 setup
+
+2) 四个终端分别启动 biyachaind + monad-node（共识需要 a/b/c/d 四组）
+
+   终端 1: $0 biyachaind a    # gRPC :19900
+   终端 2: $0 monad a
+
+   终端 3: $0 biyachaind b    # gRPC :29900
+   终端 4: $0 monad b
+
+   终端 5: $0 biyachaind c
+   终端 6: $0 monad c
+
+   终端 7: $0 biyachaind d
+   终端 8: $0 monad d
+
+   冒烟可只起 a（biyachaind a + monad a），但四验证者配置下可能无法稳定出块。
+
+3) 终端 9：Comet RPC（chain-stresser 入口）
+   MONAD_MEMPOOL_SOCK=$WORK/monad-a/mempool.sock $0 rpc
+
+4) 终端 10：压测与验证
+   $0 stress
+   $0 verify
+
+数据流:
+  chain-stresser → :26657 (cosmos-txpool-feed serve) → mempool.sock → monad-node → biyachaind
+  确认上链: gRPC $STRESS_GRPC_ADDR 查 sequence（--await=false）
+
+文档: docs/monad-chain-stresser-bench.md
+EOF
+}
+
+wait_port() {
+  local hostport="$1"
+  local label="$2"
+  local max="${3:-120}"
+  local host="${hostport%:*}"
+  local port="${hostport##*:}"
+  local i=0
+  while (( i < max )); do
+    if (echo >/dev/tcp/"$host"/"$port") 2>/dev/null; then
+      echo "  ok: $label ($hostport)"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  die "超时: $label ($hostport) 未就绪"
+}
+
+cmd_up() {
+  need_cmd docker
+  [[ -f "$WORK/compose.yaml" ]] || die "未找到 $WORK/compose.yaml，请先: $0 setup"
+  if [[ ! -f "$REPO/target/release/monad-node" ]]; then
+    echo "note: 未找到 monad-node，正在执行 build…"
+    cmd_build
+  fi
+  if [[ ! -x "$REPO/target/release/cosmos-txpool-feed" ]] \
+    && [[ ! -x "$REPO/target/release/monad-rpc" ]]; then
+    die "未找到 cosmos-txpool-feed / monad-rpc（compose 26657 需要）。请先: $0 build"
+  fi
+  [[ -f "$REPO/target/release/keystore" ]] || ln -sf monad-keystore "$REPO/target/release/keystore"
+  if ! docker image inspect monad-node:local >/dev/null 2>&1; then
+    echo "==> 构建 Docker 镜像 monad-node:local（首次较慢）"
+    docker build -t monad-node:local -f "$REPO/docker/devnet/Dockerfile" "$REPO"
+  fi
+
+  echo "==> docker compose up -d ($WORK)"
+  (cd "$WORK" && docker compose up -d)
+
+  echo "==> 等待服务就绪"
+  wait_port "$STRESS_GRPC_ADDR" "biyachaind-a gRPC"
+  wait_port "$STRESS_NODE_ADDR" "monad-rpc-a Comet RPC"
+  echo "集群已就绪。"
+  cmd_status
+}
+
+cmd_down() {
+  [[ -f "$WORK/compose.yaml" ]] || die "未找到 $WORK/compose.yaml"
+  (cd "$WORK" && docker compose down)
+}
+
+node_p2p_listening() {
+  local ip="$1"
+  ss -ulnp 2>/dev/null | grep -q "${ip}:8000.*monad-node"
+}
+
+forkpoint_genesis_template() {
+  echo "${FORKPOINT_GENESIS:-$REPO/docker/devnet/monad/config/forkpoint.genesis.toml}"
+}
+
+cmd_reset_consensus() {
+  ensure_stress_workdir
+  local fp
+  fp="$(forkpoint_genesis_template)"
+  [[ -f "$fp" ]] || die "未找到 genesis forkpoint: $fp"
+  if pgrep -f 'monad-node|biyachaind start' >/dev/null 2>&1; then
+    echo "⚠  检测到 monad-node / biyachaind 仍在运行，请先停掉："
+    echo "   pkill -f 'monad-node|biyachaind start' || true"
+    die "进程未停止，拒绝 reset-consensus"
+  fi
+  echo "==> 重置四节点共识本地状态 ($WORK)"
+  echo "    （同时清 biyachaind data/，避免 ABCI height 与 cosmos-commits 不一致导致 monad panic）"
+  local n monad_dir
+  for n in a b c d; do
+    monad_dir="$WORK/monad-$n"
+    rm -rf "$monad_dir/wal"
+    rm -rf "$monad_dir/ledger/headers" "$monad_dir/ledger/bodies" "$monad_dir/ledger/cosmos-commits"
+    mkdir -p "$monad_dir/ledger/headers" "$monad_dir/ledger/bodies" "$monad_dir/ledger/cosmos-commits"
+    cp "$fp" "$monad_dir/forkpoint.toml"
+    rm -f "$monad_dir/abci.sock" "$monad_dir/mempool.sock"
+    rm -rf "$WORK/biyachain-home-$n/data"
+    echo "    monad-$n + biyachain-home-$n: wal/ledger/data 已清，forkpoint → genesis (round 0)"
+  done
+  echo ""
+  echo "下一步（顺序重要）："
+  echo "  1. 四终端 biyachaind a/b/c/d（须在本命令之后启动，勿复用旧进程）"
+  echo "  2. 四终端 monad a → b → c → d（a 必须先起，30s 内起齐）"
+  echo "  3. $0 nodes"
+}
+
+cmd_diagnose() {
+  ensure_stress_workdir
+  echo "==> 共识/执行诊断 ($WORK)"
+  local n commits fp_round abci by
+  for n in a b c d; do
+    commits="$(ls "$WORK/monad-$n/ledger/cosmos-commits/"*.rlp 2>/dev/null | wc -l)"
+    fp_round="$(grep -E '^round = ' "$WORK/monad-$n/forkpoint.toml" 2>/dev/null | head -1 | awk '{print $3}' || echo '?')"
+    abci=NO
+    [[ -S "$WORK/monad-$n/abci.sock" ]] && abci=YES
+    by=NO
+    pgrep -f "biyachain-home-$n " >/dev/null 2>&1 && by=YES
+    echo "  monad-$n: cosmos-commits=${commits} files (latest=$((commits - 1))) forkpoint_round=$fp_round biyachaind=$by abci=$abci"
+  done
+  echo ""
+  echo "若卡在高度 4："
+  echo "  - monad 日志 try_propose_seq_num=8 + no proposal result for height 5 → pending 树超前 ledger"
+  echo "  - 需重建 monad-node: $0 build && 四节点 reset-consensus 后重启"
+  echo "  - biyachaind 终端应有 monad executed block height=N 随 committed cosmos block 增长"
+}
+
+cmd_nodes() {
+  ensure_stress_workdir
+  echo "==> 本机四节点 ($WORK)"
+  printf "%-6s %-14s %-8s %-8s %-8s %-6s\n" "节点" "P2P IP" "biyachaind" "monad" "gRPC" "abci"
+  local n ip grpc monad_dir abci_sock by monad grpc_ok abci_ok missing=0
+  for n in a b c d; do
+    ip="$(node_monad_ip "$n")"
+    grpc="$(node_grpc_port "$n")"
+    monad_dir="$WORK/monad-$n"
+    abci_sock="$monad_dir/abci.sock"
+    by=NO
+    monad=NO
+    grpc_ok=CLOSED
+    abci_ok=NO
+    pgrep -f "biyachain-home-$n " >/dev/null 2>&1 && by=YES
+    if node_p2p_listening "$ip"; then
+      monad=YES
+    fi
+    if (echo >/dev/tcp/127.0.0.1/"$grpc") 2>/dev/null; then
+      grpc_ok=LISTEN
+    fi
+    [[ -S "$abci_sock" ]] && abci_ok=YES
+    printf "%-6s %-14s %-8s %-8s %-8s %-6s\n" "$n" "$ip:8000" "$by" "$monad" ":$grpc $grpc_ok" "$abci_ok"
+    if [[ "$by" == YES && "$monad" == NO ]] || [[ "$monad" == YES && "$by" == NO ]]; then
+      missing=$((missing + 1))
+    fi
+  done
+  echo ""
+  if ! node_p2p_listening "172.28.0.10"; then
+    echo "⚠  monad-a 未监听 172.28.0.10:8000 — 四节点共识缺 leader，其它节点会报 address unknown"
+    echo "   请: $0 biyachaind a  然后  $0 monad a"
+  fi
+  if node_p2p_listening "172.28.0.20" && pgrep -f 'monad-b/id-secp' >/dev/null 2>&1; then
+    echo "note: monad-b 已在运行，勿重复执行 $0 monad b（会 AddrInUse）"
+  fi
+  if (( missing > 0 )); then
+    echo "note: 每组须 biyachaind 与 monad 成对运行，且先 biyachaind 再 monad"
+  fi
+  local rounds=() r n
+  for n in a b c d; do
+    r="$(grep -E '^round = ' "$WORK/monad-$n/forkpoint.toml" 2>/dev/null | head -1 | awk '{print $3}' || echo '?')"
+    rounds+=("$n:$r")
+  done
+  local uniq
+  uniq="$(printf '%s\n' "${rounds[@]}" | awk -F: '{print $2}' | sort -u | wc -l)"
+  if [[ "$uniq" -gt 1 ]]; then
+    echo "⚠  forkpoint round 不一致: ${rounds[*]} — 共识会卡在 still syncing / address unknown"
+    echo "   停进程后: $0 reset-consensus，再按 a→b→c→d 重启"
+  elif [[ "${rounds[0]#*:}" != "0" && "${rounds[0]#*:}" != "?" ]]; then
+    echo "note: forkpoint round=${rounds[0]#*:}（非 genesis）；若长期 still syncing 请 $0 reset-consensus"
+  fi
+}
+
+cmd_status() {
+  cmd_nodes
+  echo ""
+  echo "==> docker compose ps"
+  if [[ -f "$WORK/compose.yaml" ]]; then
+    (cd "$WORK" && docker compose ps) || true
+  else
+    echo "  (无 $WORK/compose.yaml)"
+  fi
+  echo ""
+  echo "==> 端口探测"
+  for hp in "$STRESS_GRPC_ADDR" "$STRESS_NODE_ADDR"; do
+    local host="${hp%:*}" port="${hp##*:}"
+    if (echo >/dev/tcp/"$host"/"$port") 2>/dev/null; then
+      echo "  LISTEN $hp"
+    else
+      echo "  CLOSED $hp"
+    fi
+  done
+}
+
+stress_account_address() {
+  local dir addr_file
+  dir="$(dirname "$STRESS_ACCOUNTS")"
+  addr_file="$dir/addresses.json"
+  if [[ -f "$addr_file" ]]; then
+    jq -r '.[0] // empty' "$addr_file" | head -1
+    return
+  fi
+  jq -r '.[0] // empty' "$STRESS_ACCOUNTS" 2>/dev/null | head -1
+}
+
+cmd_verify() {
+  need_cmd jq
+  [[ -x "$BIYACHAIND_BIN" ]] || die "未找到 $BIYACHAIND_BIN"
+  [[ -f "$STRESS_ACCOUNTS" ]] || die "未找到 $STRESS_ACCOUNTS"
+
+  local addr
+  addr="$(stress_account_address)"
+  [[ -n "$addr" ]] || die "无法从 $STRESS_ACCOUNTS 解析地址"
+
+  local home="$WORK/biyachain-home-a"
+  [[ -d "$home" ]] || home="${BIYAHOME:-}"
+
+  echo "==> 查询压测账户 sequence (addr=$addr)"
+  local auth_json err
+  if ! auth_json="$("$BIYACHAIND_BIN" query auth account "$addr" \
+    --grpc-addr "$STRESS_GRPC_ADDR" --grpc-insecure \
+    --home "$home" -o json 2>&1)"; then
+    echo "$auth_json" >&2
+    die "gRPC 查询失败（biyachaind-a 是否在运行？端口 $STRESS_GRPC_ADDR）"
+  fi
+  # EthAccount: .account.value.base_account；BaseAccount: .account.base_account
+  echo "$auth_json" | jq '{
+      address: (.account.value.base_account.address // .account.base_account.address // .account.address),
+      account_number: (.account.value.base_account.account_number // .account.base_account.account_number // .account.account_number),
+      sequence: (.account.value.base_account.sequence // .account.base_account.sequence // .account.sequence)
+    }'
+}
+
+cmd_stress() {
+  need_cmd chain-stresser
+  [[ -f "$STRESS_ACCOUNTS" ]] || die "未找到 $STRESS_ACCOUNTS，请先: $0 setup"
+
+  echo "==> chain-stresser ($STRESS_CMD)"
+  echo "    accounts=$STRESS_ACCOUNTS"
+  echo "    accounts-num=$STRESS_ACCOUNTS_NUM_RUN transactions=$STRESS_TRANSACTIONS rate-tps=$STRESS_RATE_TPS"
+  echo "    node-addr=$STRESS_NODE_ADDR grpc-addr=$STRESS_GRPC_ADDR chain-id=$CHAIN_ID"
+  echo "    await=false (monad-rpc 无 tx 查询)"
+  echo ""
+
+  echo "==> 压测前 sequence"
+  cmd_verify || true
+  echo ""
+
+  local start_ts end_ts
+  start_ts="$(date +%s)"
+
+  case "$STRESS_CMD" in
+    bank)
+      chain-stresser tx-bank-send \
+        --accounts "$STRESS_ACCOUNTS" \
+        --accounts-num "$STRESS_ACCOUNTS_NUM_RUN" \
+        --transactions "$STRESS_TRANSACTIONS" \
+        --rate-tps "$STRESS_RATE_TPS" \
+        --chain-id "$CHAIN_ID" \
+        --min-gas-price "$MIN_GAS_PRICE" \
+        --node-addr "$STRESS_NODE_ADDR" \
+        --grpc-addr "$STRESS_GRPC_ADDR" \
+        --await=false
+      ;;
+    spot-limit)
+      chain-stresser tx-exchange-spot-limit-orders \
+        --accounts "$STRESS_ACCOUNTS" \
+        --accounts-num "$STRESS_ACCOUNTS_NUM_RUN" \
+        --transactions "$STRESS_TRANSACTIONS" \
+        --rate-tps "$STRESS_RATE_TPS" \
+        --spot-market-ids "$SPOT_MARKET_ID" \
+        --chain-id "$CHAIN_ID" \
+        --min-gas-price "$MIN_GAS_PRICE" \
+        --node-addr "$STRESS_NODE_ADDR" \
+        --grpc-addr "$STRESS_GRPC_ADDR" \
+        --await=false
+      ;;
+    *)
+      die "未知 STRESS_CMD=$STRESS_CMD（bank | spot-limit）"
+      ;;
+  esac
+
+  end_ts="$(date +%s)"
+  local elapsed=$((end_ts - start_ts))
+  local total_tx=$((STRESS_ACCOUNTS_NUM_RUN * STRESS_TRANSACTIONS))
+
+  echo ""
+  echo "==> 压测完成 (${elapsed}s, 约 ${total_tx} 笔提交)"
+  echo "==> 等待出块 (~5s) 后查 sequence"
+  sleep 5
+  cmd_verify
+}
+
+resolve_comet_rpc_bin() {
+  if [[ -n "${MONAD_RPC_BIN:-}" && -x "${MONAD_RPC_BIN}" ]]; then
+    echo "${MONAD_RPC_BIN}"
+    return
+  fi
+  if [[ -x "$REPO/target/release/cosmos-txpool-feed" ]]; then
+    echo "$REPO/target/release/cosmos-txpool-feed"
+    return
+  fi
+  if [[ -x "$REPO/target/release/monad-rpc" ]]; then
+    echo "$REPO/target/release/monad-rpc"
+    return
+  fi
+  return 1
+}
+
+cmd_rpc() {
+  local monad_dir="${MONAD_RUN_DIR:-}"
+  local node_toml="${MONAD_NODE_CONFIG:-$REPO/docker/devnet/monad/config/node.toml}"
+  local mempool_sock="${MONAD_MEMPOOL_SOCK:-}"
+  if [[ -z "$mempool_sock" ]]; then
+    if [[ -n "$monad_dir" ]]; then
+      mempool_sock="$monad_dir/mempool.sock"
+    elif [[ -S "$WORK/monad-a/mempool.sock" ]]; then
+      mempool_sock="$WORK/monad-a/mempool.sock"
+    else
+      mempool_sock="$REPO/.monad-home/mempool.sock"
+    fi
+  fi
+  local rpc_bin listen="${COMET_RPC_LISTEN:-127.0.0.1:26657}"
+
+  rpc_bin="$(resolve_comet_rpc_bin)" || die "未找到 cosmos-txpool-feed / monad-rpc，请先: $0 build"
+  [[ -S "$mempool_sock" ]] || die "mempool socket 不存在: $mempool_sock（请先启动 monad-node）"
+
+  if [[ "$(basename "$rpc_bin")" == "cosmos-txpool-feed" ]]; then
+    echo "==> cosmos-txpool-feed serve (listen=$listen, mempool=$mempool_sock)"
+    exec "$rpc_bin" serve --listen "$listen" --cosmos-ipc-path "$mempool_sock"
+  fi
+
+  echo "==> monad-rpc (comet 26657, mempool=$mempool_sock)"
+  exec "$rpc_bin" \
+    --node-config "$node_toml" \
+    --rpc-addr 127.0.0.1 \
+    --rpc-port 8545 \
+    --comet-port 26657 \
+    --cosmos-ipc-path "$mempool_sock"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    setup) cmd_setup ;;
+    build) cmd_build ;;
+    build-full) cmd_build_full ;;
+    build-rpc-docker) cmd_build_rpc_docker ;;
+    run) cmd_run ;;
+    setup-ips) cmd_setup_ips ;;
+    biyachaind) cmd_biyachaind "${2:-a}" ;;
+    monad) cmd_monad "${2:-a}" ;;
+    repair-monad) cmd_repair_monad ;;
+    reset-consensus) cmd_reset_consensus ;;
+    diagnose) cmd_diagnose ;;
+    up) cmd_up ;;
+    down) cmd_down ;;
+    stress) cmd_stress ;;
+    verify) cmd_verify ;;
+    rpc) cmd_rpc ;;
+    nodes) cmd_nodes ;;
+    status) cmd_status ;;
+    -h | --help | help | "") usage; [[ -n "$cmd" ]] || exit 0 ;;
+    *) die "未知命令: $cmd（$0 --help）" ;;
+  esac
+}
+
+main "$@"

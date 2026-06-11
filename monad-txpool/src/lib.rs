@@ -1,4 +1,5 @@
 pub mod abci;
+pub mod comet_mempool_rpc;
 pub mod commit_store;
 pub mod executor;
 pub mod ipc;

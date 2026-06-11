@@ -26,4 +26,6 @@ perf.data*
 /reports
 deployed_contracts.json
 
-.monad
+/.monad
+/.monad-home
+/.biyachaind
