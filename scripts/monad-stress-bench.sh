@@ -45,6 +45,17 @@ STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
 STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
 MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"
 
+# SeiDB SS（state store）/ SC（state commitment）启动参数
+# 默认启用 SeiDB（SC=memiavl committer.db / SS=pebbledb）；回退原生 iavl 用 STORE_BACKEND=iavl SEIDB_ENABLED=false
+# 备注：standalone ABCI 下首块前的 "failed to get consensus params" 为已知噪声，与 iavl/seidb 无关
+STORE_BACKEND="${STORE_BACKEND:-seidb}"
+SEIDB_ENABLED="${SEIDB_ENABLED:-true}"
+SEIDB_SC_BACKEND="${SEIDB_SC_BACKEND:-memiavl}"
+SEIDB_SS_ENABLE="${SEIDB_SS_ENABLE:-true}"
+SEIDB_SS_BACKEND="${SEIDB_SS_BACKEND:-pebbledb}"
+SEIDB_KEEP_RECENT="${SEIDB_KEEP_RECENT:-0}"
+SEIDB_HOME="${SEIDB_HOME:-}"
+
 SPOT_MARKET_ID="${SPOT_MARKET_ID:-0xb322bce686ec25364be50728812e33741da1d82e9c91c2c89b91b91d26b0e9c5}"
 
 usage() {
@@ -435,6 +446,16 @@ cmd_biyachaind() {
   echo "    home=$WORK/biyachain-home-$n"
   echo "    grpc=0.0.0.0:$grpc_port  abci=unix://$abci_sock"
   echo "    monad-ledger-path=$monad_dir/ledger"
+  echo "    store.backend=$STORE_BACKEND seidb.enabled=$SEIDB_ENABLED sc=$SEIDB_SC_BACKEND ss=$SEIDB_SS_ENABLE/$SEIDB_SS_BACKEND"
+  local seidb_args=(
+    --store.backend="$STORE_BACKEND"
+    --seidb.enabled="$SEIDB_ENABLED"
+    --seidb.sc-backend="$SEIDB_SC_BACKEND"
+    --seidb.ss-enable="$SEIDB_SS_ENABLE"
+    --seidb.ss-backend="$SEIDB_SS_BACKEND"
+    --seidb.keep-recent="$SEIDB_KEEP_RECENT"
+  )
+  [[ -n "$SEIDB_HOME" ]] && seidb_args+=(--seidb.home="$SEIDB_HOME")
   exec "$BIYACHAIND_BIN" start \
     --home "$WORK/biyachain-home-$n" \
     --with-comet=false \
@@ -446,7 +467,9 @@ cmd_biyachaind() {
     --json-rpc.enable=false \
     --optimistic-execution-enabled="${OPTIMISTIC_EXECUTION_ENABLED:-false}" \
     --monad-ledger-path="$monad_dir/ledger" \
+    "${seidb_args[@]}" \
     --minimum-gas-prices "$MIN_GAS_PRICE"
+    
 }
 
 cmd_monad() {
