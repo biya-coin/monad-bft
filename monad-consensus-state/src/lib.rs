@@ -1958,7 +1958,7 @@ where
                     beneficiary: *self.beneficiary,
                     timestamp_ns,
 
-                    extending_blocks: propose_extending.into_iter().cloned().collect(),
+                    extending_blocks: pending_blocktree_blocks.into_iter().cloned().collect(),
                     delayed_execution_results,
                 });
             }
