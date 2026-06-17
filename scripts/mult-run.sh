@@ -14,6 +14,7 @@ export STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
 export STRESS_ACCOUNTS_DIR="$WORK/instances/0"
 export STRESS_ACCOUNT_BALANCE_BYB="${STRESS_ACCOUNT_BALANCE_BYB:-1000000000000000000000000000byb}"
 export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-10000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
+export MAX_BLOCK_TXS="${MAX_BLOCK_TXS:-500}"
 
 # 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 .monad 内维护）
 init_workspace_templates() {
@@ -179,17 +180,20 @@ init_biyachaind() {
     done
 
     for node in a b c d; do
-    python3 - <<PY "$WORK/biyachain-home-$node/config/app.toml"
-    import pathlib, re, sys
-    path = pathlib.Path(sys.argv[1])
-    text = path.read_text()
-    text = re.sub(
-        r'^minimum-gas-prices = ".*"$',
-        'minimum-gas-prices = "1byb"',
-        text,
-        flags=re.MULTILINE,
-    )
-    path.write_text(text)
+        python3 - "$WORK/biyachain-home-$node/config/app.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+text = re.sub(
+    r'^minimum-gas-prices = ".*"$',
+    'minimum-gas-prices = "1byb"',
+    text,
+    flags=re.MULTILINE,
+)
+path.write_text(text)
 PY
     done
     echo "--------------------------------"
@@ -305,9 +309,11 @@ PY
 
     "$BIYACHAIND_BIN" genesis collect-gentxs --home "$WORK/biyachain-home-a"
 
-    # 设置区块最大 gas 为-1
+    # 设置区块限制
     cat "$WORK/biyachain-home-a/config/genesis.json" | \
-        jq '.consensus["params"]["block"]["max_gas"]="2000000000"' > \
+        jq --arg max_txs "$MAX_BLOCK_TXS" \
+          '.consensus["params"]["block"]["max_gas"]="2000000000"
+           | .consensus["params"]["block"]["max_txs"]=$max_txs' > \
         "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
         mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
 
@@ -365,7 +371,7 @@ init_monad_node() {
         echo "未找到 $WORK/monad-a/validators.toml，正在从 keystore 生成…"
         KEYSTORE_BIN="$MONAD_BFT_ROOT/target/release/monad-keystore" "$(dirname "$0")/gen-validators-toml.sh" || exit 1
     fi
-    for n in a b c d; do
+    for n in b c d; do
         cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
     done
 
@@ -420,15 +426,20 @@ init_monad_node() {
         P2P_ADDR[$n]="$addr"
         P2P_SIG[$n]="$sig"
         P2P_PUB[$n]="$pub"
-        python3 -c "
-import re, pathlib, sys
+        python3 - "$MONAD_DIR/node.toml" "$addr" "$sig" <<'PY'
+import pathlib
+import re
+import sys
+
 path, addr, sig = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+host = addr.rsplit(':', 1)[0]
 t = path.read_text()
 t, n1 = re.subn(r'^self_address = .*$', 'self_address = \"' + addr + '\"', t, count=1, flags=re.M)
 t, n2 = re.subn(r'^self_name_record_sig = .*$', 'self_name_record_sig = \"' + sig + '\"', t, count=1, flags=re.M)
-assert n1 == 1 and n2 == 1, (n1, n2)
+t, n3 = re.subn(r'^bind_address_host = .*$', 'bind_address_host = \"' + host + '\"', t, count=1, flags=re.M)
+assert n1 == 1 and n2 == 1 and n3 == 1, (n1, n2, n3)
 path.write_text(t)
-" "$MONAD_DIR/node.toml" "$addr" "$sig"
+PY
     done
 
     # 无 [[bootstrap.peers]] 时 peer discovery 难以建立路由，Raptorcast 会持续 WARN unknown address for node …
@@ -446,8 +457,11 @@ path.write_text(t)
                 echo ""
             } >>"$bootf"
         done
-        python3 -c "
-import pathlib, re, sys
+        python3 - "$WORK/monad-$n/node.toml" "$bootf" <<'PY'
+import pathlib
+import re
+import sys
+
 path, boot_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 boot = boot_path.read_text()
 text = path.read_text()
@@ -456,7 +470,7 @@ new = '[bootstrap]\\n\\n' + boot + '[peer_discovery]'
 text, c = pat.subn(new, text, count=1)
 assert c == 1, ('[bootstrap]…[peer_discovery] replace failed', c)
 path.write_text(text)
-" "$WORK/monad-$n/node.toml" "$bootf"
+PY
         rm -f "$bootf"
     done
 
@@ -513,4 +527,3 @@ init_monad_node
 
 verify_compose_mount_sources
 echo "可在 $WORK 执行: docker compose up -d"
-
