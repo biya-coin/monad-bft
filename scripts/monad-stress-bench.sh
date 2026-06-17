@@ -25,7 +25,13 @@
 #   STRESS_RATE_TPS      限速 TPS（默认 30）
 #   STRESS_NODE_ADDR     RPC（默认 127.0.0.1:26657）
 #   STRESS_GRPC_ADDR     gRPC（默认 127.0.0.1:19900）
+#   STRESS_SHARDS        多节点压测分片数 1..4（shard/rpc-all/stress-all，默认 4）
 #   CHAIN_ID             默认 biyachain-1
+#
+# 多节点压测（发到 4 个节点，提高 TPS）:
+#   1) ./scripts/monad-stress-bench.sh shard      # 账户切 4 份（避免 nonce 冲突）
+#   2) ./scripts/monad-stress-bench.sh rpc-all    # 后台起 4 个 feed（26657/26667/26677/26687）
+#   3) STRESS_RATE_TPS=5000 ./scripts/monad-stress-bench.sh stress-all  # 4 路并发
 #
 set -euo pipefail
 
@@ -37,17 +43,21 @@ BIYACHAIND_BIN="${BIYACHAIND_BIN:-$REPO/biyachain-core/bin/biyachaind}"
 CHAIN_ID="${CHAIN_ID:-biyachain-1}"
 STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
 STRESS_ACCOUNTS="${STRESS_ACCOUNTS:-$WORK/instances/0/accounts.json}"
-STRESS_CMD="${STRESS_CMD:-bank}"
-STRESS_ACCOUNTS_NUM_RUN="${STRESS_ACCOUNTS_NUM_RUN:-50}"
-STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-20}"
-STRESS_RATE_TPS="${STRESS_RATE_TPS:-30}"
+STRESS_CMD="${STRESS_CMD:-spot-limit}"
+# 目标：每个区块约10000笔交易
+# 可以根据区块时间（通常是2s）这样估算：STRESS_RATE_TPS * 块时间 = 每块交易数
+# 例如 TPS=5000，每2s出块 ~= 10000 txs/块
+STRESS_ACCOUNTS_NUM_RUN="${STRESS_ACCOUNTS_NUM_RUN:-1000}"      # 更多账号可减少 nonce 瓶颈
+STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-400}"               # 每账号交易数，可选更大
+STRESS_RATE_TPS="${STRESS_RATE_TPS:-200}"                      # 每秒交易数，根据目标动态调整
 STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
 STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
 MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"
 
 # SeiDB SS（state store）/ SC（state commitment）启动参数
-# 默认启用 SeiDB（SC=memiavl committer.db / SS=pebbledb）；回退原生 iavl 用 STORE_BACKEND=iavl SEIDB_ENABLED=false
-# 备注：standalone ABCI 下首块前的 "failed to get consensus params" 为已知噪声，与 iavl/seidb 无关
+# 默认启用 SeiDB（SC=memiavl committer.db / SS=pebbledb）。monad standalone bootstrap 兼容性
+# 由 app 层处理：executor 等 InitChain、ProcessProposal 首块前不重置 finalize 状态、executor 与
+# ABCI 串行化、monad 结果内存缓存（绕过 SeiDB 提交可见性滞后）。回退 iavl：STORE_BACKEND=iavl SEIDB_ENABLED=false
 STORE_BACKEND="${STORE_BACKEND:-seidb}"
 SEIDB_ENABLED="${SEIDB_ENABLED:-true}"
 SEIDB_SC_BACKEND="${SEIDB_SC_BACKEND:-memiavl}"
@@ -55,6 +65,8 @@ SEIDB_SS_ENABLE="${SEIDB_SS_ENABLE:-true}"
 SEIDB_SS_BACKEND="${SEIDB_SS_BACKEND:-pebbledb}"
 SEIDB_KEEP_RECENT="${SEIDB_KEEP_RECENT:-0}"
 SEIDB_HOME="${SEIDB_HOME:-}"
+# memiavl 异步提交缓冲：<=0 表示同步提交（最新块立即可读，monad 延时执行查询需要）
+SEIDB_MEMIAVL_ASYNC="${SEIDB_MEMIAVL_ASYNC:-0}"
 
 SPOT_MARKET_ID="${SPOT_MARKET_ID:-0xb322bce686ec25364be50728812e33741da1d82e9c91c2c89b91b91d26b0e9c5}"
 
@@ -72,7 +84,10 @@ usage() {
   repair-monad  重建 node.toml P2P 签名（密钥与 node.toml 不一致时用）
   reset-consensus  清 WAL/ledger 并恢复 genesis forkpoint（共识卡住时用）
   diagnose       检查高度 4 卡点（cosmos-commits / forkpoint / ABCI）
-  rpc         前台启动 cosmos-txpool-feed serve :26657
+  rpc [a-d]   前台启动 cosmos-txpool-feed serve（默认 a :26657；b/c/d → :26667/26677/26687）
+  rpc-all     后台一键启动每节点一个 feed（多节点压测入口）
+  shard       账户分片：accounts.json → accounts.{a..d}.json（多节点压测前置）
+  stress-all  4 路分片并发压测到 4 个节点（总吞吐 ~ shards*STRESS_RATE_TPS）
   up          可选：docker compose up（需 monad-node:local 镜像）
   down        docker compose down
   nodes       四节点 biyachaind/monad/P2P 状态一览
@@ -336,6 +351,7 @@ cmd_setup() {
   export STRESS_ACCOUNTS_NUM
   export BIYACHAIND_BIN
   "$REPO/scripts/mult-run.sh"
+  apply_monad_sysctl
   echo ""
   echo "setup 完成。工作目录: $WORK"
   echo "压测账户: $STRESS_ACCOUNTS"
@@ -348,6 +364,28 @@ node_grpc_port() {
     b) echo 29900 ;;
     c) echo 39900 ;;
     d) echo 49900 ;;
+    *) die "未知节点: $1（a|b|c|d）" ;;
+  esac
+}
+
+node_metrics_port() {
+  # 与 biyachain-core/monitor/prometheus/prometheus.yml 的 target 端口一致
+  case "$1" in
+    a) echo 26660 ;;
+    b) echo 26760 ;;
+    c) echo 26860 ;;
+    d) echo 26960 ;;
+    *) die "未知节点: $1（a|b|c|d）" ;;
+  esac
+}
+
+node_comet_port() {
+  # cosmos-txpool-feed serve 监听端口（多节点压测时每节点一个，相差 10，避开 metrics 26x60）
+  case "$1" in
+    a) echo 26657 ;;
+    b) echo 26667 ;;
+    c) echo 26677 ;;
+    d) echo 26687 ;;
     *) die "未知节点: $1（a|b|c|d）" ;;
   esac
 }
@@ -435,8 +473,9 @@ cmd_biyachaind() {
   [[ -x "$BIYACHAIND_BIN" ]] || die "未找到 $BIYACHAIND_BIN，请先: $0 build"
   local monad_dir="$WORK/monad-$n"
   local abci_sock="$monad_dir/abci.sock"
-  local grpc_port lib
+  local grpc_port metrics_port lib
   grpc_port="$(node_grpc_port "$n")"
+  metrics_port="$(node_metrics_port "$n")"
   rm -f "$abci_sock"
   lib="$(biyachain_lib_path || true)"
   if [[ -n "$lib" ]]; then
@@ -445,6 +484,7 @@ cmd_biyachaind() {
   echo "==> biyachaind-$n"
   echo "    home=$WORK/biyachain-home-$n"
   echo "    grpc=0.0.0.0:$grpc_port  abci=unix://$abci_sock"
+  echo "    metrics=0.0.0.0:$metrics_port (/metrics)"
   echo "    monad-ledger-path=$monad_dir/ledger"
   echo "    store.backend=$STORE_BACKEND seidb.enabled=$SEIDB_ENABLED sc=$SEIDB_SC_BACKEND ss=$SEIDB_SS_ENABLE/$SEIDB_SS_BACKEND"
   local seidb_args=(
@@ -454,6 +494,7 @@ cmd_biyachaind() {
     --seidb.ss-enable="$SEIDB_SS_ENABLE"
     --seidb.ss-backend="$SEIDB_SS_BACKEND"
     --seidb.keep-recent="$SEIDB_KEEP_RECENT"
+    --memiavl.async-commit-buffer="$SEIDB_MEMIAVL_ASYNC"
   )
   [[ -n "$SEIDB_HOME" ]] && seidb_args+=(--seidb.home="$SEIDB_HOME")
   exec "$BIYACHAIND_BIN" start \
@@ -467,6 +508,7 @@ cmd_biyachaind() {
     --json-rpc.enable=false \
     --optimistic-execution-enabled="${OPTIMISTIC_EXECUTION_ENABLED:-false}" \
     --monad-ledger-path="$monad_dir/ledger" \
+    --metrics-address="0.0.0.0:$metrics_port" \
     "${seidb_args[@]}" \
     --minimum-gas-prices "$MIN_GAS_PRICE"
     
@@ -482,7 +524,6 @@ cmd_monad() {
   export MONAD_ABCI_ENDPOINT="unix://$abci_sock"
   export MONAD_COSMOS_GENESIS_PATH="$WORK/genesis.json.reference"
   export RUST_LOG="${RUST_LOG:-info}"
-  apply_monad_sysctl
   echo "==> monad-$n"
   echo "    dir=$monad_dir"
   echo "    P2P 绑定地址见 node.toml（默认 $(node_monad_ip "$n"):8000）"
@@ -773,6 +814,42 @@ cmd_verify() {
     }'
 }
 
+# 单路 chain-stresser 调用：accounts / accounts-num / node-addr / grpc-addr 参数化，
+# 供 cmd_stress（单节点）与 cmd_stress_all（多节点分片）复用。
+run_chain_stresser() {
+  local accounts="$1" num="$2" node_addr="$3" grpc_addr="$4"
+  case "$STRESS_CMD" in
+    bank)
+      chain-stresser tx-bank-send \
+        --accounts "$accounts" \
+        --accounts-num "$num" \
+        --transactions "$STRESS_TRANSACTIONS" \
+        --rate-tps "$STRESS_RATE_TPS" \
+        --chain-id "$CHAIN_ID" \
+        --min-gas-price "$MIN_GAS_PRICE" \
+        --node-addr "$node_addr" \
+        --grpc-addr "$grpc_addr" \
+        --await=false
+      ;;
+    spot-limit)
+      chain-stresser tx-exchange-spot-limit-orders \
+        --accounts "$accounts" \
+        --accounts-num "$num" \
+        --transactions "$STRESS_TRANSACTIONS" \
+        --rate-tps "$STRESS_RATE_TPS" \
+        --spot-market-ids "$SPOT_MARKET_ID" \
+        --chain-id "$CHAIN_ID" \
+        --min-gas-price "$MIN_GAS_PRICE" \
+        --node-addr "$node_addr" \
+        --grpc-addr "$grpc_addr" \
+        --await=false
+      ;;
+    *)
+      die "未知 STRESS_CMD=$STRESS_CMD（bank | spot-limit）"
+      ;;
+  esac
+}
+
 cmd_stress() {
   need_cmd chain-stresser
   [[ -f "$STRESS_ACCOUNTS" ]] || die "未找到 $STRESS_ACCOUNTS，请先: $0 setup"
@@ -791,36 +868,7 @@ cmd_stress() {
   local start_ts end_ts
   start_ts="$(date +%s)"
 
-  case "$STRESS_CMD" in
-    bank)
-      chain-stresser tx-bank-send \
-        --accounts "$STRESS_ACCOUNTS" \
-        --accounts-num "$STRESS_ACCOUNTS_NUM_RUN" \
-        --transactions "$STRESS_TRANSACTIONS" \
-        --rate-tps "$STRESS_RATE_TPS" \
-        --chain-id "$CHAIN_ID" \
-        --min-gas-price "$MIN_GAS_PRICE" \
-        --node-addr "$STRESS_NODE_ADDR" \
-        --grpc-addr "$STRESS_GRPC_ADDR" \
-        --await=false
-      ;;
-    spot-limit)
-      chain-stresser tx-exchange-spot-limit-orders \
-        --accounts "$STRESS_ACCOUNTS" \
-        --accounts-num "$STRESS_ACCOUNTS_NUM_RUN" \
-        --transactions "$STRESS_TRANSACTIONS" \
-        --rate-tps "$STRESS_RATE_TPS" \
-        --spot-market-ids "$SPOT_MARKET_ID" \
-        --chain-id "$CHAIN_ID" \
-        --min-gas-price "$MIN_GAS_PRICE" \
-        --node-addr "$STRESS_NODE_ADDR" \
-        --grpc-addr "$STRESS_GRPC_ADDR" \
-        --await=false
-      ;;
-    *)
-      die "未知 STRESS_CMD=$STRESS_CMD（bank | spot-limit）"
-      ;;
-  esac
+  run_chain_stresser "$STRESS_ACCOUNTS" "$STRESS_ACCOUNTS_NUM_RUN" "$STRESS_NODE_ADDR" "$STRESS_GRPC_ADDR"
 
   end_ts="$(date +%s)"
   local elapsed=$((end_ts - start_ts))
@@ -850,9 +898,17 @@ resolve_comet_rpc_bin() {
 }
 
 cmd_rpc() {
+  # 可选节点参数 a|b|c|d：自动选择对应 monad-<n>/mempool.sock 与监听端口。
+  # 显式 MONAD_MEMPOOL_SOCK / COMET_RPC_LISTEN 始终优先。
+  local node="${1:-}"
   local monad_dir="${MONAD_RUN_DIR:-}"
   local node_toml="${MONAD_NODE_CONFIG:-$REPO/docker/devnet/monad/config/node.toml}"
   local mempool_sock="${MONAD_MEMPOOL_SOCK:-}"
+  local listen="${COMET_RPC_LISTEN:-}"
+  if [[ -n "$node" ]]; then
+    [[ -z "$mempool_sock" ]] && mempool_sock="$WORK/monad-$node/mempool.sock"
+    [[ -z "$listen" ]] && listen="127.0.0.1:$(node_comet_port "$node")"
+  fi
   if [[ -z "$mempool_sock" ]]; then
     if [[ -n "$monad_dir" ]]; then
       mempool_sock="$monad_dir/mempool.sock"
@@ -862,7 +918,8 @@ cmd_rpc() {
       mempool_sock="$REPO/.monad-home/mempool.sock"
     fi
   fi
-  local rpc_bin listen="${COMET_RPC_LISTEN:-127.0.0.1:26657}"
+  [[ -z "$listen" ]] && listen="127.0.0.1:26657"
+  local rpc_bin
 
   rpc_bin="$(resolve_comet_rpc_bin)" || die "未找到 cosmos-txpool-feed / monad-rpc，请先: $0 build"
   [[ -S "$mempool_sock" ]] || die "mempool socket 不存在: $mempool_sock（请先启动 monad-node）"
@@ -879,6 +936,120 @@ cmd_rpc() {
     --rpc-port 8545 \
     --comet-port 26657 \
     --cosmos-ipc-path "$mempool_sock"
+}
+
+stress_shard_count() {
+  local n="${STRESS_SHARDS:-4}"
+  (( n >= 1 && n <= 4 )) || die "STRESS_SHARDS 须为 1..4（当前 $n）"
+  echo "$n"
+}
+
+# 把账户文件按节点切片，避免多节点并发时同一账户 nonce 冲突。
+# accounts.json / addresses.json 均为顶层数组；输出 accounts.<n>.json / addresses.<n>.json。
+cmd_shard() {
+  need_cmd jq
+  ensure_stress_workdir
+  [[ -f "$STRESS_ACCOUNTS" ]] || die "未找到 $STRESS_ACCOUNTS，请先: $0 setup"
+  local shards dir acc addr total per
+  shards="$(stress_shard_count)"
+  dir="$(dirname "$STRESS_ACCOUNTS")"
+  acc="$STRESS_ACCOUNTS"
+  addr="$dir/addresses.json"
+  total="$(jq 'length' "$acc")"
+  per=$(( total / shards ))
+  (( per > 0 )) || die "账户数 $total 不足以分 $shards 片"
+  echo "==> 账户分片: total=$total shards=$shards per=$per ($dir)"
+  local nodes=(a b c d) n start end i=0
+  for n in "${nodes[@]:0:$shards}"; do
+    start=$(( i * per ))
+    end=$(( start + per ))
+    jq -c ".[$start:$end]" "$acc" > "$dir/accounts.$n.json"
+    if [[ -f "$addr" ]]; then
+      jq -c ".[$start:$end]" "$addr" > "$dir/addresses.$n.json"
+    fi
+    echo "    $n: [$start:$end) -> accounts.$n.json ($per 账户)"
+    i=$(( i + 1 ))
+  done
+  echo "完成。下一步: $0 rpc-all  然后  $0 stress-all"
+}
+
+# 后台一键启动每节点一个 cosmos-txpool-feed（前台 wait 守护，Ctrl-C 全停）。
+cmd_rpc_all() {
+  ensure_stress_workdir
+  local rpc_bin shards
+  rpc_bin="$(resolve_comet_rpc_bin)" || die "未找到 cosmos-txpool-feed / monad-rpc，请先: $0 build"
+  shards="$(stress_shard_count)"
+  local nodes=(a b c d) n sock port logf
+  trap 'echo; echo "==> 停止所有 feed"; kill 0 2>/dev/null; exit 0' INT TERM
+  echo "==> 后台启动 $shards 个 cosmos-txpool-feed（每节点一个）"
+  for n in "${nodes[@]:0:$shards}"; do
+    sock="$WORK/monad-$n/mempool.sock"
+    port="$(node_comet_port "$n")"
+    [[ -S "$sock" ]] || die "mempool socket 不存在: $sock（请先启动 monad-node $n）"
+    logf="$WORK/feed-$n.log"
+    COMET_RPC_LISTEN="127.0.0.1:$port" MONAD_MEMPOOL_SOCK="$sock" \
+      "$0" rpc "$n" >"$logf" 2>&1 &
+    echo "    feed-$n: listen=127.0.0.1:$port mempool=$sock pid=$! log=$logf"
+  done
+  echo ""
+  echo "压测: $0 shard && $0 stress-all（另开终端）"
+  echo "停止: Ctrl-C（或 pkill -f 'cosmos-txpool-feed serve'）"
+  wait
+}
+
+# 多节点分片并发压测：每片用独立账户子集 + 对应节点的 comet/gRPC 端口。
+# 总吞吐约 shards * STRESS_RATE_TPS（每片各自限速 STRESS_RATE_TPS）。
+cmd_stress_all() {
+  need_cmd chain-stresser
+  need_cmd jq
+  ensure_stress_workdir
+  local shards dir
+  shards="$(stress_shard_count)"
+  dir="$(dirname "$STRESS_ACCOUNTS")"
+  local nodes=(a b c d) n
+  for n in "${nodes[@]:0:$shards}"; do
+    [[ -f "$dir/accounts.$n.json" ]] || die "缺少分片 $dir/accounts.$n.json，请先: $0 shard"
+  done
+  local per num
+  per="$(jq 'length' "$dir/accounts.a.json")"
+  num="$STRESS_ACCOUNTS_NUM_RUN"
+  (( num > per )) && num="$per"
+
+  echo "==> stress-all ($STRESS_CMD): shards=$shards 每片 accounts-num=$num transactions=$STRESS_TRANSACTIONS"
+  echo "    每片 rate-tps=$STRESS_RATE_TPS  →  总目标 ~$(( shards * STRESS_RATE_TPS )) TPS"
+  echo "    实时进度: tail -f $WORK/stress-{a..d}.log"
+  echo ""
+
+  local start_ts end_ts pids=() acc port grpc logf
+  start_ts="$(date +%s)"
+  for n in "${nodes[@]:0:$shards}"; do
+    acc="$dir/accounts.$n.json"
+    port="$(node_comet_port "$n")"
+    grpc="$(node_grpc_port "$n")"
+    logf="$WORK/stress-$n.log"
+    echo "    shard-$n: node-addr=127.0.0.1:$port grpc=127.0.0.1:$grpc accounts=$acc log=$logf"
+    run_chain_stresser "$acc" "$num" "127.0.0.1:$port" "127.0.0.1:$grpc" >"$logf" 2>&1 &
+    pids+=("$!")
+  done
+
+  local rc=0 p
+  for p in "${pids[@]}"; do
+    wait "$p" || rc=1
+  done
+  end_ts="$(date +%s)"
+  local elapsed=$((end_ts - start_ts))
+  local total_tx=$(( shards * num * STRESS_TRANSACTIONS ))
+  echo ""
+  echo "==> stress-all 完成 (rc=$rc, ${elapsed}s, 约 ${total_tx} 笔提交)"
+  echo "==> 各片日志末尾:"
+  for n in "${nodes[@]:0:$shards}"; do
+    echo "  --- stress-$n.log ---"
+    tail -n 3 "$WORK/stress-$n.log" 2>/dev/null || true
+  done
+  echo ""
+  echo "==> 等待出块 (~5s) 后查 sequence (节点 a)"
+  sleep 5
+  cmd_verify || true
 }
 
 main() {
@@ -898,8 +1069,11 @@ main() {
     up) cmd_up ;;
     down) cmd_down ;;
     stress) cmd_stress ;;
+    stress-all) cmd_stress_all ;;
+    shard) cmd_shard ;;
     verify) cmd_verify ;;
-    rpc) cmd_rpc ;;
+    rpc) cmd_rpc "${2:-}" ;;
+    rpc-all) cmd_rpc_all ;;
     nodes) cmd_nodes ;;
     status) cmd_status ;;
     -h | --help | help | "") usage; [[ -n "$cmd" ]] || exit 0 ;;

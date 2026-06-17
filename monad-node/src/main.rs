@@ -344,7 +344,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         maybe_blocksync_rng_seed: None,
         consensus_config: ConsensusConfig {
             execution_delay: SeqNum(EXECUTION_DELAY),
-            delta: Duration::from_millis(100),
+            delta: Duration::from_millis(5_000),
             // StateSync -> Live transition happens here
             statesync_to_live_threshold: SeqNum(statesync_threshold as u64),
             // Live -> StateSync transition happens here
@@ -433,11 +433,13 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     let _timer = DropTimer::start(Duration::from_millis(1), |elapsed| {
                         warn!(
                             ?elapsed,
-                            ?event,
+                            %event,
                             "long time to format event"
                         )
                     });
-                    format!("{:?}", event)
+                    // Display(紧凑摘要)而非 Debug:Debug 会把整个事件(含 CosmosBlockBody
+                    // 的全部交易)展开成 MB 级字符串,既慢(~100ms)又把日志撑到 GB。
+                    format!("{}", event)
                 };
 
                 let event = LogFriendlyMonadEvent {

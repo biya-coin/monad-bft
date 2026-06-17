@@ -23,7 +23,10 @@ use thiserror::Error;
 use super::raptorcast_secondary::group_message::FullNodesGroupMessage;
 
 const SERIALIZE_VERSION: u32 = 1;
-pub const MAX_MESSAGE_SIZE: usize = 3 * 1024 * 1024;
+// 6 MiB. 上限受 R10 源符号数 K<=8192 约束(消息大小 = K × 符号长度);最保守符号
+// 长度 960B 下硬天花板约 7.5MB,6MiB(K≈6553)安全,且能容下满载 exchange 提案(~5.75MB)。
+// 注意:这是全网协议常量,所有节点必须一致并一起重启。
+pub const MAX_MESSAGE_SIZE: usize = 20 * 1024 * 1024;
 
 enum CompressionVersion {
     UncompressedVersion,
