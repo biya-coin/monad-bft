@@ -205,7 +205,8 @@ where
                 LedgerCommand::LedgerCommit(OptimisticCommit::Finalized(block)) => {
                     let block_id = block.get_id();
                     let block_num = block.get_seq_num().0;
-                    info!(block_num, "committed cosmos block");
+                    let tx_count = block.body().execution_body.txs.len();
+                    info!(block_num, tx_count, "committed cosmos block");
                     self.metrics[GAUGE_COSMOS_LEDGER_NUM_COMMITS] += 1;
                     self.metrics[GAUGE_COSMOS_LEDGER_BLOCK_NUM] = block_num;
                     self.last_commit = Some((block.get_seq_num(), block.get_block_round()));
