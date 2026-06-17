@@ -68,53 +68,63 @@ impl SocketAbciClient {
     }
 
     /// Synchronous socket roundtrip (to be called from blocking context).
+    ///
+    /// The connection for `endpoint` is cached and reused across calls. If a
+    /// roundtrip fails (broken pipe, partial read, framing desync, ...) the
+    /// cached connection is evicted so it is never reused in a poisoned state,
+    /// and the request is retried once on a freshly established connection.
+    /// Without this, a single transient ABCI socket error would permanently
+    /// stall the node, because every subsequent call would reuse the dead fd.
     fn do_socket_roundtrip(endpoint: &str, request: Request) -> Result<Response> {
-        enum SocketVariant {
-            Unix(UnixStream),
-            Tcp(TcpStream),
-        }
-
-        impl Read for SocketVariant {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                match self {
-                    SocketVariant::Unix(s) => s.read(buf),
-                    SocketVariant::Tcp(s) => s.read(buf),
-                }
-            }
-        }
-
-        impl Write for SocketVariant {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                match self {
-                    SocketVariant::Unix(s) => s.write(buf),
-                    SocketVariant::Tcp(s) => s.write(buf),
-                }
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                match self {
-                    SocketVariant::Unix(s) => s.flush(),
-                    SocketVariant::Tcp(s) => s.flush(),
-                }
-            }
-        }
-
         static SOCKET_CLIENTS: Lazy<Mutex<HashMap<String, SocketVariant>>> =
             Lazy::new(|| Mutex::new(HashMap::new()));
 
         let mut clients = SOCKET_CLIENTS.lock().unwrap();
 
-        if !clients.contains_key(endpoint) {
-            let socket = if endpoint.starts_with("/") {
-                SocketVariant::Unix(UnixStream::connect(endpoint)?)
-            } else {
-                SocketVariant::Tcp(TcpStream::connect(endpoint)?)
-            };
-            clients.insert(endpoint.to_string(), socket);
+        // Attempt the roundtrip; on the first failure, drop the (possibly
+        // poisoned) connection and retry once with a brand new connection.
+        let mut last_err: Option<AbciClientError> = None;
+        for _attempt in 0..2 {
+            if !clients.contains_key(endpoint) {
+                match Self::connect(endpoint) {
+                    Ok(socket) => {
+                        clients.insert(endpoint.to_string(), socket);
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        continue;
+                    }
+                }
+            }
+
+            let socket = clients.get_mut(endpoint).expect("socket just inserted");
+            match Self::roundtrip_on_socket(socket, &request) {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    // Evict the dead/desynced connection so the next attempt
+                    // (and any future call) reconnects instead of reusing it.
+                    clients.remove(endpoint);
+                    last_err = Some(err);
+                }
+            }
         }
 
-        let socket = clients.get_mut(endpoint).unwrap();
+        Err(last_err.unwrap_or_else(|| {
+            AbciClientError::Transport("ABCI socket roundtrip failed".to_owned())
+        }))
+    }
 
+    fn connect(endpoint: &str) -> Result<SocketVariant> {
+        let socket = if endpoint.starts_with("/") {
+            SocketVariant::Unix(UnixStream::connect(endpoint)?)
+        } else {
+            SocketVariant::Tcp(TcpStream::connect(endpoint)?)
+        };
+        Ok(socket)
+    }
+
+    /// Perform a single request/flush roundtrip on an established connection.
+    fn roundtrip_on_socket(socket: &mut SocketVariant, request: &Request) -> Result<Response> {
         // Encode and send request
         let mut body = Vec::new();
         request.encode(&mut body)?;
@@ -151,6 +161,36 @@ impl SocketAbciClient {
             _ => Err(AbciClientError::Transport(
                 "expected trailing flush response".to_owned(),
             )),
+        }
+    }
+}
+
+enum SocketVariant {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Read for SocketVariant {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SocketVariant::Unix(s) => s.read(buf),
+            SocketVariant::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for SocketVariant {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SocketVariant::Unix(s) => s.write(buf),
+            SocketVariant::Tcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SocketVariant::Unix(s) => s.flush(),
+            SocketVariant::Tcp(s) => s.flush(),
         }
     }
 }

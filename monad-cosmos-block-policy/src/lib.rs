@@ -210,7 +210,7 @@ impl CosmosBlockPolicy {
         SBT: StateBackend<ST, SCT, CosmosExecutionProtocol>,
     {
         if let Ok(header) = state_backend.get_execution_result(&GENESIS_BLOCK_ID, &target, true) {
-            return Ok(header);
+            return Ok(header.consensus_digest());
         }
 
         let endpoint = self.abci_endpoint.clone();
@@ -241,7 +241,7 @@ impl CosmosBlockPolicy {
             }
         }
 
-        Ok(header)
+        Ok(header.consensus_digest())
     }
 }
 

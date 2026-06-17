@@ -87,7 +87,12 @@ where
         let wire_bytes: usize = txs.iter().map(|b| b.len()).sum();
         let mut accepted = 0usize;
         let mut duplicates = 0usize;
+        let mut rejected_full = 0usize;
         for tx in txs {
+            if self.pending_txs.is_full() {
+                rejected_full += 1;
+                continue;
+            }
             let fwd = tx.clone();
             if self.pending_txs.try_push(tx) {
                 accepted += 1;
@@ -96,11 +101,19 @@ where
                 duplicates += 1;
             }
         }
+        if rejected_full > 0 {
+            warn!(
+                rejected_full,
+                pending = self.pending_txs.pending_len(),
+                "cosmos txpool: mempool full, rejecting new txs"
+            );
+        }
         if n > 0 {
             debug!(
                 count = n,
                 accepted,
                 duplicates,
+                rejected_full,
                 wire_bytes,
                 pending_after = self.pending_txs.pending_len(),
                 "cosmos txpool: IPC ingress (CheckTx already applied)"

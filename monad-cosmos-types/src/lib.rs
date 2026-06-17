@@ -80,6 +80,29 @@ impl CosmosFinalizedHeader {
             retain_height: commit.retain_height.max(0) as u64,
         })
     }
+
+    /// Lightweight copy for embedding in consensus proposals
+    /// (`delayed_execution_results`).
+    ///
+    /// The raw `finalize_block_response` / `commit_response` blobs can each be
+    /// ~MBs for a full block and are NOT needed cross-node: `app_hash`,
+    /// `tx_results_hash` and `validator_updates_hash` are cryptographic
+    /// commitments to that content, and every validator re-derives the same
+    /// digest from its own local execution. Shipping the full blobs only bloats
+    /// the proposal past raptorcast's `MAX_MESSAGE_SIZE` (3 MiB). Dropping them
+    /// keeps coherency verification intact while shrinking the proposal by an
+    /// order of magnitude.
+    pub fn consensus_digest(&self) -> Self {
+        Self {
+            height: self.height,
+            app_hash: self.app_hash.clone(),
+            tx_results_hash: self.tx_results_hash.clone(),
+            validator_updates_hash: self.validator_updates_hash.clone(),
+            finalize_block_response: Vec::new(),
+            commit_response: Vec::new(),
+            retain_height: self.retain_height,
+        }
+    }
 }
 
 fn hash_messages<M: Message>(messages: &[M]) -> Result<Vec<u8>, prost::EncodeError> {
