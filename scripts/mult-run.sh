@@ -15,6 +15,7 @@ export GENTX_STAKE="${GENTX_STAKE:-500000000000000000000byb}"
 export STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
 export STRESS_ACCOUNTS_DIR="$WORK/instances/0"
 export STRESS_ACCOUNT_BALANCE_BYB="${STRESS_ACCOUNT_BALANCE_BYB:-1000000000000000000000000000byb}"
+export MAX_BLOCK_TXS="${MAX_BLOCK_TXS:-500}"
 # USDT(market 0xb322 的 quote 币)。原值 1e19 不够 chain-stresser spot-limit 初始化
 # deposit 的默认额度(1e23),会导致 MsgDeposit 失败 → 子账户空 → 订单被拒。提到 1e27。
 export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-1000000000000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
@@ -356,9 +357,11 @@ PY
 
     "$BIYACHAIND_BIN" genesis collect-gentxs --home "$WORK/biyachain-home-a"
 
-    # 设置区块最大 gas 为-1
+    # 设置区块限制
     cat "$WORK/biyachain-home-a/config/genesis.json" | \
-        jq '.consensus["params"]["block"]["max_gas"]="2000000000"' > \
+        jq --arg max_txs "$MAX_BLOCK_TXS" \
+          '.consensus["params"]["block"]["max_gas"]="2000000000"
+           | .consensus["params"]["block"]["max_txs"]=$max_txs' > \
         "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
         mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
 
@@ -421,6 +424,9 @@ init_monad_node() {
             cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
         done
     fi
+    for n in b c d; do
+        cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
+    done
 
     # Compose 使用 --forkpoint-config /monad/forkpoint.toml；缺文件会报 local_err=ENOENT 且 REMOTE 未设时直接退出。
     # 默认用仓库 genesis forkpoint；多验证者生产场景请换与 validators.toml 配套的 forkpoint（见 docs）。
@@ -475,8 +481,11 @@ init_monad_node() {
         P2P_ADDR[$n]="$addr"
         P2P_SIG[$n]="$sig"
         P2P_PUB[$n]="$pub"
-        python3 -c "
-import re, pathlib, sys
+        python3 - "$MONAD_DIR/node.toml" "$addr" "$sig" <<'PY'
+import pathlib
+import re
+import sys
+
 path, addr, sig = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 host = addr.rsplit(':', 1)[0]
 t = path.read_text()
@@ -486,7 +495,7 @@ t, n2 = re.subn(r'^self_name_record_sig = .*$', 'self_name_record_sig = \"' + si
 t, n3 = re.subn(r'^bind_address_host = .*$', 'bind_address_host = \"' + host + '\"', t, count=1, flags=re.M)
 assert n1 == 1 and n2 == 1 and n3 == 1, (n1, n2, n3)
 path.write_text(t)
-" "$MONAD_DIR/node.toml" "$addr" "$sig"
+PY
     done
 
     # 无 [[bootstrap.peers]] 时 peer discovery 难以建立路由，Raptorcast 会持续 WARN unknown address for node …
@@ -504,8 +513,11 @@ path.write_text(t)
                 echo ""
             } >>"$bootf"
         done
-        python3 -c "
-import pathlib, re, sys
+        python3 - "$WORK/monad-$n/node.toml" "$bootf" <<'PY'
+import pathlib
+import re
+import sys
+
 path, boot_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 boot = boot_path.read_text()
 text = path.read_text()
@@ -514,7 +526,7 @@ new = '[bootstrap]\\n\\n' + boot + '[peer_discovery]'
 text, c = pat.subn(new, text, count=1)
 assert c == 1, ('[bootstrap]…[peer_discovery] replace failed', c)
 path.write_text(text)
-" "$WORK/monad-$n/node.toml" "$bootf"
+PY
         rm -f "$bootf"
     done
 
