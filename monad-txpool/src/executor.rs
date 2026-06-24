@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     marker::PhantomData,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -34,7 +34,7 @@ use crate::{
         block_on_async, check_tx, info, prepare_proposal,
         prepare_request_from_header,
     },
-    mempool::IndexedCosmosMempool,
+    mempool::{cosmos_raw_tx_id, CosmosTxId, IndexedCosmosMempool},
 };
 
 const COSMOS_FORWARD_EGRESS_MAX_BYTES: usize = 1024 * 1024;
@@ -54,6 +54,7 @@ pub struct CosmosTxPoolExecutor<
     events: VecDeque<MonadEvent<ST, SCT, CosmosExecutionProtocol>>,
     waker: Option<Waker>,
     metrics: ExecutorMetrics,
+    committed_seen_txs: HashSet<CosmosTxId>,
     _phantom: PhantomData<(BPT, SBT, CCT, CRT)>,
 }
 
@@ -78,6 +79,7 @@ where
             events: VecDeque::new(),
             waker: None,
             metrics: ExecutorMetrics::default(),
+            committed_seen_txs: HashSet::new(),
             _phantom: PhantomData,
         }
     }
@@ -89,6 +91,10 @@ where
         let mut duplicates = 0usize;
         let mut rejected_full = 0usize;
         for tx in txs {
+            if self.committed_seen_txs.contains(&cosmos_raw_tx_id(tx.as_ref())) {
+                duplicates += 1;
+                continue;
+            }
             if self.pending_txs.is_full() {
                 rejected_full += 1;
                 continue;
@@ -157,6 +163,7 @@ where
                     tx_limit: _,
                     proposal_byte_limit,
                     timestamp_ns,
+                    extending_blocks,
                     delayed_execution_results,
                     ..
                 } => {
@@ -173,7 +180,12 @@ where
 
                     let prepared_txs = {
                         let endpoint = self.endpoint.clone();
-                        let prepare_request = prepare_request_from_header(&header, Vec::new());
+                        let reserved_parent_txs = extending_blocks
+                            .iter()
+                            .flat_map(|block| block.body().execution_body.txs.iter().cloned())
+                            .collect::<Vec<_>>();
+                        let prepare_request =
+                            prepare_request_from_header(&header, reserved_parent_txs);
                         block_on_async(async move {
                             prepare_proposal(&endpoint, prepare_request)
                                 .await
@@ -183,6 +195,10 @@ where
 
                     match prepared_txs {
                         Ok(txs) => {
+                            let txs = txs
+                                .into_iter()
+                                .filter(|tx| !self.committed_seen_txs.contains(&cosmos_raw_tx_id(tx.as_slice())))
+                                .collect::<Vec<_>>();
                             let n_included = txs.len();
                             let included_bytes: usize = txs.iter().map(|t| t.len()).sum();
                             if n_included > 0 {
@@ -246,6 +262,10 @@ where
                         };
                     }
                     for tx in to_apply {
+                        if self.committed_seen_txs.contains(&cosmos_raw_tx_id(tx.as_ref())) {
+                            duplicates += 1;
+                            continue;
+                        }
                         if self.pending_txs.try_push(tx) {
                             accepted += 1;
                         } else {
@@ -271,6 +291,8 @@ where
                 TxPoolCommand::BlockCommit(committed_blocks) => {
                     for block in committed_blocks {
                         for tx in block.body().execution_body.txs.iter() {
+                            let tx_id = cosmos_raw_tx_id(tx.as_slice());
+                            self.committed_seen_txs.insert(tx_id);
                             self.pending_txs.remove_by_raw(tx.as_slice());
                         }
                     }
