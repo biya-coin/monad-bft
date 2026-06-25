@@ -443,10 +443,16 @@ where
                     txs,
                 })]
             }
-            MempoolEvent::ForwardTxs(_) => {
-                // Local IPC egress forwarding is drained asynchronously by monad-node → router.
-                Vec::new()
-            }
+            MempoolEvent::ForwardTxs(txs) => consensus
+                .iter_future_other_leaders()
+                .map(|target| {
+                    Command::RouterCommand(RouterCommand::PublishWithPriority {
+                        target: RouterTarget::DirectPointToPoint(target),
+                        message: VerifiedMonadMessage::ForwardedTx(txs.clone()),
+                        priority: monad_types::UdpPriority::Regular,
+                    })
+                })
+                .collect_vec(),
         }
     }
 

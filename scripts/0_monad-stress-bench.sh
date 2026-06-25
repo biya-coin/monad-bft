@@ -57,8 +57,8 @@ STRESS_CMD="${STRESS_CMD:-spot-limit}"
 # 可以根据区块时间（通常是2s）这样估算：STRESS_RATE_TPS * 块时间 = 每块交易数
 # 例如 TPS=5000，每2s出块 ~= 10000 txs/块
 STRESS_ACCOUNTS_NUM_RUN="${STRESS_ACCOUNTS_NUM_RUN:-1000}"      # 更多账号可减少 nonce 瓶颈
-STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-800}"               # 每账号交易数，可选更大
-STRESS_RATE_TPS="${STRESS_RATE_TPS:-3000}"                      # 每秒交易数，根据目标动态调整
+STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-600}"               # 每账号交易数，可选更大
+STRESS_RATE_TPS="${STRESS_RATE_TPS:-1000}"                      # 每秒交易数，根据目标动态调整
 STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
 STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
 MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"

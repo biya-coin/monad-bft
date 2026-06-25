@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     marker::PhantomData,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -32,8 +32,8 @@ monad_executor::metric_consts! {
 
 use crate::{
     abci::{block_on_async, prepare_proposal, prepare_request_from_header},
-    forward::{spawn_mempool_ingress_consumer, spawn_p2p_insert_bridge},
-    mempool::IndexedCosmosMempool,
+    forward::{ForwardEgress, spawn_mempool_ingress_consumer, spawn_p2p_insert_bridge},
+    mempool::{cosmos_raw_tx_id, CosmosTxId, IndexedCosmosMempool},
 };
 
 pub struct CosmosTxPoolExecutor<
@@ -51,6 +51,8 @@ pub struct CosmosTxPoolExecutor<
     events: VecDeque<MonadEvent<ST, SCT, CosmosExecutionProtocol>>,
     waker: Option<Waker>,
     metrics: ExecutorMetrics,
+    committed_seen_txs: Arc<Mutex<HashSet<CosmosTxId>>>,
+    forward_egress: Arc<ForwardEgress>,
     _phantom: PhantomData<(BPT, SBT, CCT, CRT)>,
 }
 
@@ -69,12 +71,26 @@ where
     ) -> Self {
         let endpoint = endpoint.into();
         let pending_txs = Arc::new(Mutex::new(IndexedCosmosMempool::new()));
+        let committed_seen_txs = Arc::new(Mutex::new(HashSet::new()));
+        let forward_egress = ForwardEgress::new_shared();
         let (p2p_insert_tx, p2p_checked_rx) = spawn_p2p_insert_bridge(endpoint.clone());
 
         if let Some(rx) = ipc_checked_rx {
-            spawn_mempool_ingress_consumer(pending_txs.clone(), rx, "ipc");
+            spawn_mempool_ingress_consumer(
+                pending_txs.clone(),
+                committed_seen_txs.clone(),
+                Some(forward_egress.clone()),
+                rx,
+                "ipc",
+            );
         }
-        spawn_mempool_ingress_consumer(pending_txs.clone(), p2p_checked_rx, "p2p");
+        spawn_mempool_ingress_consumer(
+            pending_txs.clone(),
+            committed_seen_txs.clone(),
+            None,
+            p2p_checked_rx,
+            "p2p",
+        );
 
         Self {
             endpoint,
@@ -83,6 +99,8 @@ where
             events: VecDeque::new(),
             waker: None,
             metrics: ExecutorMetrics::default(),
+            committed_seen_txs,
+            forward_egress,
             _phantom: PhantomData,
         }
     }
@@ -127,6 +145,7 @@ where
                     tx_limit: _,
                     proposal_byte_limit,
                     timestamp_ns,
+                    extending_blocks,
                     delayed_execution_results,
                     ..
                 } => {
@@ -146,7 +165,12 @@ where
 
                     let prepared_txs = {
                         let endpoint = self.endpoint.clone();
-                        let prepare_request = prepare_request_from_header(&header, Vec::new());
+                        let reserved_parent_txs = extending_blocks
+                            .iter()
+                            .flat_map(|block| block.body().execution_body.txs.iter().cloned())
+                            .collect::<Vec<_>>();
+                        let prepare_request =
+                            prepare_request_from_header(&header, reserved_parent_txs);
                         block_on_async(async move {
                             prepare_proposal(&endpoint, prepare_request)
                                 .await
@@ -160,6 +184,22 @@ where
                                 proposal_start.elapsed().as_micros() as u64;
                             self.metrics[GAUGE_COSMOS_TXPOOL_PROPOSAL_COUNT] += 1;
 
+                            let txs = match self.committed_seen_txs.lock() {
+                                Ok(seen) => txs
+                                    .into_iter()
+                                    .filter(|tx| {
+                                        !seen.contains(&cosmos_raw_tx_id(tx.as_slice()))
+                                    })
+                                    .collect::<Vec<_>>(),
+                                Err(poisoned) => {
+                                    let seen = poisoned.into_inner();
+                                    txs.into_iter()
+                                        .filter(|tx| {
+                                            !seen.contains(&cosmos_raw_tx_id(tx.as_slice()))
+                                        })
+                                        .collect::<Vec<_>>()
+                                }
+                            };
                             let n_included = txs.len();
                             let included_bytes: usize = txs.iter().map(|t| t.len()).sum();
                             if n_included > 0 {
@@ -213,12 +253,18 @@ where
                     }
                 }
                 TxPoolCommand::BlockCommit(committed_blocks) => {
-                    if let Ok(mut pool) = self.pending_txs.lock() {
+                    if let (Ok(mut seen), Ok(mut pool)) = (
+                        self.committed_seen_txs.lock(),
+                        self.pending_txs.lock(),
+                    ) {
                         for block in committed_blocks {
                             for tx in block.body().execution_body.txs.iter() {
+                                seen.insert(cosmos_raw_tx_id(tx.as_slice()));
                                 pool.remove_by_raw(tx.as_slice());
                             }
                         }
+                    } else {
+                        warn!("cosmos txpool: lock poisoned during BlockCommit");
                     }
                 }
                 TxPoolCommand::EnterRound { .. } => {}
@@ -252,6 +298,17 @@ where
             return Poll::Ready(Some(event));
         }
 
+        let (batch, has_more) = this.forward_egress.drain_batch();
+        if !batch.is_empty() {
+            if has_more {
+                cx.waker().wake_by_ref();
+            }
+            return Poll::Ready(Some(MonadEvent::MempoolEvent(
+                MempoolEvent::ForwardTxs(batch),
+            )));
+        }
+
+        this.forward_egress.register_waker(cx.waker().clone());
         this.waker = Some(cx.waker().clone());
         Poll::Pending
     }
