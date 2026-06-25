@@ -2,6 +2,7 @@ pub mod abci;
 pub mod comet_mempool_rpc;
 pub mod commit_store;
 pub mod executor;
+pub mod forward;
 pub mod ipc;
 pub mod mempool;
 
@@ -15,5 +16,6 @@ pub use abci::{
 };
 pub use commit_store::CosmosCommitStore;
 pub use executor::CosmosTxPoolExecutor;
+pub use forward::CosmosTxForwardJob;
 pub use ipc as cosmos_txpool_ipc;
 pub use mempool::{cosmos_raw_tx_id, CosmosTxId, IndexedCosmosMempool};

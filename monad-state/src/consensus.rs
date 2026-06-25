@@ -298,7 +298,7 @@ where
                     }
                 }
             }
-            ConsensusEvent::Timeout(round) => consensus.handle_timeout_expiry(round),
+            ConsensusEvent::Timeout(round) => consensus.handle_timeout_expiry(round, true),
             ConsensusEvent::BlockSync {
                 block_range,
                 full_blocks,
@@ -436,28 +436,16 @@ where
                 ]
             }
             MempoolEvent::ForwardedTxs { sender, txs } => {
+                // P2P ingress is handled directly via TxPoolCommand (async CheckTx in txpool).
+                // Avoid routing through consensus state so block production is not delayed.
                 vec![Command::TxPoolCommand(TxPoolCommand::InsertForwardedTxs {
                     sender,
                     txs,
                 })]
             }
-            MempoolEvent::ForwardTxs(txs) => {
-                consensus
-                    .iter_future_other_leaders()
-                    .map(|target| {
-                        // TODO ideally we could batch these all as one RouterCommand(PointToPoint) so
-                        // that we can:
-                        // 1. avoid cloning txns
-                        // 2. avoid serializing multiple times
-                        // 3. avoid raptor coding multiple times
-                        // 4. use 1 sendmmsg in the router
-                        Command::RouterCommand(RouterCommand::PublishWithPriority {
-                            target: RouterTarget::DirectPointToPoint(target),
-                            message: VerifiedMonadMessage::ForwardedTx(txs.clone()),
-                            priority: monad_types::UdpPriority::Regular,
-                        })
-                    })
-                    .collect_vec()
+            MempoolEvent::ForwardTxs(_) => {
+                // Local IPC egress forwarding is drained asynchronously by monad-node → router.
+                Vec::new()
             }
         }
     }
@@ -638,10 +626,15 @@ where
         &mut self,
         command: ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
     ) -> WrappedConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT> {
+        let wrapper = self.try_build_state_wrapper();
         WrappedConsensusCommand {
-            upcoming_leader_rounds: self
-                .try_build_state_wrapper()
+            upcoming_leader_rounds: wrapper
+                .as_ref()
                 .map(|consensus| consensus.iter_upcoming_self_leader_rounds().collect())
+                .unwrap_or_default(),
+            forward_targets: wrapper
+                .as_ref()
+                .map(|consensus| consensus.iter_future_other_leaders().collect())
                 .unwrap_or_default(),
             command,
         }
@@ -659,6 +652,7 @@ where
     CRT: ChainRevision,
 {
     upcoming_leader_rounds: Vec<Round>,
+    forward_targets: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
     pub command: ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>,
 }
 
@@ -689,6 +683,7 @@ where
     fn from(wrapped: WrappedConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>) -> Self {
         let WrappedConsensusCommand {
             upcoming_leader_rounds,
+            forward_targets,
             command,
         } = wrapped;
 
@@ -703,6 +698,7 @@ where
                     epoch,
                     round,
                     upcoming_leader_rounds,
+                    forward_targets,
                 }))
             }
             ConsensusCommand::Publish { target, message } => {

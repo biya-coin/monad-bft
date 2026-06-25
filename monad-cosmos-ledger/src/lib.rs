@@ -31,6 +31,14 @@ monad_executor::metric_consts! {
         name: "monad.cosmos_ledger.block_num",
         help: "Current block number in the Cosmos ledger",
     }
+    GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_TOTAL_US {
+        name: "monad.cosmos_ledger.proposed_head_write_total_us",
+        help: "Total microseconds writing canonical proposed block to ledger (body+header+proposed_head symlink)",
+    }
+    GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_COUNT {
+        name: "monad.cosmos_ledger.proposed_head_write_count",
+        help: "Canonical proposed-head ledger writes",
+    }
 }
 
 /// Persists BFT blocks to disk and serves blocksync requests for the Cosmos
@@ -189,11 +197,15 @@ where
         for command in commands {
             match command {
                 LedgerCommand::LedgerCommit(OptimisticCommit::Proposed { block, is_canonical }) => {
+                    let write_start = std::time::Instant::now();
                     self.write_bft_block(&block);
                     if is_canonical {
                         self.bft_block_persist
                             .update_proposed_head(&block.get_id())
                             .unwrap();
+                        self.metrics[GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_TOTAL_US] +=
+                            write_start.elapsed().as_micros() as u64;
+                        self.metrics[GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_COUNT] += 1;
                     }
                     self.update_cache(block);
                 }

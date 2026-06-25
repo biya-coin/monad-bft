@@ -222,12 +222,6 @@ where
         }) {
             return Poll::Ready(Some(e));
         }
-        // TODO: ingesting txs should be deprioritized
-        if let Poll::Ready(Some(e)) = guard.metrics.record(GAUGE_TXPOOL_TOTAL_POLL_US, || {
-            this.txpool.next().poll_unpin(cx)
-        }) {
-            return Poll::Ready(Some(e));
-        }
         if let Poll::Ready(Some(e)) = this.val_set.next().poll_unpin(cx) {
             return Poll::Ready(Some(e));
         }
@@ -237,9 +231,14 @@ where
         if let Poll::Ready(Some(e)) = this.loopback.next().poll_unpin(cx) {
             return Poll::Ready(Some(e));
         }
-        // TODO: consensus msgs should be prioritized
+        // Consensus network messages before txpool (tx ingress is async / side-channel).
         if let Poll::Ready(Some(e)) = guard.metrics.record(GAUGE_ROUTER_TOTAL_POLL_US, || {
             this.router.next().poll_unpin(cx)
+        }) {
+            return Poll::Ready(Some(e));
+        }
+        if let Poll::Ready(Some(e)) = guard.metrics.record(GAUGE_TXPOOL_TOTAL_POLL_US, || {
+            this.txpool.next().poll_unpin(cx)
         }) {
             return Poll::Ready(Some(e));
         }

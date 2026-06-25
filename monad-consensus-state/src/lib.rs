@@ -107,6 +107,10 @@ where
     canonical_proposed_tip: Option<BlockId>,
     vote_delay_timer_start: Option<VoteDelayTimerStart>,
     vote_delay_metrics: VoteDelayMetricsWindow,
+    /// Set when handling a proposal; consumed when the node reaches vote-ready.
+    proposal_vote_start: Option<std::time::Instant>,
+    /// Set when vote is scheduled (VoteReady); consumed when the vote is sent.
+    vote_ready_at: Option<std::time::Instant>,
 }
 
 impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> PartialEq
@@ -287,6 +291,8 @@ where
             canonical_proposed_tip: None,
             vote_delay_timer_start: None,
             vote_delay_metrics: VoteDelayMetricsWindow::default(),
+            proposal_vote_start: None,
+            vote_ready_at: None,
         }
     }
 
@@ -399,6 +405,7 @@ where
     pub fn handle_timeout_expiry(
         &mut self,
         timeout_round: Round,
+        record_local_timeout_metrics: bool,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         let mut cmds = Vec::new();
 
@@ -406,7 +413,13 @@ where
             return cmds;
         }
 
-        self.metrics.consensus_events.local_timeout += 1;
+        if record_local_timeout_metrics {
+            self.metrics.consensus_events.local_timeout += 1;
+            if let Some(elapsed) = self.consensus.pacemaker.round_timer_elapsed() {
+                self.metrics.consensus_timing.local_timeout_total_us +=
+                    elapsed.as_micros() as u64;
+            }
+        }
 
         let lookup_leader = |round: Round| {
             let epoch = self
@@ -567,7 +580,9 @@ where
         }
         self.consensus.safety.handle_proposal(proposal_round);
 
+        self.consensus.proposal_vote_start = Some(std::time::Instant::now());
         let Some(block) = self.validate_block(p.tip.block_header.clone(), p.block_body) else {
+            self.consensus.proposal_vote_start = None;
             info!(
                 proposal_round = proposal_round.0,
                 seq_num = p.tip.block_header.seq_num.0,
@@ -864,7 +879,7 @@ where
                 // broadcast Timeout message immediately if received
                 // TC to advance round. this helps other validators to
                 // form their own TC
-                cmds.extend(self.handle_timeout_expiry(tc.round));
+                cmds.extend(self.handle_timeout_expiry(tc.round, false));
                 cmds.extend(self.process_tc(tc));
             }
             Some(RoundCertificate::Tc(tc)) if tc.round > current_round => {
@@ -1301,6 +1316,12 @@ where
         }
 
         debug!(?round, ?vote, ?current_leader, ?next_leader, "sending vote");
+
+        if let Some(ready_at) = self.consensus.vote_ready_at.take() {
+            self.metrics.consensus_timing.vote_send_wait_total_us +=
+                ready_at.elapsed().as_micros() as u64;
+            self.metrics.consensus_timing.vote_send_wait_count += 1;
+        }
 
         // start the vote-timer for the next round
         let next_round = round + Round(1);
@@ -1829,6 +1850,10 @@ where
         };
 
         debug!(?v, "vote successful");
+        if let Some(start) = self.consensus.proposal_vote_start.take() {
+            self.metrics.consensus_timing.vote_total_us += start.elapsed().as_micros() as u64;
+            self.metrics.consensus_timing.vote_count += 1;
+        }
         info!(
             vote_round = v.round.0,
             vote_block_id = ?v.id,
@@ -1886,6 +1911,7 @@ where
                         "MONAD_EXEC_DEBUG consensus_vote_scheduled"
                     );
                     self.consensus.scheduled_vote = Some(OutgoingVoteStatus::VoteReady(v));
+                    self.consensus.vote_ready_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -2085,6 +2111,7 @@ where
                         )
                     };
 
+                let exec_result_start = std::time::Instant::now();
                 let Ok(delayed_execution_results) =
                     self.block_policy.get_expected_execution_results(
                         try_propose_seq_num,
@@ -2102,6 +2129,9 @@ where
                     self.metrics.consensus_events.rx_execution_lagging += 1;
                     return cmds;
                 };
+                self.metrics.consensus_timing.execution_result_query_total_us +=
+                    exec_result_start.elapsed().as_micros() as u64;
+                self.metrics.consensus_timing.execution_result_query_count += 1;
                 let _create_proposal_span =
                     tracing::info_span!("create_proposal_span", ?round).entered();
 
@@ -4188,7 +4218,7 @@ mod test {
         let node1_round = node1.consensus_state.get_current_round();
 
         // now timeout someone
-        let cmds = node1.wrapped_state().handle_timeout_expiry(node1_round);
+        let cmds = node1.wrapped_state().handle_timeout_expiry(node1_round, true);
         let tmo: Vec<
             &TimeoutMessage<SignatureType, SignatureCollectionType, EthExecutionProtocol>,
         > = cmds
@@ -5974,7 +6004,7 @@ mod test {
         };
         let timeout_locally = |node: &mut NodeContext<_, _, _, _, _, _, _>| {
             let round = node.consensus_state.get_current_round();
-            let cmds = node.wrapped_state().handle_timeout_expiry(round);
+            let cmds = node.wrapped_state().handle_timeout_expiry(round, true);
             let timeout = extract_timeout_msgs(cmds).remove(0);
             let _ = handle_own_timeout(node, &timeout);
             timeout
@@ -6109,7 +6139,7 @@ mod test {
         };
         let timeout_locally = |node: &mut NodeContext<_, _, _, _, _, _, _>| {
             let round = node.consensus_state.get_current_round();
-            let cmds = node.wrapped_state().handle_timeout_expiry(round);
+            let cmds = node.wrapped_state().handle_timeout_expiry(round, true);
             let timeout = extract_timeout_msgs(cmds).remove(0);
             let _ = handle_own_timeout(node, &timeout);
             timeout

@@ -525,6 +525,7 @@ where
                 epoch,
                 round,
                 upcoming_leader_rounds,
+                forward_targets: _,
             } => Either::Left(TxPoolExecutorCommand::EnterRound {
                 epoch,
                 round,

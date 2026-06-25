@@ -64,6 +64,30 @@ monad_executor::metric_consts! {
         name: "monad.bft.raptorcast.udp.secondary_broadcast_latency_count",
         help: "Secondary broadcast latency measurement count (30s rolling window)",
     }
+    pub GAUGE_PRIMARY_BROADCAST_LATENCY_TOTAL_MS {
+        name: "monad.bft.raptorcast.udp.primary_broadcast_latency_total_ms",
+        help: "Cumulative primary broadcast receive latency in ms (receiver now - message unix_ts_ms)",
+    }
+    pub GAUGE_PRIMARY_BROADCAST_LATENCY_OBSERVATIONS {
+        name: "monad.bft.raptorcast.udp.primary_broadcast_latency_observations",
+        help: "Cumulative primary broadcast receive latency observations",
+    }
+    pub GAUGE_SECONDARY_BROADCAST_LATENCY_TOTAL_MS {
+        name: "monad.bft.raptorcast.udp.secondary_broadcast_latency_total_ms",
+        help: "Cumulative secondary broadcast receive latency in ms (receiver now - message unix_ts_ms)",
+    }
+    pub GAUGE_SECONDARY_BROADCAST_LATENCY_OBSERVATIONS {
+        name: "monad.bft.raptorcast.udp.secondary_broadcast_latency_observations",
+        help: "Cumulative secondary broadcast receive latency observations",
+    }
+    pub GAUGE_RAPTORCAST_BROADCAST_TOTAL_US {
+        name: "monad.raptorcast.broadcast_total_us",
+        help: "Total microseconds spent publishing broadcast/raptorcast messages",
+    }
+    pub GAUGE_RAPTORCAST_BROADCAST_COUNT {
+        name: "monad.raptorcast.broadcast_count",
+        help: "Number of broadcast/raptorcast publish operations",
+    }
 }
 
 const HISTOGRAM_CLEAR_INTERVAL: Duration = Duration::from_secs(30);
@@ -142,6 +166,17 @@ impl UdpStateMetrics {
             crate::util::BroadcastMode::Secondary => &mut self.secondary_broadcast,
         };
         histogram.record(latency_ms, &mut self.executor_metrics);
+        match mode {
+            crate::util::BroadcastMode::Primary => {
+                self.executor_metrics[GAUGE_PRIMARY_BROADCAST_LATENCY_TOTAL_MS] += latency_ms;
+                self.executor_metrics[GAUGE_PRIMARY_BROADCAST_LATENCY_OBSERVATIONS] += 1;
+            }
+            crate::util::BroadcastMode::Secondary => {
+                self.executor_metrics[GAUGE_SECONDARY_BROADCAST_LATENCY_TOTAL_MS] += latency_ms;
+                self.executor_metrics[GAUGE_SECONDARY_BROADCAST_LATENCY_OBSERVATIONS] += 1;
+            }
+            crate::util::BroadcastMode::Unspecified => {}
+        }
     }
 
     pub fn executor_metrics(&self) -> &ExecutorMetrics {

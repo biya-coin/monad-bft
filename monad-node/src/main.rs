@@ -269,10 +269,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             node_state.chain_config.get_epoch_length(),
         ),
         timestamp: TokioTimestamp::new(Duration::from_millis(5), 100, 10001),
-        txpool: CosmosTxPoolExecutor::new(
-            abci_endpoint.clone(),
-            cosmos_ipc_checked,
-        ),
+        txpool: CosmosTxPoolExecutor::new(abci_endpoint.clone(), cosmos_ipc_checked),
         control_panel: ControlPanelIpcReceiver::new(
             node_state.control_panel_ipc_path,
             node_state.reload_handle,

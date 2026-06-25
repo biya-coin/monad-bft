@@ -54,6 +54,8 @@ impl VoteDelayMetricsWindow {
                 recorded_at_ms: now_ms,
                 ready_after_timer_start_ms,
             });
+        metrics.vote_delay.ready_after_timer_start_total_ms += ready_after_timer_start_ms;
+        metrics.vote_delay.ready_after_timer_start_count += 1;
         self.update_metrics(metrics);
     }
 
