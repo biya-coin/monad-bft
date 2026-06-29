@@ -1,0 +1,119 @@
+---
+# Step 1：本地编译 + genesis 初始化 + 打包（无 Docker，纯二进制分发）
+- name: 探测 validators（获取 P2P IP）
+  hosts: validators
+  gather_facts: false
+  tasks:
+    - ansible.builtin.ping:
+
+- name: 本地编译与初始化
+  hosts: coordinator
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/build-p2p-map.yml
+
+    - name: 创建 artifacts 目录
+      file:
+        path: "{{ node_pack_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[1/2] 本地编译 monad-node / biyachaind / cosmos-txpool-feed"
+      command: "{{ bench_script }} build"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment:
+        BUILD_NO_CACHE: "{{ build_no_cache | default('1') }}"
+      register: build_out
+      changed_when: "'build done' in build_out.stdout"
+
+    - name: 确认 monad-node 已生成
+      stat:
+        path: "{{ monad_repo }}/target/release/monad-node"
+      register: monad_bin_stat
+      failed_when: not monad_bin_stat.stat.exists
+
+    - name: 确认 cosmos-txpool-feed 已生成
+      stat:
+        path: "{{ monad_repo }}/target/release/cosmos-txpool-feed"
+      register: feed_bin_stat
+      failed_when: not feed_bin_stat.stat.exists
+
+    - name: 确认 biyachaind 已生成
+      stat:
+        path: "{{ biyachaind_bin }}"
+      register: by_bin_stat
+      failed_when: not by_bin_stat.stat.exists
+
+    - name: "[2/2] 本地 genesis 初始化（无 Docker，remote P2P）"
+      shell: "{{ bench_script }} setup"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment: "{{ setup_env }}"
+      vars:
+        setup_env: "{{ {
+          'MONAD_WORK': monad_work_coordinator,
+          'BENCH_P2P_MODE': bench_p2p_mode,
+          'MULT_RUN_NO_DOCKER': '1',
+          'MONAD_NODES_LIST': monad_nodes | join(' '),
+          'STRESS_ACCOUNTS_NUM': stress_accounts_num | string,
+          'CHAIN_ID': chain_id
+        } | combine(p2p_host_map) }}"
+      register: setup_out
+      changed_when: "'setup 完成' in setup_out.stdout"
+
+    - name: 检查 biyachain-lib
+      stat:
+        path: "{{ monad_work_coordinator }}/biyachain-lib"
+      register: lib_stat
+
+    - name: 准备二进制打包目录
+      file:
+        path: "{{ node_pack_dir }}/bin-staging"
+        state: directory
+        mode: "0755"
+
+    - name: 复制二进制到 staging
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ node_pack_dir }}/bin-staging/{{ item.dest }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - { src: "{{ monad_repo }}/target/release/monad-node", dest: monad-node }
+        - { src: "{{ monad_repo }}/target/release/cosmos-txpool-feed", dest: cosmos-txpool-feed }
+        - { src: "{{ biyachaind_bin }}", dest: biyachaind }
+        - { src: "{{ bench_script }}", dest: monad-stress-bench.sh }
+
+    - name: 打包二进制 → artifacts/binaries.tar.gz
+      archive:
+        path: "{{ node_pack_dir }}/bin-staging"
+        dest: "{{ node_pack_dir }}/binaries.tar.gz"
+        format: gz
+        remove: false
+
+    - name: 打包各节点链数据
+      archive:
+        path:
+          - "{{ monad_work_coordinator }}/biyachain-home-{{ item }}"
+          - "{{ monad_work_coordinator }}/monad-{{ item }}"
+          - "{{ monad_work_coordinator }}/genesis.json.reference"
+        dest: "{{ node_pack_dir }}/node-{{ item }}.tar.gz"
+        format: gz
+      loop: "{{ monad_nodes }}"
+
+    - name: 打包 biyachain-lib
+      archive:
+        path: "{{ monad_work_coordinator }}/biyachain-lib"
+        dest: "{{ node_pack_dir }}/biyachain-lib.tar.gz"
+        format: gz
+      when: lib_stat.stat.exists
+
+    - name: 本地初始化完成
+      debug:
+        msg:
+          - "无 Docker 模式：本地编译 + genesis 完成"
+          - "artifacts: {{ node_pack_dir }}"
+          - "  binaries.tar.gz       — monad-node / biyachaind / cosmos-txpool-feed"
+          - "  node-{{ monad_nodes | join('|') }}.tar.gz — 各 validator 链目录"
+          - "下一步: make deploy && make start"

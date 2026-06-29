@@ -1,0 +1,9 @@
+---
+# 密码 sudo 场景：ansible become 常 TTY 超时，改用 sudo -S
+- name: 配置 monad-node sysctl（UDP buffer / 大页）
+  shell: 'echo "{{ ansible_become_password }}" | sudo -S sysctl -w {{ item.name }}={{ item.value }}'
+  loop: "{{ monad_sysctl }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: start_configure_sysctl | default(true) | bool

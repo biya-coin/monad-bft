@@ -1,0 +1,28 @@
+---
+- name: 集群状态
+  hosts: validators
+  become: "{{ monad_deploy_become | bool }}"
+  roles:
+    - monad-health
+
+- name: 本地压测连通性（coordinator → 远程 RPC）
+  hosts: coordinator
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/build-p2p-map.yml
+
+    - name: 探测远程 Comet RPC
+      uri:
+        url: "http://{{ hostvars['monad-' + item].ansible_host }}:{{ monad_port.comet }}/"
+        method: GET
+        status_code: [200, 400, 404, 405, 500]
+      loop: "{{ monad_nodes }}"
+      register: rpc_probe
+      failed_when: false
+
+    - name: RPC 状态
+      debug:
+        msg: "node {{ item.item }} http://{{ hostvars['monad-' + item.item].ansible_host }}:{{ monad_port.comet }} → {{ 'UP' if item.status is defined else 'DOWN' }}"
+      loop: "{{ rpc_probe.results }}"
+      loop_control:
+        label: "{{ item.item }}"

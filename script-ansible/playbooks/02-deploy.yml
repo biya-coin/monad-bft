@@ -1,0 +1,37 @@
+---
+# Step 2：复制二进制 + 节点数据到各 validator
+- name: Validator 前置（创建目录，可选 sysctl）
+  hosts: validators
+  gather_facts: false
+  become: "{{ monad_deploy_become | bool }}"
+  roles:
+    - common
+
+- name: 分发二进制与节点数据
+  hosts: validators
+  gather_facts: false
+  become: "{{ monad_deploy_become | bool }}"
+  roles:
+    - monad-bin
+    - monad-node-data
+
+- name: 部署摘要
+  hosts: validators
+  gather_facts: false
+  become: false
+  tasks:
+    - name: 已安装二进制
+      command: ls -la {{ monad_bin_dir }}/monad-node {{ monad_bin_dir }}/biyachaind {{ monad_bin_dir }}/cosmos-txpool-feed
+      changed_when: false
+      register: bin_ls
+
+    - name: 链数据目录
+      stat:
+        path: "{{ monad_work }}/biyachain-home-{{ monad_node_role }}"
+      register: chain_home
+
+    - debug:
+        msg:
+          - "binaries: {{ bin_ls.stdout_lines }}"
+          - "biyachaind home: {{ monad_work }}/biyachain-home-{{ monad_node_role }} exists={{ chain_home.stat.exists }}"
+          - "env: {{ monad_env_file }}"

@@ -1,0 +1,40 @@
+---
+# Step 3：各 validator 后台启动三服务 biyachaind + monad-node + cosmos-txpool-feed
+- name: 配置 monad-node sysctl（须先于 monad-node 启动）
+  hosts: validators
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/apply-sysctl.yml
+
+- name: 启动节点 a（共识 leader，须最先）
+  hosts: monad-a
+  become: "{{ monad_deploy_become | bool }}"
+  roles:
+    - role: monad-process
+      vars:
+        start_node: a
+
+- name: 等待 monad-a P2P / gRPC / RPC 就绪
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: 等待 monad-a P2P
+      wait_for:
+        host: "{{ hostvars['monad-a'].ansible_host }}"
+        port: 8000
+        timeout: 180
+
+- name: 启动除 a 外的 validator 节点
+  hosts: validators:!monad-a
+  become: "{{ monad_deploy_become | bool }}"
+  serial: 1
+  roles:
+    - role: monad-process
+      vars:
+        start_node: "{{ monad_node_role }}"
+
+- name: 校验三服务进程
+  hosts: validators
+  become: "{{ monad_deploy_become | bool }}"
+  roles:
+    - monad-health

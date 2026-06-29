@@ -1,0 +1,20 @@
+---
+# validator 主机：默认无 sudo 部署到 ~/monad/（密码登录时 ansible become 常超时）
+monad_deploy_become: false
+
+monad_work: "/home/{{ ansible_user }}/monad/.monad"
+monad_bin_dir: "/home/{{ ansible_user }}/monad/bin"
+monad_config_dir: "/home/{{ ansible_user }}/monad/config"
+monad_log_dir: "/home/{{ ansible_user }}/monad/log"
+monad_env_file: "/home/{{ ansible_user }}/monad/monad-bench.env"
+
+deploy_configure_sysctl: false
+
+MONAD_WORK: "{{ monad_work }}"
+BENCH_P2P_MODE: "{{ bench_p2p_mode }}"
+BENCH_RPC_BIND: "{{ bench_rpc_bind }}"
+BENCH_KEEP_DATA: "{{ bench_keep_data }}"
+BENCH_NO_RPC: "{{ bench_no_rpc }}"
+NODE_LOG_DIR: "{{ monad_log_dir }}"
+
+ansible_pipelining: false

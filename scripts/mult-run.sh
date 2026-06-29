@@ -21,7 +21,46 @@ export MAX_BLOCK_TXS="${MAX_BLOCK_TXS:-500}"
 export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-1000000000000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
 
 # 压测集群：四验证者 a/b/c/d（与 scripts/0_monad-stress-bench.sh 一致）
+# Ansible 等多主机场景可 MONAD_NODES_LIST="a b c" 覆盖
 MONAD_NODES=(a b c d)
+if [[ -n "${MONAD_NODES_LIST:-}" ]]; then
+    read -r -a MONAD_NODES <<< "${MONAD_NODES_LIST}"
+fi
+
+work_rm_rf() {
+    local p="$1"
+    [[ -e "$p" || -d "$p" ]] || return 0
+    rm -rf "$p" 2>/dev/null && return 0
+    if command -v sudo >/dev/null 2>&1; then
+        sudo rm -rf "$p"
+    else
+        echo "错误: 无法删除 $p（权限不足；可 sudo 或安装 docker）" >&2
+        return 1
+    fi
+}
+
+work_clean_biyachain_homes() {
+    local n
+    work_rm_rf "$WORK/genesis.json.reference"
+    for n in "${MONAD_NODES[@]}"; do
+        work_rm_rf "$WORK/biyachain-home-$n"
+        mkdir -p "$WORK/biyachain-home-$n"
+    done
+}
+
+work_clean_monad_genesis_json_dirs() {
+    local n p
+    for n in "${MONAD_NODES[@]}"; do
+        p="$WORK/monad-$n/genesis.json"
+        if [[ -d "$p" ]]; then
+            work_rm_rf "$p"
+        fi
+    done
+}
+
+work_use_docker_clean() {
+    [[ "${MULT_RUN_NO_DOCKER:-0}" != "1" ]] && command -v docker >/dev/null 2>&1
+}
 
 # 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 .monad 内维护）
 init_workspace_templates() {
@@ -221,10 +260,8 @@ init_biyachaind() {
     # 支持单独执行 ./scripts/mult-run.sh init-biyachain：缺失时自动生成压测账户 json
     ensure_stress_accounts_generated
 
-    # 若以 root 在容器内写过 $WORK，宿主机上 rm -rf .../* 往往删不干净，biyachaind init 也写不进 genesis.json。
-    # 同时 Docker 在缺少源文件时会把 ./genesis.json.reference 建成目录，需删掉再生成文件。
-    if command -v docker >/dev/null 2>&1; then
-        # 先以 root 删净（含 root 属主残留），再 chown 给宿主机用户以便本机 biyachaind 写入
+    # 清理旧链目录；MULT_RUN_NO_DOCKER=1 时用本机 rm/sudo（Ansible 无 docker 部署）
+    if work_use_docker_clean; then
         local home_paths=()
         for n in "${MONAD_NODES[@]}"; do
             home_paths+=("/work/biyachain-home-$n")
@@ -236,8 +273,7 @@ init_biyachaind() {
              mkdir -p ${home_paths[*]} && \
              chown -R \"\$HOST_UID:\$HOST_GID\" ${home_paths[*]}"
     else
-        echo "错误: 需要 docker 以清空可能为 root 属主的 biyachain-home-*（见 init_biyachaind 注释）。" >&2
-        exit 1
+        work_clean_biyachain_homes
     fi
 
     for node in "${MONAD_NODES[@]}"; do
@@ -381,14 +417,18 @@ PY
     done
 
     if [[ -d "$WORK/genesis.json.reference" ]]; then
-        docker run --rm -v "$WORK:/work:rw" alpine:3.19 rm -rf /work/genesis.json.reference
+        if work_use_docker_clean; then
+            docker run --rm -v "$WORK:/work:rw" alpine:3.19 rm -rf /work/genesis.json.reference
+        else
+            work_rm_rf "$WORK/genesis.json.reference"
+        fi
     fi
     cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/genesis.json.reference"
-    # Compose 会把「文件」./genesis.json.reference 挂到 /monad/genesis.json；若宿主机 monad-* 里误存在
-    # 同名目录（Docker 曾对不存在的源路径建过目录），会与文件挂载冲突并报 OCI mount 错。
-    if command -v docker >/dev/null 2>&1; then
+    if work_use_docker_clean; then
         docker run --rm -v "$WORK:/work:rw" alpine:3.19 sh -c \
             "for n in ${MONAD_NODES[*]}; do p=\"/work/monad-\$n/genesis.json\"; if [ -d \"\$p\" ]; then rm -rf \"\$p\"; fi; done"
+    else
+        work_clean_monad_genesis_json_dirs
     fi
     echo "--------------------------------"
     echo "step 2: init biyachaind done."
@@ -399,9 +439,11 @@ init_monad_node() {
     echo "--------------------------------"
     echo "step 3: init monad-node"
     echo "--------------------------------"
-    if command -v docker >/dev/null 2>&1; then
+    if work_use_docker_clean; then
         docker run --rm -v "$WORK:/work:rw" alpine:3.19 sh -c \
             "for n in ${MONAD_NODES[*]}; do p=\"/work/monad-\$n/genesis.json\"; if [ -d \"\$p\" ]; then rm -rf \"\$p\"; fi; done"
+    else
+        work_clean_monad_genesis_json_dirs
     fi
     NODE_TOML_SRC="$WORK/node.toml"
     if [[ ! -f "$NODE_TOML_SRC" ]]; then
@@ -461,12 +503,23 @@ init_monad_node() {
         printf '0x%s' "$(printf '%s' "$raw" | tr 'A-F' 'a-f')"
     }
 
-    # 与 compose 中 monad_net 固定 IP 对齐；勿用 echo|od 取字母 ASCII（echo 带换行会把 od 多字节拼成 9710 之类脏数）
-    declare -A P2P_ADDR P2P_SIG P2P_PUB
-    for n in "${MONAD_NODES[@]}"; do
+    monad_p2p_host_for_node() {
+        local n="$1" var="MONAD_P2P_HOST_${n}"
+        if [[ -n "${!var:-}" ]]; then
+            echo "${!var}"
+            return 0
+        fi
+        local ascii octet
         ascii=$(LC_ALL=C printf '%d' "'$n")
         octet=$((10 + (ascii - 97) * 10))
-        addr="172.28.0.${octet}:8000"
+        echo "172.28.0.${octet}"
+    }
+
+    # 与 compose 中 monad_net 固定 IP 对齐；多主机时由 MONAD_P2P_HOST_<n> 覆盖
+    declare -A P2P_ADDR P2P_SIG P2P_PUB
+    for n in "${MONAD_NODES[@]}"; do
+        host="$(monad_p2p_host_for_node "$n")"
+        addr="${host}:8000"
         MONAD_DIR="$WORK/monad-$n"
         ensure_sign_name_record_bin
         out="$(
@@ -497,7 +550,7 @@ host = addr.rsplit(':', 1)[0]
 t = path.read_text()
 t, n1 = re.subn(r'^self_address = .*$', 'self_address = \"' + addr + '\"', t, count=1, flags=re.M)
 t, n2 = re.subn(r'^self_name_record_sig = .*$', 'self_name_record_sig = \"' + sig + '\"', t, count=1, flags=re.M)
-# 本机多节点时 bind 0.0.0.0:8000 会 AddrInUse；每节点须绑各自 loopback IP（须 setup-ips）。
+# 本机多节点绑 loopback IP；多主机绑各机真实 NIC IP
 t, n3 = re.subn(r'^bind_address_host = .*$', 'bind_address_host = \"' + host + '\"', t, count=1, flags=re.M)
 assert n1 == 1 and n2 == 1 and n3 == 1, (n1, n2, n3)
 path.write_text(t)

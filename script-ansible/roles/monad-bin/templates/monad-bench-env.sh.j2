@@ -1,0 +1,28 @@
+# Monad 压测集群 — validator 运行时环境
+# 多主机模式：各机端口统一，由下方 BENCH_*_PORT 注入 bench 脚本
+
+export MONAD_WORK="{{ monad_work }}"
+export BENCH_NODE_ROLE="{{ monad_node_role }}"
+export BENCH_P2P_MODE="{{ bench_p2p_mode }}"
+export BENCH_RPC_BIND="{{ bench_rpc_bind }}"
+export BENCH_KEEP_DATA="{{ bench_keep_data }}"
+export BENCH_NO_RPC="{{ bench_no_rpc }}"
+export NODE_LOG_DIR="{{ monad_log_dir }}"
+export BIYACHAIND_BIN="{{ monad_bin_dir }}/biyachaind"
+export MONAD_NODE_BIN="{{ monad_bin_dir }}/monad-node"
+export COSMOS_TXPOOL_FEED_BIN="{{ monad_bin_dir }}/cosmos-txpool-feed"
+export FORKPOINT_GENESIS="{{ monad_config_dir }}/forkpoint.genesis.toml"
+
+# 多主机统一端口（每机一节点，无端口冲突）
+export BENCH_GRPC_PORT="{{ monad_port.grpc }}"
+export BENCH_COMET_PORT="{{ monad_port.comet }}"
+export BENCH_METRICS_PORT="{{ monad_port.metrics }}"
+
+{% for n in monad_nodes %}
+export MONAD_P2P_HOST_{{ n }}="{{ hostvars['monad-' + n].ansible_host }}"
+{% endfor %}
+
+{% for n in monad_nodes %}
+export STRESS_NODE_ADDR_{{ n }}="{{ hostvars['monad-' + n].ansible_host }}:{{ monad_port.comet }}"
+export STRESS_GRPC_ADDR_{{ n }}="{{ hostvars['monad-' + n].ansible_host }}:{{ monad_port.grpc }}"
+{% endfor %}

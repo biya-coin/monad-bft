@@ -1,0 +1,42 @@
+---
+- name: "检查三服务进程 (节点 {{ monad_node_role }})"
+  shell: |
+    set -a
+    source {{ monad_env_file }}
+    set +a
+    echo "=== biyachaind ==="
+    pgrep -af "biyachaind start --home ${MONAD_WORK}/biyachain-home-{{ monad_node_role }}" || echo MISSING
+    echo "=== monad-node ==="
+    pgrep -af "${MONAD_WORK}/monad-{{ monad_node_role }}/id-secp" || echo MISSING
+    echo "=== cosmos-txpool-feed ==="
+    pgrep -af "cosmos-txpool-feed serve" || echo MISSING
+    echo "=== bench nodes ==="
+    {{ monad_bin_dir }}/monad-stress-bench.sh nodes 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: health_out
+  changed_when: false
+  failed_when: false
+
+- name: 进程状态
+  debug:
+    msg: "{{ health_out.stdout_lines }}"
+
+- name: 校验 biyachaind 运行中
+  shell: pgrep -cf "biyachaind start --home {{ monad_work }}/biyachain-home-{{ monad_node_role }}"
+  register: by_cnt
+  changed_when: false
+  failed_when: by_cnt.stdout | int < 1
+
+- name: 校验 monad-node 运行中
+  shell: pgrep -cf "{{ monad_work }}/monad-{{ monad_node_role }}/id-secp"
+  register: monad_cnt
+  changed_when: false
+  failed_when: monad_cnt.stdout | int < 1
+
+- name: 校验 cosmos-txpool-feed 运行中
+  shell: pgrep -cf "cosmos-txpool-feed serve"
+  register: feed_cnt
+  changed_when: false
+  failed_when: feed_cnt.stdout | int < 1
+  when: bench_no_rpc | string != '1'

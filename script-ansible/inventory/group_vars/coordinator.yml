@@ -1,0 +1,6 @@
+---
+# coordinator 初始化 genesis 时使用
+MONAD_WORK: "{{ monad_work_coordinator }}"
+BENCH_P2P_MODE: "{{ bench_p2p_mode }}"
+STRESS_ACCOUNTS_NUM: "{{ stress_accounts_num }}"
+CHAIN_ID: "{{ chain_id }}"

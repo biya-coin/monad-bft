@@ -1,0 +1,33 @@
+---
+- name: 复制节点 tar 包到 validator
+  copy:
+    src: "{{ node_pack_dir }}/node-{{ monad_node_role }}.tar.gz"
+    dest: /tmp/node-{{ monad_node_role }}.tar.gz
+    mode: "0644"
+
+- name: 解压节点数据到 {{ monad_work }}
+  unarchive:
+    src: /tmp/node-{{ monad_node_role }}.tar.gz
+    dest: "{{ monad_work }}"
+    remote_src: true
+    creates: "{{ monad_work }}/monad-{{ monad_node_role }}/node.toml"
+
+- name: 复制 biyachain-lib（若已打包）
+  copy:
+    src: "{{ node_pack_dir }}/biyachain-lib.tar.gz"
+    dest: /tmp/biyachain-lib.tar.gz
+    mode: "0644"
+  ignore_errors: true
+  register: lib_copy
+
+- name: 解压 biyachain-lib
+  unarchive:
+    src: /tmp/biyachain-lib.tar.gz
+    dest: "{{ monad_work }}"
+    remote_src: true
+  when: lib_copy is succeeded
+
+- name: 清理临时 tar
+  file:
+    path: "/tmp/node-{{ monad_node_role }}.tar.gz"
+    state: absent

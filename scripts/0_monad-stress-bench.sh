@@ -42,8 +42,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO="${MONAD_BFT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 WORK="${MONAD_WORK:-$REPO/.monad}"
+MONAD_NODE_BIN="${MONAD_NODE_BIN:-$REPO/target/release/monad-node}"
+COSMOS_TXPOOL_FEED_BIN="${COSMOS_TXPOOL_FEED_BIN:-$REPO/target/release/cosmos-txpool-feed}"
 
 # 压测集群：四验证者 a/b/c/d
 MONAD_BENCH_NODES=(a b c d)
@@ -57,13 +59,13 @@ STRESS_CMD="${STRESS_CMD:-spot-limit}"
 # 可以根据区块时间（通常是2s）这样估算：STRESS_RATE_TPS * 块时间 = 每块交易数
 # 例如 TPS=5000，每2s出块 ~= 10000 txs/块
 STRESS_ACCOUNTS_NUM_RUN="${STRESS_ACCOUNTS_NUM_RUN:-1000}"      # 更多账号可减少 nonce 瓶颈
-STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-600}"               # 每账号交易数，可选更大
-STRESS_RATE_TPS="${STRESS_RATE_TPS:-1000}"                      # 每秒交易数，根据目标动态调整
+STRESS_TRANSACTIONS="${STRESS_TRANSACTIONS:-1000}"               # 每账号交易数，可选更大
+STRESS_RATE_TPS="${STRESS_RATE_TPS:-1200}"                      # 每秒交易数，根据目标动态调整
 STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
 STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
 MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"
 # build 默认清 release 产物再编译，避免 monad-node 仍链接旧的 monad-chain-config 等 crate
-BUILD_NO_CACHE="${BUILD_NO_CACHE:-1}"
+BUILD_NO_CACHE="${BUILD_NO_CACHE:-0}"
 
 # SeiDB SS（state store）/ SC（state commitment）启动参数
 # 默认启用 SeiDB（SC=memiavl committer.db / SS=pebbledb）。monad standalone bootstrap 兼容性
@@ -82,6 +84,14 @@ SEIDB_MEMIAVL_ASYNC="${SEIDB_MEMIAVL_ASYNC:-0}"
 SPOT_MARKET_ID="${SPOT_MARKET_ID:-0xb322bce686ec25364be50728812e33741da1d82e9c91c2c89b91b91d26b0e9c5}"
 # start/stop 日志与 pid 文件目录（相对当前工作目录）
 NODE_LOG_DIR="${NODE_LOG_DIR:-./node-log}"
+# 多主机：remote 跳过 setup-ips；BENCH_NODE_ROLE=a|b|c|d 时只操作单节点
+BENCH_P2P_MODE="${BENCH_P2P_MODE:-local}"
+BENCH_NODE_ROLE="${BENCH_NODE_ROLE:-}"
+BENCH_RPC_BIND="${BENCH_RPC_BIND:-127.0.0.1}"
+# 多主机每机一节点时各机端口相同，由 Ansible 注入（见 /etc/monad-bench/env）
+BENCH_GRPC_PORT="${BENCH_GRPC_PORT:-}"
+BENCH_COMET_PORT="${BENCH_COMET_PORT:-}"
+BENCH_METRICS_PORT="${BENCH_METRICS_PORT:-}"
 
 usage() {
   cat <<EOF
@@ -92,6 +102,7 @@ usage() {
   build-full  可选：含 monad-rpc（26657 已由 build 的 cosmos-txpool-feed serve 提供）
   run         打印本机原生启动步骤（推荐，无需 monad-node Docker 镜像）
   start       一键启动四节点 + RPC feed（清数据/genesis 初始化，日志 ./node-log/）
+  start-node  启动单节点（BENCH_NODE_ROLE=a|b|c|d，多主机/Ansible 用）
   restart     同 start
   stop        停止四节点进程并清理 socket/pid 残留
   setup-ips   配置四节点 P2P loopback IP（sudo，一次性；start 会自动调用）
@@ -412,7 +423,6 @@ need_setup_build() {
 }
 
 cmd_setup() {
-  need_cmd docker
   need_cmd jq
   if need_setup_build; then
     cmd_build
@@ -430,6 +440,10 @@ cmd_setup() {
 }
 
 node_grpc_port() {
+  if [[ -n "$BENCH_GRPC_PORT" ]]; then
+    echo "$BENCH_GRPC_PORT"
+    return
+  fi
   case "$1" in
     a) echo 19900 ;;
     b) echo 29900 ;;
@@ -440,6 +454,10 @@ node_grpc_port() {
 }
 
 node_metrics_port() {
+  if [[ -n "$BENCH_METRICS_PORT" ]]; then
+    echo "$BENCH_METRICS_PORT"
+    return
+  fi
   # 与 biyachain-core/monitor/prometheus/prometheus.yml 的 target 端口一致
   case "$1" in
     a) echo 26660 ;;
@@ -451,7 +469,10 @@ node_metrics_port() {
 }
 
 node_comet_port() {
-  # cosmos-txpool-feed serve 监听端口（多节点压测时每节点一个，相差 10，避开 metrics 26x60）
+  if [[ -n "$BENCH_COMET_PORT" ]]; then
+    echo "$BENCH_COMET_PORT"
+    return
+  fi
   case "$1" in
     a) echo 26657 ;;
     b) echo 26667 ;;
@@ -461,7 +482,14 @@ node_comet_port() {
   esac
 }
 
-node_monad_ip() {
+bench_p2p_remote_enabled() {
+  case "${BENCH_P2P_MODE:-local}" in
+    remote|Remote|REMOTE) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+node_monad_ip_local() {
   case "$1" in
     a) echo 172.28.0.10 ;;
     b) echo 172.28.0.20 ;;
@@ -469,6 +497,53 @@ node_monad_ip() {
     d) echo 172.28.0.40 ;;
     *) die "未知节点: $1（a|b|c|d）" ;;
   esac
+}
+
+# 多主机：读 MONAD_P2P_HOST_<n>；本机：172.28.0.x
+node_monad_ip() {
+  local n="$1" var="MONAD_P2P_HOST_${n}"
+  if [[ -n "${!var:-}" ]]; then
+    echo "${!var}"
+    return
+  fi
+  if bench_p2p_remote_enabled; then
+    die "remote 模式需设置 MONAD_P2P_HOST_$n（Ansible inventory 或 export）"
+  fi
+  node_monad_ip_local "$n"
+}
+
+bench_target_nodes() {
+  local n
+  if [[ -n "$BENCH_NODE_ROLE" ]]; then
+    case "$BENCH_NODE_ROLE" in
+      a|b|c|d) echo "$BENCH_NODE_ROLE" ;;
+      *) die "无效 BENCH_NODE_ROLE=$BENCH_NODE_ROLE（a|b|c|d）" ;;
+    esac
+    return
+  fi
+  for n in "${MONAD_BENCH_NODES[@]}"; do
+    echo "$n"
+  done
+}
+
+node_stress_rpc_addr() {
+  local n="$1" var="STRESS_NODE_ADDR_${n}"
+  if [[ -n "${!var:-}" ]]; then
+    echo "${!var}"
+    return
+  fi
+  echo "${BENCH_RPC_BIND:-127.0.0.1}:$(node_comet_port "$n")"
+}
+
+node_stress_grpc_addr() {
+  local n="$1" var="STRESS_GRPC_ADDR_${n}"
+  if [[ -n "${!var:-}" ]]; then
+    echo "${!var}"
+    return
+  fi
+  local host
+  host="$(node_monad_ip "$n")"
+  echo "${host}:$(node_grpc_port "$n")"
 }
 
 ensure_stress_workdir() {
@@ -511,17 +586,22 @@ biyachain_lib_path() {
 }
 
 apply_monad_sysctl() {
+  if bench_skip_sysctl_enabled; then
+    echo "note: BENCH_SKIP_SYSCTL=1，跳过 monad-node sysctl（大页/UDP buffer）"
+    return 0
+  fi
   if ! command -v sudo >/dev/null 2>&1; then
     echo "note: 无 sudo，跳过 monad-node sysctl（大页/UDP buffer）"
     return 0
   fi
-  sudo sysctl -w vm.nr_hugepages=2048 >/dev/null 2>&1 || true
-  sudo sysctl -w net.core.rmem_max=62500000 >/dev/null 2>&1 || true
-  sudo sysctl -w net.core.rmem_default=62500000 >/dev/null 2>&1 || true
-  sudo sysctl -w net.core.wmem_max=62500000 >/dev/null 2>&1 || true
-  sudo sysctl -w net.core.wmem_default=62500000 >/dev/null 2>&1 || true
-  sudo sysctl -w net.ipv4.tcp_rmem='4096 12582912 12582912' >/dev/null 2>&1 || true
-  sudo sysctl -w net.ipv4.tcp_wmem='4096 12582912 12582912' >/dev/null 2>&1 || true
+  # 非交互 sudo，避免 Ansible/CI 在密码提示处永久阻塞
+  sudo -n sysctl -w vm.nr_hugepages=2048 >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.core.rmem_max=62500000 >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.core.rmem_default=62500000 >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.core.wmem_max=62500000 >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.core.wmem_default=62500000 >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.ipv4.tcp_rmem='4096 12582912 12582912' >/dev/null 2>&1 || true
+  sudo -n sysctl -w net.ipv4.tcp_wmem='4096 12582912 12582912' >/dev/null 2>&1 || true
 }
 
 node_log_dir_abs() {
@@ -567,8 +647,12 @@ bench_all_nodes_running() {
 stop_bench_node_processes() {
   local n logdir pf svc pid
   logdir="$(node_log_dir_abs)"
-  echo "==> 停止四节点进程"
-  for n in "${MONAD_BENCH_NODES[@]}"; do
+  if [[ -n "$BENCH_NODE_ROLE" ]]; then
+    echo "==> 停止节点 $BENCH_NODE_ROLE"
+  else
+    echo "==> 停止四节点进程"
+  fi
+  while IFS= read -r n; do
     for svc in biyachaind monad feed; do
       pf="$logdir/${svc}-${n}.pid"
       if [[ -f "$pf" ]]; then
@@ -579,26 +663,36 @@ stop_bench_node_processes() {
     done
     pkill -f "biyachaind start --home ${WORK}/biyachain-home-${n}" 2>/dev/null || true
     pkill -f "${WORK}/monad-${n}/id-secp" 2>/dev/null || true
-  done
-  pkill -f 'cosmos-txpool-feed serve' 2>/dev/null || true
+  done < <(bench_target_nodes)
+  if [[ -z "$BENCH_NODE_ROLE" ]]; then
+    pkill -f 'cosmos-txpool-feed serve' 2>/dev/null || true
+  fi
   sleep 1
-  for n in "${MONAD_BENCH_NODES[@]}"; do
+  while IFS= read -r n; do
     pkill -9 -f "biyachaind start --home ${WORK}/biyachain-home-${n}" 2>/dev/null || true
     pkill -9 -f "${WORK}/monad-${n}/id-secp" 2>/dev/null || true
-  done
-  pkill -9 -f 'cosmos-txpool-feed serve' 2>/dev/null || true
+  done < <(bench_target_nodes)
+  if [[ -z "$BENCH_NODE_ROLE" ]]; then
+    pkill -9 -f 'cosmos-txpool-feed serve' 2>/dev/null || true
+  fi
 }
 
 cleanup_bench_stale_files() {
   local n monad_dir logdir
   logdir="$(node_log_dir_abs)"
   echo "==> 清理 socket / pid 残留"
-  for n in "${MONAD_BENCH_NODES[@]}"; do
+  while IFS= read -r n; do
     monad_dir="$WORK/monad-$n"
     rm -f "$monad_dir/abci.sock" "$monad_dir/mempool.sock" \
       "$monad_dir/controlpanel.sock" "$monad_dir/statesync.sock"
-  done
-  rm -f "$logdir"/biyachaind-*.pid "$logdir"/monad-*.pid "$logdir"/feed-*.pid
+  done < <(bench_target_nodes)
+  if [[ -z "$BENCH_NODE_ROLE" ]]; then
+    rm -f "$logdir"/biyachaind-*.pid "$logdir"/monad-*.pid "$logdir"/feed-*.pid
+  else
+    rm -f "$logdir/biyachaind-${BENCH_NODE_ROLE}.pid" \
+      "$logdir/monad-${BENCH_NODE_ROLE}.pid" \
+      "$logdir/feed-${BENCH_NODE_ROLE}.pid"
+  fi
 }
 
 prepare_biyachaind_ld_path() {
@@ -634,6 +728,10 @@ wait_abci_socket() {
     i=$((i + 1))
   done
   die "超时: $label ABCI socket 未就绪: $sock"
+}
+
+wait_mempool_socket() {
+  wait_abci_socket "$1" "$2" "${3:-120}"
 }
 
 run_biyachaind_node() {
@@ -698,10 +796,10 @@ run_biyachaind_node() {
 run_monad_node() {
   local n="$1" mode="${2:-fg}"
   ensure_node_dirs "$n" genesis
-  [[ -x "$REPO/target/release/monad-node" ]] || die "未找到 monad-node，请先: $0 build"
+  [[ -x "$MONAD_NODE_BIN" ]] || die "未找到 monad-node（MONAD_NODE_BIN=$MONAD_NODE_BIN），请先: $0 build"
   local monad_dir="$WORK/monad-$n"
   local abci_sock="$monad_dir/abci.sock"
-  local monad_bin="$REPO/target/release/monad-node"
+  local monad_bin="$MONAD_NODE_BIN"
   local logdir logf pidf
   local -a monad_args=(
     --secp-identity "$monad_dir/id-secp"
@@ -768,7 +866,7 @@ cmd_start() {
   ensure_all_bench_nodes
   ensure_genesis_reference
   [[ -x "$BIYACHAIND_BIN" ]] || die "未找到 $BIYACHAIND_BIN，请先: $0 build"
-  [[ -x "$REPO/target/release/monad-node" ]] || die "未找到 monad-node，请先: $0 build"
+  [[ -x "$MONAD_NODE_BIN" ]] || die "未找到 monad-node（MONAD_NODE_BIN=$MONAD_NODE_BIN），请先: $0 build"
   if bench_start_rpc_enabled; then
     resolve_comet_rpc_bin >/dev/null || die "未找到 cosmos-txpool-feed，请先: $0 build"
   fi
@@ -793,7 +891,11 @@ cmd_start() {
 
   echo "==> 一键启动四节点（后台，日志 $logdir）"
   echo "    工作目录: $WORK"
-  cmd_setup_ips
+  if bench_p2p_remote_enabled; then
+    echo "    BENCH_P2P_MODE=remote，跳过 setup-ips"
+  else
+    cmd_setup_ips
+  fi
   apply_monad_sysctl
 
   echo "==> 启动 biyachaind x4"
@@ -830,6 +932,64 @@ cmd_start() {
 
 cmd_restart() {
   cmd_start
+}
+
+cmd_start_node() {
+  local n="${1:-${BENCH_NODE_ROLE:-}}"
+  [[ -n "$n" ]] || die "start-node 需要 BENCH_NODE_ROLE 或参数 a|b|c|d"
+  case "$n" in
+    a|b|c|d) ;;
+    *) die "未知节点: $n（a|b|c|d）" ;;
+  esac
+  export BENCH_NODE_ROLE="$n"
+  ensure_node_dirs "$n" genesis
+  [[ -x "$BIYACHAIND_BIN" ]] || die "未找到 $BIYACHAIND_BIN，请先: $0 build"
+  [[ -x "$MONAD_NODE_BIN" ]] || die "未找到 monad-node（MONAD_NODE_BIN=$MONAD_NODE_BIN），请先: $0 build"
+
+  local logdir
+  logdir="$(node_log_dir_abs)"
+  stop_bench_node_processes
+  cleanup_bench_stale_files
+
+  if ! bench_keep_data_enabled; then
+    local fp monad_dir
+    fp="$(forkpoint_genesis_template)"
+    [[ -f "$fp" ]] || die "未找到 genesis forkpoint: $fp"
+    monad_dir="$WORK/monad-$n"
+    rm -rf "$monad_dir/wal"
+    rm -rf "$monad_dir/ledger/headers" "$monad_dir/ledger/bodies" "$monad_dir/ledger/cosmos-commits"
+    mkdir -p "$monad_dir/ledger/headers" "$monad_dir/ledger/bodies" "$monad_dir/ledger/cosmos-commits"
+    rm -f "$monad_dir"/forkpoint.rlp "$monad_dir"/forkpoint.rlp.*
+    rm -f "$monad_dir"/forkpoint.toml.*
+    cp "$fp" "$monad_dir/forkpoint.toml"
+    rm -rf "$WORK/biyachain-home-$n/data"
+  fi
+
+  rm -f "$logdir/biyachaind-${n}.log" "$logdir/monad-${n}.log" \
+    "$logdir/feed-${n}.log" \
+    "$logdir/biyachaind-${n}.pid" "$logdir/monad-${n}.pid" "$logdir/feed-${n}.pid"
+
+  echo "==> 启动单节点 $n（后台，日志 $logdir）"
+  echo "    工作目录: $WORK  P2P=$(node_monad_ip "$n"):8000"
+  apply_monad_sysctl
+
+  echo "==> 启动 biyachaind-$n"
+  run_biyachaind_node "$n" bg
+  wait_abci_socket "$WORK/monad-$n/abci.sock" "biyachaind-$n"
+
+  echo "==> 启动 monad-$n"
+  run_monad_node "$n" bg
+  wait_mempool_socket "$WORK/monad-$n/mempool.sock" "monad-$n"
+
+  if bench_start_rpc_enabled; then
+    start_rpc_feed_bg "$n"
+  fi
+
+  echo ""
+  echo "节点 $n 已在后台运行。"
+  echo "  日志: tail -f $logdir/monad-${n}.log"
+  echo "  RPC:  ${BENCH_RPC_BIND}:$(node_comet_port "$n")"
+  echo "  停止: BENCH_NODE_ROLE=$n $0 stop"
 }
 
 cmd_setup_ips() {
@@ -983,25 +1143,38 @@ bench_start_rpc_enabled() {
   esac
 }
 
-start_rpc_feeds_bg() {
-  local rpc_bin logdir shards n sock port logf pidf
+bench_skip_sysctl_enabled() {
+  case "${BENCH_SKIP_SYSCTL:-0}" in
+    1|true|yes|TRUE|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+start_rpc_feed_bg() {
+  local n="$1" rpc_bin logdir sock port logf pidf bind
+  bind="${BENCH_RPC_BIND:-127.0.0.1}"
   rpc_bin="$(resolve_comet_rpc_bin)" || die "未找到 cosmos-txpool-feed / monad-rpc，请先: $0 build"
   if [[ "$(basename "$rpc_bin")" != "cosmos-txpool-feed" ]]; then
     die "start 默认仅支持 cosmos-txpool-feed，请: $0 build"
   fi
   logdir="$(node_log_dir_abs)"
+  sock="$WORK/monad-$n/mempool.sock"
+  port="$(node_comet_port "$n")"
+  [[ -S "$sock" ]] || die "mempool socket 不存在: $sock（请先启动 monad-node $n）"
+  logf="$logdir/feed-${n}.log"
+  pidf="$logdir/feed-${n}.pid"
+  : >"$logf"
+  nohup "$rpc_bin" serve --listen "${bind}:$port" --cosmos-ipc-path "$sock" >>"$logf" 2>&1 &
+  echo $! >"$pidf"
+  echo "    feed-$n: listen=${bind}:$port pid=$! log=$logf"
+}
+
+start_rpc_feeds_bg() {
+  local n shards
   shards="$(stress_shard_count)"
   echo "==> 后台启动 cosmos-txpool-feed x${shards}"
   for n in "${MONAD_BENCH_NODES[@]:0:$shards}"; do
-    sock="$WORK/monad-$n/mempool.sock"
-    port="$(node_comet_port "$n")"
-    [[ -S "$sock" ]] || die "mempool socket 不存在: $sock（请先启动 monad-node $n）"
-    logf="$logdir/feed-${n}.log"
-    pidf="$logdir/feed-${n}.pid"
-    : >"$logf"
-    nohup "$rpc_bin" serve --listen "127.0.0.1:$port" --cosmos-ipc-path "$sock" >>"$logf" 2>&1 &
-    echo $! >"$pidf"
-    echo "    feed-$n: listen=127.0.0.1:$port pid=$! log=$logf"
+    start_rpc_feed_bg "$n"
   done
 }
 
@@ -1281,6 +1454,10 @@ resolve_comet_rpc_bin() {
     echo "${MONAD_RPC_BIN}"
     return
   fi
+  if [[ -x "$COSMOS_TXPOOL_FEED_BIN" ]]; then
+    echo "$COSMOS_TXPOOL_FEED_BIN"
+    return
+  fi
   if [[ -x "$REPO/target/release/cosmos-txpool-feed" ]]; then
     echo "$REPO/target/release/cosmos-txpool-feed"
     return
@@ -1430,8 +1607,8 @@ cmd_stress_all() {
     port="$(node_comet_port "$n")"
     grpc="$(node_grpc_port "$n")"
     logf="$WORK/stress-$n.log"
-    echo "    shard-$n: node-addr=127.0.0.1:$port grpc=127.0.0.1:$grpc accounts=$acc log=$logf"
-    run_chain_stresser "$acc" "$num" "127.0.0.1:$port" "127.0.0.1:$grpc" >"$logf" 2>&1 &
+    echo "    shard-$n: node-addr=$(node_stress_rpc_addr "$n") grpc=$(node_stress_grpc_addr "$n") accounts=$acc log=$logf"
+    run_chain_stresser "$acc" "$num" "$(node_stress_rpc_addr "$n")" "$(node_stress_grpc_addr "$n")" >"$logf" 2>&1 &
     pids+=("$!")
   done
 
@@ -1464,6 +1641,7 @@ main() {
     build-rpc-docker) cmd_build_rpc_docker ;;
     run) cmd_run ;;
     start) cmd_start ;;
+    start-node) cmd_start_node "${2:-}" ;;
     restart) cmd_restart ;;
     stop) cmd_stop ;;
     setup-ips) cmd_setup_ips ;;

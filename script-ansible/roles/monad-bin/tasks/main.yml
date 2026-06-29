@@ -1,0 +1,50 @@
+---
+- name: 创建配置目录 {{ monad_config_dir }}
+  file:
+    path: "{{ monad_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: 创建运行时 env 父目录
+  file:
+    path: "{{ monad_env_file | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: 创建二进制目录 {{ monad_bin_dir }}
+  file:
+    path: "{{ monad_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: 复制二进制包到 validator
+  copy:
+    src: "{{ node_pack_dir }}/binaries.tar.gz"
+    dest: /tmp/binaries.tar.gz
+    mode: "0644"
+
+- name: 解压二进制到 {{ monad_bin_dir }}
+  unarchive:
+    src: /tmp/binaries.tar.gz
+    dest: "{{ monad_bin_dir }}"
+    remote_src: true
+    extra_opts:
+      - --strip-components=1
+    creates: "{{ monad_bin_dir }}/monad-node"
+
+- name: 同步 forkpoint genesis 模板
+  copy:
+    src: "{{ monad_repo }}/docker/devnet/monad/config/forkpoint.genesis.toml"
+    dest: "{{ monad_config_dir }}/forkpoint.genesis.toml"
+    mode: "0644"
+
+- name: 安装运行时环境 {{ monad_env_file }}
+  template:
+    src: monad-bench-env.sh.j2
+    dest: "{{ monad_env_file }}"
+    mode: "0644"
+
+- name: 清理临时包
+  file:
+    path: /tmp/binaries.tar.gz
+    state: absent

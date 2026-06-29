@@ -1,0 +1,87 @@
+---
+# monad-bft 仓库根（script-ansible/playbooks 的上两级）
+monad_repo: "{{ playbook_dir }}/../.."
+# 链数据根目录（= bench 脚本 MONAD_WORK / WORK）
+# biyachaind --home = {{ monad_work }}/biyachain-home-<节点字母>
+# monad 数据     = {{ monad_work }}/monad-<节点字母>
+# 共享 genesis   = {{ monad_work }}/genesis.json.reference
+# 动态库（可选） = {{ monad_work }}/biyachain-lib
+monad_work_coordinator: "{{ monad_repo }}/.monad"
+# 默认路径（validator 组会覆盖为 ~/monad/，见 group_vars/validators.yml）
+monad_work: /opt/monad/.monad
+monad_bin_dir: /usr/local/bin
+monad_config_dir: /opt/monad/config
+monad_log_dir: /var/log/monad-bench
+monad_env_file: /etc/monad-bench/env
+# validator 是否 sudo（密码登录建议 false，改用 ~/monad/）
+monad_deploy_become: true
+
+bench_script: "{{ monad_repo }}/scripts/0_monad-stress-bench.sh"
+biyachaind_bin: "{{ monad_repo }}/biyachain-core/bin/biyachaind"
+
+bench_p2p_mode: remote
+bench_rpc_bind: "0.0.0.0"
+bench_network_cidr: "10.0.0.0/24"
+bench_keep_data: "0"
+bench_no_rpc: "0"
+
+# 每台 validator 后台三服务（start-node 顺序启动）
+bench_services:
+  - biyachaind
+  - monad-node
+  - cosmos-txpool-feed
+
+chain_id: biyachain-1
+stress_accounts_num: 1000
+stress_rate_tps: 1200
+stress_cmd: spot-limit
+
+# 须与 inventory/hosts.ini 中 validators 数量一致
+monad_nodes:
+  - a
+  - b
+  - c
+
+stress_shards: "{{ monad_nodes | length }}"
+
+# 多主机（每机一节点）：各 validator 使用相同端口，仅 IP 不同
+# 单机四节点压测才需要 a=19900 / b=29900 / c=39900 等差异化端口（不设 BENCH_*_PORT 即可）
+monad_port:
+  grpc: 19900
+  comet: 26657
+  metrics: 26660
+  p2p: 8000
+  p2p_auth: 8001
+
+monad_sysctl:
+  - { name: vm.nr_hugepages, value: "2048" }
+  - { name: net.core.rmem_max, value: "62500000" }
+  - { name: net.core.rmem_default, value: "62500000" }
+  - { name: net.core.wmem_max, value: "62500000" }
+  - { name: net.core.wmem_default, value: "62500000" }
+  - { name: net.ipv4.tcp_rmem, value: "4096 12582912 12582912" }
+  - { name: net.ipv4.tcp_wmem, value: "4096 12582912 12582912" }
+
+monad_firewall_ports:
+  - { port: "{{ monad_port.p2p }}", proto: tcp }
+  - { port: "{{ monad_port.p2p_auth }}", proto: tcp }
+  - { port: "{{ monad_port.p2p }}", proto: udp }
+  - { port: "{{ monad_port.p2p_auth }}", proto: udp }
+
+# RPC / gRPC / metrics（各机相同）
+monad_service_firewall_ports:
+  - "{{ monad_port.comet }}"
+  - "{{ monad_port.grpc }}"
+  - "{{ monad_port.metrics }}"
+
+node_pack_dir: "{{ monad_repo }}/script-ansible/artifacts"
+
+# deploy 前置（playbooks/02-deploy → role common）
+deploy_install_packages: false   # true 时在远程 apt 装 jq/curl（可能因源 GPG 失败）
+deploy_apt_update_cache: false   # 不跑 apt update，避免 bazel 等坏源拖垮 deploy
+deploy_apt_ignore_errors: true
+deploy_configure_sysctl: true    # 大页 / UDP buffer（失败不阻断）
+deploy_configure_firewall: false  # ufw 需自行确认
+
+# 本地 init 是否全量重编（1=每次 cargo clean）
+build_no_cache: "1"

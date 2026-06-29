@@ -1,0 +1,5 @@
+---
+# 全流程（不含压测；压测单独 make stress）
+- import_playbook: 01-local-init.yml
+- import_playbook: 02-deploy.yml
+- import_playbook: 03-start.yml

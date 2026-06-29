@@ -1,0 +1,41 @@
+---
+- name: 构建 MONAD_P2P_HOST_* 映射
+  set_fact:
+    p2p_host_map: "{{ p2p_host_map | default({}) | combine({('MONAD_P2P_HOST_' + item): hostvars['monad-' + item].ansible_host}) }}"
+  loop: "{{ monad_nodes }}"
+
+- name: "后台启动三服务: biyachaind → monad-node → cosmos-txpool-feed (节点 {{ start_node }})"
+  shell: "{{ monad_bin_dir }}/monad-stress-bench.sh start-node {{ start_node }}"
+  args:
+    executable: /bin/bash
+  environment: "{{ validator_env }}"
+  vars:
+    validator_env: "{{ {
+      'MONAD_WORK': monad_work,
+      'BENCH_NODE_ROLE': start_node,
+      'BENCH_P2P_MODE': bench_p2p_mode,
+      'BENCH_RPC_BIND': bench_rpc_bind,
+      'BENCH_KEEP_DATA': bench_keep_data,
+      'BENCH_NO_RPC': bench_no_rpc,
+      'BENCH_SKIP_SYSCTL': (not deploy_configure_sysctl | bool) | ternary('1', '0'),
+      'NODE_LOG_DIR': monad_log_dir,
+      'BIYACHAIND_BIN': monad_bin_dir + '/biyachaind',
+      'MONAD_NODE_BIN': monad_bin_dir + '/monad-node',
+      'COSMOS_TXPOOL_FEED_BIN': monad_bin_dir + '/cosmos-txpool-feed',
+      'FORKPOINT_GENESIS': monad_config_dir + '/forkpoint.genesis.toml',
+      'BENCH_GRPC_PORT': monad_port.grpc | string,
+      'BENCH_COMET_PORT': monad_port.comet | string,
+      'BENCH_METRICS_PORT': monad_port.metrics | string
+    } | combine(p2p_host_map) }}"
+  register: start_out
+  changed_when: "'已在后台运行' in start_out.stdout"
+
+- name: 启动日志
+  debug:
+    msg: "{{ start_out.stdout_lines }}"
+
+- name: 等待 monad-node P2P 监听
+  wait_for:
+    host: "{{ ansible_host }}"
+    port: "{{ monad_port.p2p }}"
+    timeout: 120

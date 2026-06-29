@@ -1,0 +1,14 @@
+---
+# 从 inventory 构建 MONAD_P2P_HOST_* / 压测地址（多主机统一端口）
+- name: 构建 MONAD_P2P_HOST_* 映射
+  set_fact:
+    p2p_host_map: "{{ p2p_host_map | default({}) | combine({('MONAD_P2P_HOST_' + item): hostvars['monad-' + item].ansible_host}) }}"
+  loop: "{{ monad_nodes }}"
+
+- name: 构建远程压测地址映射（各机相同 comet/grpc 端口）
+  set_fact:
+    stress_remote_env: "{{ stress_remote_env | default({}) | combine({
+      ('STRESS_NODE_ADDR_' + item): hostvars['monad-' + item].ansible_host + ':' + (monad_port.comet | string),
+      ('STRESS_GRPC_ADDR_' + item): hostvars['monad-' + item].ansible_host + ':' + (monad_port.grpc | string)
+    }) }}"
+  loop: "{{ monad_nodes }}"

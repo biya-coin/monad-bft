@@ -1,0 +1,38 @@
+# 复制为 hosts.ini 并修改为实际 IP / SSH 用户
+#
+#   cp inventory/hosts.ini.example inventory/hosts.ini
+#
+# coordinator：跑 build / setup / 压测（可与 monad-a 同机，用 ansible_connection=local）
+# validators：每台跑一个节点 a|b|c|d
+#
+# ── SSH 认证方式 ──
+# 1) 密钥（推荐）：ansible_ssh_private_key_file=~/.ssh/id_rsa
+# 2) 密码：见下方 [validators:vars] 的 ansible_ssh_pass / ansible_become_pass
+#    需安装 sshpass，且 playbook 里 become: true 时要配 sudo 密码
+
+[coordinator]
+bench-coord ansible_host=127.0.0.1 ansible_connection=local
+
+[validators]
+monad-a ansible_host=10.0.0.1 monad_node_role=a
+monad-b ansible_host=10.0.0.2 monad_node_role=b
+monad-c ansible_host=10.0.0.3 monad_node_role=c
+monad-d ansible_host=10.0.0.4 monad_node_role=d
+
+[validators:vars]
+ansible_user=ubuntu
+ansible_port=22
+
+# ── 方式 A：密钥登录（推荐）──
+# ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+# ── 方式 B：密码登录（明文，仅内网测试）──
+# ansible_ssh_pass=your_ssh_password
+# ansible_become_pass=your_sudo_password
+# ansible_become_method=sudo
+
+# 若 sudo 免密，可只配 SSH 密码：
+# ansible_ssh_pass=your_ssh_password
+
+[coordinator:vars]
+ansible_user=ubuntu

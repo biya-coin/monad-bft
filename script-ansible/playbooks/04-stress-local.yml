@@ -1,0 +1,87 @@
+---
+# Step 4：本地（coordinator）发起压测，交易发往远程 validator RPC
+- name: 收集 validator 地址
+  hosts: validators
+  gather_facts: false
+  tasks:
+    - ansible.builtin.ping:
+
+- name: 本地压测 → 远程节点
+  hosts: coordinator
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/build-p2p-map.yml
+
+    - name: 检查 chain-stresser
+      command: which chain-stresser
+      changed_when: false
+      failed_when: false
+      register: stresser_bin
+
+    - name: 缺少 chain-stresser
+      fail:
+        msg: "coordinator 需安装 chain-stresser（go install 或 PATH 中可用）"
+      when: stresser_bin.rc != 0
+
+    - name: 等待远程 RPC 可达
+      wait_for:
+        host: "{{ hostvars['monad-' + item].ansible_host }}"
+        port: "{{ monad_port.comet }}"
+        timeout: 60
+      loop: "{{ monad_nodes[0:stress_shards | int] }}"
+
+    - name: 账户分片（本地 .monad/instances/0）
+      command: "{{ bench_script }} shard"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment:
+        MONAD_WORK: "{{ monad_work_coordinator }}"
+      changed_when: false
+
+    - name: 压测前 verify（节点 a gRPC）
+      shell: "{{ bench_script }} verify"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment: "{{ stress_run_env }}"
+      vars:
+        stress_run_env: "{{ {'MONAD_WORK': monad_work_coordinator, 'STRESS_GRPC_ADDR': hostvars['monad-a'].ansible_host + ':' + (monad_port.grpc | string)} | combine(stress_remote_env) }}"
+      register: verify_before
+      failed_when: false
+      changed_when: false
+
+    - name: verify 输出
+      debug:
+        msg: "{{ verify_before.stdout_lines }}"
+
+    - name: stress-all → 远程 {{ stress_shards }} 节点
+      shell: "{{ bench_script }} stress-all"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment: "{{ stress_run_env }}"
+      vars:
+        stress_run_env: "{{ {
+          'MONAD_WORK': monad_work_coordinator,
+          'STRESS_RATE_TPS': stress_rate_tps | string,
+          'STRESS_CMD': stress_cmd,
+          'STRESS_SHARDS': stress_shards | string,
+          'STRESS_GRPC_ADDR': hostvars['monad-a'].ansible_host + ':' + (monad_port.grpc | string)
+        } | combine(stress_remote_env) }}"
+      register: stress_out
+
+    - name: 压测结果
+      debug:
+        msg: "{{ stress_out.stdout_lines[-25:] }}"
+
+    - name: 压测后 verify
+      shell: "{{ bench_script }} verify"
+      args:
+        chdir: "{{ monad_repo }}"
+      environment: "{{ stress_run_env }}"
+      vars:
+        stress_run_env: "{{ {'MONAD_WORK': monad_work_coordinator, 'STRESS_GRPC_ADDR': hostvars['monad-a'].ansible_host + ':' + (monad_port.grpc | string)} | combine(stress_remote_env) }}"
+      register: verify_after
+      failed_when: false
+      changed_when: false
+
+    - debug:
+        msg: "{{ verify_after.stdout_lines }}"

@@ -1,0 +1,49 @@
+---
+# deploy 前置：默认只建目录；装包/sysctl/防火墙可选（见 group_vars deploy_*）
+
+- name: 创建日志目录
+  file:
+    path: "{{ monad_log_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: 创建链数据根目录 {{ monad_work }}
+  file:
+    path: "{{ monad_work }}"
+    state: directory
+    mode: "0755"
+
+- name: 安装基础依赖（可选，默认跳过）
+  apt:
+    name:
+      - jq
+      - curl
+      - tar
+    state: present
+    update_cache: "{{ deploy_apt_update_cache | bool }}"
+  when:
+    - deploy_install_packages | bool
+    - ansible_os_family is defined
+    - ansible_os_family == "Debian"
+  ignore_errors: "{{ deploy_apt_ignore_errors | bool }}"
+
+- name: monad-node sysctl（可选）
+  command: sysctl -w {{ item.name }}={{ item.value }}
+  loop: "{{ monad_sysctl }}"
+  changed_when: false
+  failed_when: false
+  when: deploy_configure_sysctl | bool
+
+- name: 开放 P2P 端口 ufw（可选）
+  command: ufw allow from {{ bench_network_cidr }} to any port {{ item.port }} proto {{ item.proto }}
+  loop: "{{ monad_firewall_ports }}"
+  changed_when: false
+  failed_when: false
+  when: deploy_configure_firewall | bool
+
+- name: 开放 RPC / gRPC / metrics ufw（可选）
+  command: ufw allow from {{ bench_network_cidr }} to any port {{ item }} proto tcp
+  loop: "{{ monad_service_firewall_ports }}"
+  changed_when: false
+  failed_when: false
+  when: deploy_configure_firewall | bool

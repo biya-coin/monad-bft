@@ -1,0 +1,17 @@
+---
+- name: 停止各 validator 三服务
+  hosts: validators
+  become: "{{ monad_deploy_become | bool }}"
+  tasks:
+    - name: stop biyachaind + monad + feed
+      shell: |
+        set -a
+        source {{ monad_env_file }}
+        set +a
+        {{ monad_bin_dir }}/monad-stress-bench.sh stop
+      args:
+        executable: /bin/bash
+      register: stop_out
+
+    - debug:
+        msg: "{{ stop_out.stdout_lines }}"
