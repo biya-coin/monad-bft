@@ -214,7 +214,18 @@ metrics!(
                 vote_send_wait_total_us,
                 "Total microseconds from vote ready until vote is sent (vote_pace wait)"
             ),
-            (vote_send_wait_count, "Votes sent after vote-ready scheduling"),
+            (
+                vote_send_wait_count,
+                "Votes sent after vote-ready scheduling"
+            ),
+            (
+                finalized_commit_interval_total_us,
+                "Total microseconds between finalized commit emissions"
+            ),
+            (
+                finalized_commit_interval_count,
+                "Intervals between finalized commit emissions"
+            ),
         ]
     ),
     (
