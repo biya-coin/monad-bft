@@ -111,6 +111,8 @@ where
     proposal_vote_start: Option<std::time::Instant>,
     /// Set when vote is scheduled (VoteReady); consumed when the vote is sent.
     vote_ready_at: Option<std::time::Instant>,
+    /// Set after emitting a finalized commit; used to measure finalized block intervals.
+    last_finalized_commit_at: Option<std::time::Instant>,
 }
 
 impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> PartialEq
@@ -306,6 +308,7 @@ where
             vote_delay_metrics: VoteDelayMetricsWindow::default(),
             proposal_vote_start: None,
             vote_ready_at: None,
+            last_finalized_commit_at: None,
         }
     }
 
@@ -1573,10 +1576,23 @@ where
             .prune(&committable_block_id);
 
         for block in blocks_to_commit.iter() {
+            let finalized_commit_at = std::time::Instant::now();
+            let finalized_commit_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default();
+            let finalized_commit_interval_us = self
+                .consensus
+                .last_finalized_commit_at
+                .map(|last_commit_at| {
+                    finalized_commit_at.duration_since(last_commit_at).as_micros() as u64
+                });
             info!(
                 seq_num = block.header().seq_num.0,
                 block_round = block.header().block_round.0,
                 block_id = ?block.get_id(),
+                finalized_commit_unix_ms,
+                finalized_commit_interval_us,
                 "MONAD_EXEC_DEBUG consensus_emit_finalized_commit"
             );
             debug!(
@@ -1586,7 +1602,16 @@ where
             );
             // when epoch boundary block is committed, this updates
             // epoch manager records
-            self.metrics.consensus_events.commit_block.inc();
+            self.metrics.consensus_events.commit_block += 1;
+            if let Some(interval_us) = finalized_commit_interval_us {
+                self.metrics
+                    .consensus_timing
+                    .finalized_commit_interval_total_us += interval_us;
+                self.metrics
+                    .consensus_timing
+                    .finalized_commit_interval_count += 1;
+            }
+            self.consensus.last_finalized_commit_at = Some(finalized_commit_at);
             self.block_policy.update_committed_block(block);
             self.epoch_manager
                 .schedule_epoch_start(block.header().seq_num, block.get_block_round());
