@@ -90,51 +90,51 @@ const STATESYNC_BLOCK_THRESHOLD: SeqNum = SeqNum(30_000);
 pub(crate) fn handle_validation_error(e: validation::Error, metrics: &mut Metrics) {
     match e {
         validation::Error::InvalidAuthor => {
-            metrics.validation_errors.invalid_author += 1;
+            metrics.validation_errors.invalid_author.inc();
         }
         validation::Error::NotWellFormed => {
-            metrics.validation_errors.not_well_formed_sig += 1;
+            metrics.validation_errors.not_well_formed_sig.inc();
         }
         validation::Error::InvalidSignature => {
-            metrics.validation_errors.invalid_signature += 1;
+            metrics.validation_errors.invalid_signature.inc();
         }
         validation::Error::InvalidTcRound => {
-            metrics.validation_errors.invalid_tc_round += 1;
+            metrics.validation_errors.invalid_tc_round.inc();
         }
         validation::Error::DuplicateTcTipRound => {
-            metrics.validation_errors.duplicate_tc_tip_round += 1;
+            metrics.validation_errors.duplicate_tc_tip_round.inc();
         }
         validation::Error::EmptySignersTcTipRound => {
-            metrics.validation_errors.empty_signers_tc_tip_round += 1;
+            metrics.validation_errors.empty_signers_tc_tip_round.inc();
         }
         validation::Error::TooManyTcTipRound => {
-            metrics.validation_errors.too_many_tc_tip_round += 1;
+            metrics.validation_errors.too_many_tc_tip_round.inc();
         }
         validation::Error::InsufficientStake => {
-            metrics.validation_errors.insufficient_stake += 1;
+            metrics.validation_errors.insufficient_stake.inc();
         }
         validation::Error::ValidatorSetDataUnavailable => {
             // This error occurs when the node knows when the next epoch starts,
             // but didn't get enough execution deltas to build the next
             // validator set.
             // TODO: This should trigger statesync
-            metrics.validation_errors.val_data_unavailable += 1;
+            metrics.validation_errors.val_data_unavailable.inc();
         }
         validation::Error::SignaturesDuplicateNode => {
-            metrics.validation_errors.signatures_duplicate_node += 1;
+            metrics.validation_errors.signatures_duplicate_node.inc();
         }
         validation::Error::InvalidVote => {
-            metrics.validation_errors.invalid_vote_message += 1;
+            metrics.validation_errors.invalid_vote_message.inc();
         }
         validation::Error::InvalidVersion => {
-            metrics.validation_errors.invalid_version += 1;
+            metrics.validation_errors.invalid_version.inc();
         }
         validation::Error::InvalidEpoch => {
             // TODO: If the node is not actively participating, getting this
             // error can indicate that the node is behind by more than an epoch
             // and needs state sync. Else if actively participating, this is
             // spam
-            metrics.validation_errors.invalid_epoch += 1;
+            metrics.validation_errors.invalid_epoch.inc();
         }
     };
 }
@@ -1027,7 +1027,10 @@ where
                     .iter()
                     .any(|cmd| matches!(cmd.command, ConsensusCommand::EnterRound(_, _)))
                 {
-                    self.metrics.node_state.self_stake_bps = self.get_self_stake_bps();
+                    self.metrics
+                        .node_state
+                        .self_stake_bps
+                        .set(self.get_self_stake_bps());
                 }
 
                 let mut cmds = consensus_cmds
@@ -1037,6 +1040,15 @@ where
 
                 if take_checkpoint {
                     if let Some(checkpoint_cmd) = ConsensusChildState::new(self).checkpoint() {
+                        // Note that this is not written to disk synchronously
+                        //
+                        // This is intentional since we want to avoid blocking the consensus state
+                        // machine on disk IO (fsync)
+                        //
+                        // There is no practically exploitable attack here since a malicious actor
+                        // would have to cause f+1 nodes to crash immediately after taking a
+                        // checkpoint and before the checkpoint is written to disk, which is
+                        // not a realistic attack vector
                         cmds.push(Command::ConfigFileCommand(checkpoint_cmd));
                     }
                 }
@@ -1209,13 +1221,13 @@ where
             MonadEvent::ControlPanelEvent(control_panel_event) => match control_panel_event {
                 ControlPanelEvent::GetMetricsEvent => {
                     vec![Command::ControlPanelCommand(ControlPanelCommand::Read(
-                        ReadCommand::GetMetrics(GetMetrics::Response(self.metrics)),
+                        ReadCommand::GetMetrics(GetMetrics::Response(self.metrics.snapshot())),
                     ))]
                 }
                 ControlPanelEvent::ClearMetricsEvent => {
-                    self.metrics = Default::default();
+                    self.metrics.clear();
                     vec![Command::ControlPanelCommand(ControlPanelCommand::Write(
-                        WriteCommand::ClearMetrics(ClearMetrics::Response(self.metrics)),
+                        WriteCommand::ClearMetrics(ClearMetrics::Response(self.metrics.snapshot())),
                     ))]
                 }
                 ControlPanelEvent::UpdateLogFilter(filter) => {
@@ -1450,7 +1462,7 @@ where
                 warn!("starting from empty state, consider fetching a snapshot first");
             }
 
-            self.metrics.consensus_events.trigger_state_sync += 1;
+            self.metrics.consensus_events.trigger_state_sync.inc();
             return vec![Command::StateSyncCommand(StateSyncCommand::RequestSync(
                 delayed_execution_result
                     .first()
@@ -1565,12 +1577,20 @@ where
             high_certificate.clone(),
         );
         let current_round = consensus.get_current_round();
+        let current_epoch = consensus.get_current_epoch();
         tracing::info!(
             ?root_info,
             ?high_certificate,
             "done syncing, initializing consensus"
         );
         self.consensus = ConsensusMode::Live(consensus);
+        // Pacemaker emits EnterRound only on a strictly higher
+        // certificate, seed RaptorCast/PeerDiscovery/etc with the
+        // bootstrap round here.
+        commands.push(Command::RouterCommand(RouterCommand::UpdateCurrentRound(
+            current_epoch,
+            current_round,
+        )));
         commands.push(Command::StateSyncCommand(StateSyncCommand::StartExecution));
         // technically we should be waiting for the vote pacing timer
         // to expire before we set scheduled_vote to TimerFired
@@ -1623,9 +1643,7 @@ where
 mod test {
     use monad_bls::BlsSignatureCollection;
     use monad_consensus_types::{
-        quorum_certificate::QuorumCertificate,
-        validator_data::{ValidatorData, ValidatorSetData, ValidatorsConfig},
-        voting::Vote,
+        quorum_certificate::QuorumCertificate, validator_data::ValidatorSetData, voting::Vote,
     };
     use monad_crypto::{certificate_signature::CertificateSignaturePubKey, signing_domain};
     use monad_eth_types::EthExecutionProtocol;
@@ -1835,56 +1853,6 @@ mod test {
             ),
             Err(ForkpointValidationError::InvalidQC)
         );
-    }
-
-    #[test]
-    fn test_validators_config() {
-        let (keys, cert_keys, _valset, _valmap) = create_keys_w_validators::<
-            SignatureType,
-            SignatureCollectionType,
-            _,
-        >(1, ValidatorSetFactory::default());
-
-        let make_val_set_data = |stake: Stake| {
-            ValidatorSetData(
-                vec![ValidatorData {
-                    node_id: NodeId::new(keys[0].pubkey()),
-                    cert_pubkey: cert_keys[0].pubkey(),
-                    stake,
-                }]
-                .into(),
-            )
-        };
-
-        let validators_config: ValidatorsConfig<SignatureCollectionType> = ValidatorsConfig {
-            validators: vec![
-                (Epoch(1), make_val_set_data(Stake::ONE)),
-                (Epoch(2), make_val_set_data(Stake::from(2))),
-                (Epoch(4), make_val_set_data(Stake::from(3))),
-                (Epoch(10), make_val_set_data(Stake::from(4))),
-            ]
-            .into_iter()
-            .collect(),
-        };
-
-        let expected = vec![
-            (Epoch(1), make_val_set_data(Stake::ONE)),
-            (Epoch(2), make_val_set_data(Stake::from(2))),
-            (Epoch(3), make_val_set_data(Stake::from(2))),
-            (Epoch(4), make_val_set_data(Stake::from(3))),
-            (Epoch(5), make_val_set_data(Stake::from(3))),
-            (Epoch(6), make_val_set_data(Stake::from(3))),
-            (Epoch(7), make_val_set_data(Stake::from(3))),
-            (Epoch(8), make_val_set_data(Stake::from(3))),
-            (Epoch(9), make_val_set_data(Stake::from(3))),
-            (Epoch(10), make_val_set_data(Stake::from(4))),
-            (Epoch(11), make_val_set_data(Stake::from(4))),
-            (Epoch(12), make_val_set_data(Stake::from(4))),
-        ];
-
-        for (epoch, val_set) in &expected {
-            assert_eq!(val_set, validators_config.get_validator_set(epoch))
-        }
     }
 
     // Confirm that version values greather than 2^16 for version fields don't cause deser issue

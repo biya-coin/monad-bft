@@ -15,7 +15,7 @@
 
 use std::{
     fmt::Debug,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
 };
 
@@ -276,13 +276,14 @@ pub enum GetMetrics {
     Response(Metrics),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound = "ST: CertificateSignatureRecoverable")]
 pub struct PeerEntry<ST: CertificateSignatureRecoverable> {
     #[serde(serialize_with = "serialize_pubkey::<_, CertificateSignaturePubKey<ST>>")]
     #[serde(deserialize_with = "deserialize_pubkey::<_, CertificateSignaturePubKey<ST>>")]
     pub pubkey: CertificateSignaturePubKey<ST>,
-    pub addr: SocketAddrV4,
+    #[serde(flatten)]
+    pub address: PeerEntryAddress,
 
     pub signature: ST,
     pub record_seq_num: u64,
@@ -296,33 +297,93 @@ pub struct PeerEntry<ST: CertificateSignatureRecoverable> {
     pub direct_udp_port: Option<NonZeroU16>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PeerEntryAddress {
+    Split(PeerEntrySplitEndpoint),
+    SocketAddr(PeerEntrySocketAddrEndpoint),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEntrySocketAddrEndpoint {
+    address: SocketAddrV4,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEntrySplitEndpoint {
+    address: Ipv4Addr,
+    tcp_port: NonZeroU16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    udp_port: Option<NonZeroU16>,
+}
+
+impl PeerEntryAddress {
+    pub fn new(address: Ipv4Addr, tcp_port: NonZeroU16, udp_port: Option<NonZeroU16>) -> Self {
+        Self::Split(PeerEntrySplitEndpoint {
+            address,
+            tcp_port,
+            udp_port,
+        })
+    }
+
+    pub fn ip(&self) -> Ipv4Addr {
+        match self {
+            Self::Split(endpoint) => endpoint.address,
+            Self::SocketAddr(endpoint) => *endpoint.address.ip(),
+        }
+    }
+
+    pub fn tcp_port(&self) -> NonZeroU16 {
+        match self {
+            Self::Split(endpoint) => Ok(endpoint.tcp_port),
+            Self::SocketAddr(endpoint) => NonZeroU16::new(endpoint.address.port())
+                .ok_or("socket address port must be non-zero"),
+        }
+        .expect("peer entry TCP port must be non-zero")
+    }
+
+    pub fn udp_port(&self) -> Option<NonZeroU16> {
+        match self {
+            Self::Split(endpoint) => endpoint.udp_port,
+            Self::SocketAddr(_) => Some(self.tcp_port()),
+        }
+    }
+}
+
+impl<ST: CertificateSignatureRecoverable> PeerEntry<ST> {
+    pub fn ip(&self) -> Ipv4Addr {
+        self.address.ip()
+    }
+
+    pub fn tcp_port(&self) -> NonZeroU16 {
+        self.address.tcp_port()
+    }
+
+    pub fn udp_port(&self) -> Option<NonZeroU16> {
+        self.address.udp_port()
+    }
+}
+
 impl<ST: CertificateSignatureRecoverable> Encodable for PeerEntry<ST> {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let addr = self.addr.to_string();
+        let address = self.ip().to_string();
         let auth_port = self.auth_port.get();
-        let base = [
+        let direct_udp_port = self.direct_udp_port.map_or(0, NonZeroU16::get);
+        let tcp_port = self.tcp_port().get();
+        let udp_port = self.udp_port().map_or(0, NonZeroU16::get);
+        let enc = [
             &self.pubkey as &dyn Encodable,
-            &addr as &dyn Encodable,
+            &address as &dyn Encodable,
             &self.signature as &dyn Encodable,
             &self.record_seq_num as &dyn Encodable,
             &auth_port as &dyn Encodable,
+            &direct_udp_port as &dyn Encodable,
+            &tcp_port as &dyn Encodable,
+            &udp_port as &dyn Encodable,
         ];
-
-        match self.direct_udp_port {
-            None => encode_list::<_, dyn Encodable>(&base, out),
-            Some(direct_udp_port) => {
-                let direct_udp_port = direct_udp_port.get();
-                let enc = [
-                    base[0],
-                    base[1],
-                    base[2],
-                    base[3],
-                    base[4],
-                    &direct_udp_port as &dyn Encodable,
-                ];
-                encode_list::<_, dyn Encodable>(&enc, out);
-            }
-        }
+        encode_list::<_, dyn Encodable>(&enc, out);
     }
 }
 
@@ -331,24 +392,35 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
         let mut payload = alloy_rlp::Header::decode_bytes(buf, true)?;
 
         let pubkey = CertificateSignaturePubKey::<ST>::decode(&mut payload)?;
-        let s = <String as Decodable>::decode(&mut payload)?;
-        let addr = s
-            .parse::<SocketAddrV4>()
-            .map_err(|_| alloy_rlp::Error::Custom("invalid SocketAddrV4"))?;
+        let address = <String as Decodable>::decode(&mut payload)?;
+        let (address, legacy_port) = if let Ok(address) = address.parse::<Ipv4Addr>() {
+            (address, None)
+        } else {
+            let address = address
+                .parse::<SocketAddrV4>()
+                .map_err(|_| alloy_rlp::Error::Custom("invalid peer entry address"))?;
+            let port = NonZeroU16::new(address.port())
+                .ok_or(alloy_rlp::Error::Custom("invalid SocketAddrV4"))?;
+            (*address.ip(), Some(port))
+        };
         let signature = ST::decode(&mut payload)?;
         let record_seq_num = u64::decode(&mut payload)?;
-
-        if payload.is_empty() {
-            return Err(alloy_rlp::Error::Custom("missing auth port"));
-        }
-
         let auth_port = NonZeroU16::new(u16::decode(&mut payload)?)
             .ok_or(alloy_rlp::Error::Custom("invalid auth port"))?;
-
-        let direct_udp_port = if !payload.is_empty() {
-            NonZeroU16::new(u16::decode(&mut payload)?)
-        } else {
+        let direct_udp_port = if payload.is_empty() {
             None
+        } else {
+            decode_optional_non_zero_u16(&mut payload)?
+        };
+        let (tcp_port, udp_port) = if payload.is_empty() {
+            let port = legacy_port.ok_or(alloy_rlp::Error::Custom(
+                "missing tcp/udp ports for peer entry",
+            ))?;
+            (port, Some(port))
+        } else {
+            let tcp_port = decode_non_zero_u16(&mut payload, "invalid tcp port")?;
+            let udp_port = decode_optional_non_zero_u16(&mut payload)?;
+            (tcp_port, udp_port)
         };
 
         if !payload.is_empty() {
@@ -357,13 +429,21 @@ impl<ST: CertificateSignatureRecoverable> Decodable for PeerEntry<ST> {
 
         Ok(Self {
             pubkey,
-            addr,
+            address: PeerEntryAddress::new(address, tcp_port, udp_port),
             signature,
             record_seq_num,
             auth_port,
             direct_udp_port,
         })
     }
+}
+
+fn decode_non_zero_u16(payload: &mut &[u8], error: &'static str) -> alloy_rlp::Result<NonZeroU16> {
+    NonZeroU16::new(u16::decode(payload)?).ok_or(alloy_rlp::Error::Custom(error))
+}
+
+fn decode_optional_non_zero_u16(payload: &mut &[u8]) -> alloy_rlp::Result<Option<NonZeroU16>> {
+    Ok(NonZeroU16::new(u16::decode(payload)?))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -799,24 +879,28 @@ where
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum ConsensusEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
 {
+    #[wal(enable)]
     Message {
         sender: NodeId<SCT::NodeIdPubKey>,
         unverified_message: Unverified<ST, Unvalidated<ConsensusMessage<ST, SCT, EPT>>>,
     },
+    #[wal(enable)]
     Timeout(Round),
     /// a block that was previously requested
     /// this is an invariant
+    #[wal(enable)]
     BlockSync {
         block_range: BlockRange,
         full_blocks: Vec<ConsensusFullBlock<ST, SCT, EPT>>,
     },
+    #[wal(enable)]
     SendVote(Round),
 }
 
@@ -928,7 +1012,7 @@ where
 }
 
 /// BlockSync related events
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum BlockSyncEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
@@ -936,29 +1020,35 @@ where
     EPT: ExecutionProtocol,
 {
     /// A peer (not self) requesting for a missing block
+    #[wal(enable)]
     Request {
         sender: NodeId<SCT::NodeIdPubKey>,
         request: BlockSyncRequestMessage,
     },
     /// Outbound request timed out
+    #[wal(enable)]
     Timeout(BlockSyncRequestMessage),
     /// self requesting for a missing block
     /// this request must be retried if necessary
+    #[wal(enable)]
     SelfRequest {
         requester: BlockSyncSelfRequester,
         block_range: BlockRange,
     },
     /// cancel request for block
+    #[wal(enable)]
     SelfCancelRequest {
         requester: BlockSyncSelfRequester,
         block_range: BlockRange,
     },
     /// A peer (not self) sending us a block
+    #[wal(enable)]
     Response {
         sender: NodeId<SCT::NodeIdPubKey>,
         response: BlockSyncResponseMessage<ST, SCT, EPT>,
     },
     /// self sending us missing block (from ledger)
+    #[wal(enable)]
     SelfResponse {
         response: BlockSyncResponseMessage<ST, SCT, EPT>,
     },
@@ -1098,8 +1188,9 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum ValidatorEvent<SCT: SignatureCollection> {
+    #[wal(enable)]
     UpdateValidators(ValidatorSetDataWithEpoch<SCT>),
 }
 
@@ -1130,13 +1221,14 @@ impl<SCT: SignatureCollection> Decodable for ValidatorEvent<SCT> {
 }
 
 #[serde_as]
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum MempoolEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     EPT: ExecutionProtocol,
 {
+    #[wal(enable)]
     Proposal {
         epoch: Epoch,
         round: Round,
@@ -1773,7 +1865,7 @@ impl Decodable for StateSyncNetworkMessage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, monad_wal::WALLog)]
 pub enum StateSyncEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
@@ -1788,15 +1880,18 @@ where
     ),
 
     /// Execution done syncing
+    #[wal(enable)]
     DoneSync(SeqNum),
 
     // Statesync-requested block
+    #[wal(enable)]
     BlockSync {
         block_range: BlockRange,
         full_blocks: Vec<ConsensusFullBlock<ST, SCT, EPT>>,
     },
 
     // Statesync re-sync request
+    #[wal(enable)]
     RequestSync {
         root: ConsensusBlockHeader<ST, SCT, EPT>,
         high_qc: QuorumCertificate<SCT>,
@@ -1880,7 +1975,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum ControlPanelEvent<ST>
 where
     ST: CertificateSignatureRecoverable,
@@ -1967,7 +2062,7 @@ where
     pub prioritized_full_nodes: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, monad_wal::WALLog)]
 pub enum ConfigEvent<ST, SCT>
 where
     ST: CertificateSignatureRecoverable,
@@ -2024,7 +2119,7 @@ where
 }
 
 /// MonadEvent are inputs to MonadState
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, monad_wal::WALLog)]
 pub enum MonadEvent<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
@@ -2032,18 +2127,24 @@ where
     EPT: ExecutionProtocol,
 {
     /// Events for consensus state
+    #[wal(enable(nested))]
     ConsensusEvent(ConsensusEvent<ST, SCT, EPT>),
     /// Events for block sync responder
+    #[wal(enable(nested))]
     BlockSyncEvent(BlockSyncEvent<ST, SCT, EPT>),
     /// Events to update validator set
+    #[wal(enable(nested))]
     ValidatorEvent(ValidatorEvent<SCT>),
     /// Events to mempool
+    #[wal(enable(nested))]
     MempoolEvent(MempoolEvent<ST, SCT, EPT>),
     /// Events for the debug control panel
     ControlPanelEvent(ControlPanelEvent<ST>),
     /// Events to update the block timestamper
+    #[wal(enable)]
     TimestampUpdateEvent(u128),
     /// Events to statesync
+    #[wal(enable(nested))]
     StateSyncEvent(StateSyncEvent<ST, SCT, EPT>),
     /// Config updates
     ConfigEvent(ConfigEvent<ST, SCT>),
@@ -2366,18 +2467,52 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddrV4, num::NonZeroU16};
+    use std::{net::Ipv4Addr, num::NonZeroU16};
 
     use alloy_rlp::{encode_list, Encodable};
+    use monad_blocksync::messages::message::BlockSyncRequestMessage;
+    use monad_consensus_types::block::BlockRange;
     use monad_crypto::{
         certificate_signature::{CertificateSignaturePubKey, PubKey},
         NopSignature,
     };
+    use monad_eth_types::EthExecutionProtocol;
+    use monad_multi_sig::MultiSig;
+    use monad_types::{NodeId, SeqNum, GENESIS_BLOCK_ID};
+    use monad_wal::wal::WALLog;
 
     use crate::{
-        PeerEntry, StateSyncRequest, StateSyncResponse, StateSyncUpsertType, StateSyncUpsertV1,
-        StateSyncVersion, SELF_STATESYNC_VERSION, STATESYNC_VERSION_V0, STATESYNC_VERSION_V1,
+        BlockSyncEvent, MempoolEvent, MonadEvent, PeerEntry, PeerEntryAddress, StateSyncEvent,
+        StateSyncNetworkMessage, StateSyncRequest, StateSyncResponse, StateSyncUpsertType,
+        StateSyncUpsertV1, StateSyncVersion, SELF_STATESYNC_VERSION, STATESYNC_VERSION_V0,
+        STATESYNC_VERSION_V1,
     };
+
+    type TestSignature = NopSignature;
+    type TestSignatureCollection = MultiSig<TestSignature>;
+    type TestExecutionProtocol = EthExecutionProtocol;
+
+    #[derive(monad_wal::WALLog)]
+    enum VariantLoggedTestEvent {
+        #[wal(enable)]
+        Logged,
+        NotLogged,
+    }
+
+    #[derive(monad_wal::WALLog)]
+    enum UnannotatedLoggedTestEvent {
+        First,
+        Second,
+    }
+
+    #[derive(monad_wal::WALLog)]
+    enum NestedLoggedTestEvent {
+        #[wal(enable(nested))]
+        Nested(VariantLoggedTestEvent),
+        #[wal(enable)]
+        Scalar,
+        Hidden,
+    }
 
     #[test]
     fn statesync_version_is_compatible() {
@@ -2522,18 +2657,75 @@ mod tests {
         assert_eq!(deserialized_request.old_target, 0);
     }
 
+    fn peer_entry_toml(address_fields: &str) -> String {
+        let pubkey = "01".repeat(32);
+        let signature_pubkey = ["1"; 32].join(", ");
+
+        format!(
+            r#"{address_fields}
+pubkey = "0x{pubkey}"
+signature = {{ pubkey = [{signature_pubkey}], id = 1234 }}
+record_seq_num = 42
+auth_port = 9000
+direct_udp_port = 9001
+"#
+        )
+    }
+
+    #[test]
+    fn peer_entry_decodes_legacy_socket_addr_toml() {
+        let peer: PeerEntry<NopSignature> =
+            toml::from_str(&peer_entry_toml(r#"address = "127.0.0.1:8000""#)).unwrap();
+
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(peer.tcp_port().get(), 8000);
+        assert_eq!(peer.udp_port().map(NonZeroU16::get), Some(8000));
+        assert_eq!(peer.direct_udp_port.map(NonZeroU16::get), Some(9001));
+    }
+
+    #[test]
+    fn peer_entry_decodes_split_port_toml() {
+        let peer: PeerEntry<NopSignature> = toml::from_str(&peer_entry_toml(
+            r#"address = "127.0.0.2"
+tcp_port = 8001
+udp_port = 8002"#,
+        ))
+        .unwrap();
+
+        assert_eq!(peer.ip(), "127.0.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(peer.tcp_port().get(), 8001);
+        assert_eq!(peer.udp_port().map(NonZeroU16::get), Some(8002));
+    }
+
+    #[test]
+    fn peer_entry_decodes_split_port_toml_without_udp_port() {
+        let peer: PeerEntry<NopSignature> = toml::from_str(&peer_entry_toml(
+            r#"address = "127.0.0.3"
+tcp_port = 8003"#,
+        ))
+        .unwrap();
+
+        assert_eq!(peer.ip(), "127.0.0.3".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(peer.tcp_port().get(), 8003);
+        assert_eq!(peer.udp_port(), None);
+    }
+
     #[test]
     fn peer_entry_rlp_encode_decode() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[1u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8000".parse().unwrap();
+        let address: Ipv4Addr = "127.0.0.1".parse().unwrap();
         let signature = NopSignature { pubkey, id: 1234 };
         let record_seq_num = 0;
         let entry = PeerEntry {
             pubkey,
-            addr,
+            address: PeerEntryAddress::new(
+                address,
+                NonZeroU16::new(8000).unwrap(),
+                Some(NonZeroU16::new(8000).unwrap()),
+            ),
             signature,
             record_seq_num,
-            auth_port: NonZeroU16::new(addr.port()).unwrap(),
+            auth_port: NonZeroU16::new(8000).unwrap(),
             direct_udp_port: None,
         };
         let encoded = alloy_rlp::encode(&entry);
@@ -2544,11 +2736,15 @@ mod tests {
     #[test]
     fn peer_entry_rlp_encode_decode_with_direct_udp() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[2u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8001".parse().unwrap();
+        let address: Ipv4Addr = "127.0.0.1".parse().unwrap();
         let signature = NopSignature { pubkey, id: 4321 };
         let entry = PeerEntry {
             pubkey,
-            addr,
+            address: PeerEntryAddress::new(
+                address,
+                NonZeroU16::new(8001).unwrap(),
+                Some(NonZeroU16::new(8001).unwrap()),
+            ),
             signature,
             record_seq_num: 7,
             auth_port: NonZeroU16::new(9000).unwrap(),
@@ -2561,15 +2757,35 @@ mod tests {
     }
 
     #[test]
-    fn peer_entry_rlp_decode_legacy_auth_only_form() {
+    fn peer_entry_rlp_encode_decode_ip_form() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[3u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8002".parse().unwrap();
+        let ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
         let signature = NopSignature { pubkey, id: 99 };
         let record_seq_num = 11u64;
         let auth_port = 9002u16;
+        let entry = PeerEntry {
+            pubkey,
+            address: PeerEntryAddress::new(ip, NonZeroU16::new(8002).unwrap(), None),
+            signature,
+            record_seq_num,
+            auth_port: NonZeroU16::new(auth_port).unwrap(),
+            direct_udp_port: None,
+        };
+
+        let encoded = alloy_rlp::encode(&entry);
+        let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn peer_entry_rlp_decode_legacy_auth_only_form() {
+        let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[7u8; 32]).unwrap();
+        let signature = NopSignature { pubkey, id: 10 };
+        let record_seq_num = 15u64;
+        let auth_port = 9006u16;
         let enc: [&dyn Encodable; 5] = [
             &pubkey,
-            &addr.to_string(),
+            &"127.0.0.3:8006".to_string(),
             &signature,
             &record_seq_num,
             &auth_port,
@@ -2578,17 +2794,59 @@ mod tests {
         encode_list::<_, dyn Encodable>(&enc, &mut encoded);
 
         let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
-        assert_eq!(decoded.auth_port, NonZeroU16::new(auth_port).unwrap());
+        assert_eq!(decoded.ip(), "127.0.0.3".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(decoded.tcp_port().get(), 8006);
+        assert_eq!(decoded.udp_port().map(NonZeroU16::get), Some(8006));
+        assert_eq!(decoded.auth_port.get(), auth_port);
         assert_eq!(decoded.direct_udp_port, None);
     }
 
     #[test]
-    fn peer_entry_rlp_decode_rejects_missing_auth_port() {
+    fn peer_entry_rlp_decode_legacy_direct_udp_form() {
+        let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[8u8; 32]).unwrap();
+        let signature = NopSignature { pubkey, id: 11 };
+        let record_seq_num = 16u64;
+        let auth_port = 9007u16;
+        let direct_udp_port = 9008u16;
+        let enc: [&dyn Encodable; 6] = [
+            &pubkey,
+            &"127.0.0.4:8007".to_string(),
+            &signature,
+            &record_seq_num,
+            &auth_port,
+            &direct_udp_port,
+        ];
+        let mut encoded = Vec::new();
+        encode_list::<_, dyn Encodable>(&enc, &mut encoded);
+
+        let decoded: PeerEntry<NopSignature> = alloy_rlp::decode_exact(&encoded).unwrap();
+        assert_eq!(decoded.ip(), "127.0.0.4".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(decoded.tcp_port().get(), 8007);
+        assert_eq!(decoded.udp_port().map(NonZeroU16::get), Some(8007));
+        assert_eq!(decoded.auth_port.get(), auth_port);
+        assert_eq!(
+            decoded.direct_udp_port.map(NonZeroU16::get),
+            Some(direct_udp_port)
+        );
+    }
+
+    #[test]
+    fn peer_entry_rlp_decode_rejects_zero_auth_port() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[5u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8004".parse().unwrap();
+        let address = "127.0.0.1".to_string();
         let signature = NopSignature { pubkey, id: 8 };
         let record_seq_num = 13u64;
-        let enc: [&dyn Encodable; 4] = [&pubkey, &addr.to_string(), &signature, &record_seq_num];
+        let auth_port = 0u16;
+        let enc: [&dyn Encodable; 8] = [
+            &pubkey,
+            &address,
+            &signature,
+            &record_seq_num,
+            &auth_port,
+            &0u16,
+            &8004u16,
+            &8004u16,
+        ];
         let mut encoded = Vec::new();
         encode_list::<_, dyn Encodable>(&enc, &mut encoded);
 
@@ -2597,18 +2855,21 @@ mod tests {
     }
 
     #[test]
-    fn peer_entry_rlp_decode_rejects_zero_auth_port() {
+    fn peer_entry_rlp_decode_rejects_zero_tcp_port() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[6u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8005".parse().unwrap();
         let signature = NopSignature { pubkey, id: 9 };
         let record_seq_num = 14u64;
-        let auth_port = 0u16;
-        let enc: [&dyn Encodable; 5] = [
+        let auth_port = 9005u16;
+        let tcp_port = 0u16;
+        let enc: [&dyn Encodable; 8] = [
             &pubkey,
-            &addr.to_string(),
+            &"127.0.0.1".to_string(),
             &signature,
             &record_seq_num,
             &auth_port,
+            &0u16,
+            &tcp_port,
+            &0u16,
         ];
         let mut encoded = Vec::new();
         encode_list::<_, dyn Encodable>(&enc, &mut encoded);
@@ -2620,19 +2881,21 @@ mod tests {
     #[test]
     fn peer_entry_rlp_decode_rejects_extra_fields() {
         let pubkey = CertificateSignaturePubKey::<NopSignature>::from_bytes(&[4u8; 32]).unwrap();
-        let addr: SocketAddrV4 = "127.0.0.1:8003".parse().unwrap();
         let signature = NopSignature { pubkey, id: 7 };
         let record_seq_num = 12u64;
         let auth_port = 9003u16;
         let direct_udp_port = 9004u16;
+        let tcp_port = 8003u16;
         let extra_port = 9005u16;
-        let enc: [&dyn Encodable; 7] = [
+        let enc: [&dyn Encodable; 9] = [
             &pubkey,
-            &addr.to_string(),
+            &"127.0.0.1".to_string(),
             &signature,
             &record_seq_num,
             &auth_port,
             &direct_udp_port,
+            &tcp_port,
+            &0u16,
             &extra_port,
         ];
         let mut encoded = Vec::new();
@@ -2640,5 +2903,63 @@ mod tests {
 
         let decoded = alloy_rlp::decode_exact::<PeerEntry<NopSignature>>(&encoded);
         assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn wal_logging_only_keeps_traceable_events() {
+        assert!(VariantLoggedTestEvent::Logged.is_wal_logged());
+        assert!(!VariantLoggedTestEvent::NotLogged.is_wal_logged());
+        assert!(!UnannotatedLoggedTestEvent::First.is_wal_logged());
+        assert!(!UnannotatedLoggedTestEvent::Second.is_wal_logged());
+        assert!(NestedLoggedTestEvent::Nested(VariantLoggedTestEvent::Logged).is_wal_logged());
+        assert!(!NestedLoggedTestEvent::Nested(VariantLoggedTestEvent::NotLogged).is_wal_logged());
+        assert!(NestedLoggedTestEvent::Scalar.is_wal_logged());
+        assert!(!NestedLoggedTestEvent::Hidden.is_wal_logged());
+
+        let logged_event = MonadEvent::<
+            TestSignature,
+            TestSignatureCollection,
+            TestExecutionProtocol,
+        >::BlockSyncEvent(BlockSyncEvent::Timeout(
+            BlockSyncRequestMessage::Headers(BlockRange {
+                last_block_id: GENESIS_BLOCK_ID,
+                num_blocks: SeqNum(1),
+            }),
+        ));
+        assert!(logged_event.is_wal_logged());
+
+        let mempool_event = MonadEvent::<
+            TestSignature,
+            TestSignatureCollection,
+            TestExecutionProtocol,
+        >::MempoolEvent(MempoolEvent::ForwardTxs(Vec::new()));
+        assert!(!mempool_event.is_wal_logged());
+
+        let timestamp_event = MonadEvent::<
+            TestSignature,
+            TestSignatureCollection,
+            TestExecutionProtocol,
+        >::TimestampUpdateEvent(7);
+        assert!(timestamp_event.is_wal_logged());
+
+        let state_sync_event = MonadEvent::<
+            TestSignature,
+            TestSignatureCollection,
+            TestExecutionProtocol,
+        >::StateSyncEvent(StateSyncEvent::DoneSync(SeqNum(2)));
+        assert!(state_sync_event.is_wal_logged());
+
+        let sender = NodeId::new(
+            CertificateSignaturePubKey::<TestSignature>::from_bytes(&[8u8; 32]).unwrap(),
+        );
+        let inbound_statesync = MonadEvent::<
+            TestSignature,
+            TestSignatureCollection,
+            TestExecutionProtocol,
+        >::StateSyncEvent(StateSyncEvent::Inbound(
+            sender,
+            StateSyncNetworkMessage::NotWhitelisted,
+        ));
+        assert!(!inbound_statesync.is_wal_logged());
     }
 }

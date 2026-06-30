@@ -17,6 +17,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::metrics::{parse_label, Label};
+
+const DEFAULT_WAL_CHUNKS: u64 = 8;
+const DEFAULT_WAL_CHUNK_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "monad-node", about, long_about = None, version = monad_version::version!())]
 pub struct Cli {
@@ -44,9 +49,17 @@ pub struct Cli {
     #[arg(long)]
     pub devnet_chain_config_override: Option<PathBuf>,
 
-    /// Set the path where the write-ahead log will be stored
+    /// Set the directory where WAL chunks will be stored
     #[arg(long)]
     pub wal_path: PathBuf,
+
+    /// Set the maximum number of WAL chunks to retain. Set to 0 to disable WAL.
+    #[arg(long, default_value_t = DEFAULT_WAL_CHUNKS)]
+    pub wal_chunks: u64,
+
+    /// Set the WAL chunk size in bytes
+    #[arg(long, default_value_t = DEFAULT_WAL_CHUNK_SIZE_BYTES)]
+    pub wal_chunk_size_bytes: u64,
 
     /// Set the path where consensus blocks will be stored
     #[arg(long)]
@@ -85,6 +98,21 @@ pub struct Cli {
     /// Set the time interval for metrics collection
     #[arg(long, requires = "otel_endpoint")]
     pub record_metrics_interval_seconds: Option<u64>,
+
+    #[arg(
+        long,
+        help = "listen address for the Prometheus HTTP server serving /metrics. the server won't be enabled if address is empty",
+        default_value = ""
+    )]
+    pub metrics: String,
+
+    #[arg(
+        long,
+        value_name = "KEY=VALUE",
+        value_parser = parse_label,
+        help = "constant Prometheus label to attach to all /metrics output; can be repeated"
+    )]
+    pub metrics_labels: Vec<Label>,
 
     #[arg(
         long,

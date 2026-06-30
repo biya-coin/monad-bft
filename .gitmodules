@@ -1,7 +1,7 @@
 [submodule "monad-execution"]
 	path = monad-execution
 	url = https://github.com/biya-coin/monad
-	branch = staging-v0.14.2
+	branch = v0.14.7
 [submodule "biyachain-core"]
 	path = biyachain-core
 	url = https://github.com/biya-coin/biyachain-core

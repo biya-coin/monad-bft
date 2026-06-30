@@ -51,7 +51,7 @@ use monad_raptorcast::{
     RaptorCast, RaptorCastEvent,
 };
 use monad_secp::{KeyPair, SecpSignature};
-use monad_types::{Deserializable, Epoch, NodeId, RouterTarget, Serializable, Stake};
+use monad_types::{Deserializable, Epoch, NodeId, Round, RouterTarget, Serializable, Stake};
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use rand::{thread_rng, Rng};
@@ -291,6 +291,7 @@ fn create_raptorcast_config(keypair: Arc<KeyPair>) -> RaptorCastConfig<Signature
             invite_future_dist_max: monad_types::Round(5),
             invite_accept_heartbeat_ms: 100,
         },
+        deterministic_protocol_rollout: monad_raptorcast::v1_rollout::CURRENT_STAGE,
     }
 }
 
@@ -586,7 +587,7 @@ fn setup_node(
         let name_record = NameRecord::new(
             *participant.tcp_addr.ip(),
             participant.tcp_addr.port(),
-            participant.udp_addr.port(),
+            Some(participant.udp_addr.port()),
             participant.authenticated_udp_addr.port(),
             0,
             0,
@@ -638,7 +639,7 @@ fn setup_node(
 
     let mut known_addresses = std::collections::HashMap::new();
     for (node_id, record) in &routing_info {
-        known_addresses.insert(*node_id, record.name_record.udp_socket());
+        known_addresses.insert(*node_id, record.name_record.authenticated_udp_socket());
     }
 
     let noop_builder = NopDiscoveryBuilder {
@@ -669,7 +670,7 @@ fn setup_node(
         create_raptorcast_config(keypair_arc),
         SecondaryRaptorCastModeConfig::None,
         tcp_socket,
-        Some((authenticated_socket, auth_protocol)),
+        (authenticated_socket, auth_protocol),
         None,
         non_authenticated_socket,
         dataplane_control,
@@ -769,7 +770,7 @@ async fn run_producer(
             _ = interval_timer.tick() => {
                 let message = MockMessage::new_with_timestamp(size);
                 raptorcast.exec(vec![RouterCommand::Publish {
-                    target: RouterTarget::Raptorcast(Epoch(0)),
+                    target: RouterTarget::Raptorcast { round: Round(0), epoch: Epoch(0) },
                     message,
                 }]);
 

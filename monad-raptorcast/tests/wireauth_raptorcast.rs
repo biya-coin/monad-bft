@@ -36,7 +36,7 @@ use monad_peer_discovery::{
 };
 use monad_raptorcast::{create_dataplane_for_tests, DataplaneHandles, RaptorCastEvent};
 use monad_secp::{KeyPair, SecpSignature};
-use monad_types::{Deserializable, Epoch, NodeId, Serializable, Stake};
+use monad_types::{Deserializable, Epoch, NodeId, Round, Serializable, Stake};
 use rstest::rstest;
 use tracing_subscriber::EnvFilter;
 
@@ -154,7 +154,7 @@ impl ValidatorInfo {
         let name_record = NameRecord::new_with_ports(
             Ipv4Addr::new(127, 0, 0, 1),
             tcp_addr.port(),
-            non_auth_addr.port(),
+            Some(non_auth_addr.port()),
             auth_addr.port(),
             direct_udp_addr.map(|addr| addr.port()),
             1,
@@ -191,6 +191,7 @@ fn create_raptorcast_config(
             invite_future_dist_max: monad_types::Round(5),
             invite_accept_heartbeat_ms: 100,
         },
+        deterministic_protocol_rollout: monad_raptorcast::v1_rollout::CURRENT_STAGE,
     }
 }
 
@@ -247,12 +248,15 @@ fn spawn_noop_validator(
             config,
             monad_raptorcast::raptorcast_secondary::SecondaryRaptorCastModeConfig::None,
             dataplane.tcp_socket,
-            None,
+            (
+                dataplane.authenticated_socket,
+                monad_raptorcast::auth::NoopAuthProtocol::new(),
+            ),
             None,
             dataplane.non_authenticated_socket,
             dataplane.control,
             shared_pd,
-            Epoch(0),
+            monad_types::Epoch(0),
         );
 
         let mut cmd_rx = cmd_rx;
@@ -301,14 +305,14 @@ fn spawn_wireauth_validator(
     tokio::task::spawn_local(async move {
         let config = create_raptorcast_config(keypair.clone(), sig_verification_rate_limit);
         let wireauth_config = monad_wireauth::Config::default();
-        let authenticated = dataplane.authenticated_socket.map(|socket| {
-            let protocol = monad_raptorcast::auth::WireAuthProtocol::new(
+        let authenticated = (
+            dataplane.authenticated_socket,
+            monad_raptorcast::auth::WireAuthProtocol::new(
                 &monad_raptorcast::auth::metrics::UDP_METRICS,
                 wireauth_config.clone(),
                 keypair.clone(),
-            );
-            (socket, protocol)
-        });
+            ),
+        );
         let direct_udp = dataplane.direct_udp_socket.map(|socket| {
             let protocol = monad_raptorcast::auth::WireAuthProtocol::new(
                 &monad_raptorcast::auth::metrics::DIRECT_UDP_METRICS,
@@ -341,7 +345,7 @@ fn spawn_wireauth_validator(
             dataplane.non_authenticated_socket,
             dataplane.control,
             shared_pd,
-            Epoch(0),
+            monad_types::Epoch(0),
         );
 
         let mut cmd_rx = cmd_rx;
@@ -394,6 +398,7 @@ async fn establish_connections(
     ready_rxs: Vec<tokio::sync::oneshot::Receiver<()>>,
     epoch: Epoch,
     validator_set: Vec<(NodeId<CertificateSignaturePubKey<SecpSignature>>, Stake)>,
+    node_ids: &[NodeId<CertificateSignaturePubKey<SecpSignature>>],
     event_rxs: &mut [&mut tokio::sync::mpsc::UnboundedReceiver<
         MockEvent<CertificateSignaturePubKey<SecpSignature>>,
     >],
@@ -407,14 +412,18 @@ async fn establish_connections(
             .unwrap();
     }
 
-    let setup_message = MockMessage::new(1, 100);
-    for cmd_tx in cmd_txs {
-        cmd_tx
-            .send(RouterCommand::Publish {
-                target: monad_types::RouterTarget::Broadcast(epoch),
-                message: setup_message,
-            })
-            .unwrap();
+    // establish connections via pairwise p2p messages
+    for (i, cmd_tx) in cmd_txs.iter().enumerate() {
+        for (j, node_id) in node_ids.iter().enumerate() {
+            if i != j {
+                cmd_tx
+                    .send(RouterCommand::Publish {
+                        target: monad_types::RouterTarget::PointToPoint(*node_id),
+                        message: MockMessage::new(1, 100),
+                    })
+                    .unwrap();
+            }
+        }
     }
 
     for ready_rx in ready_rxs {
@@ -442,7 +451,7 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
     let use_direct_udp = matches!(routing_type, RoutingType::DirectPointToPoint);
 
     let dataplanes: Vec<_> = (0..NUM_NODES)
-        .map(|i| create_dataplane_for_tests(true, use_direct_udp && i < num_auth_nodes))
+        .map(|i| create_dataplane_for_tests(use_direct_udp && i < num_auth_nodes))
         .collect();
 
     let name_records: HashMap<_, _> = validator_infos
@@ -453,7 +462,7 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
                 v.nodeid,
                 v.create_name_record(
                     dp.tcp_addr,
-                    dp.auth_addr.expect("auth enabled"),
+                    dp.auth_addr,
                     dp.direct_udp_addr,
                     dp.non_auth_addr,
                 ),
@@ -472,7 +481,7 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
         .zip(dataplanes.iter())
         .enumerate()
         .filter(|(i, _)| *i < num_auth_nodes)
-        .map(|(_, (v, dp))| (dp.auth_addr.expect("auth enabled"), v.pubkey))
+        .map(|(_, (v, dp))| (dp.auth_addr, v.pubkey))
         .collect();
 
     let validators: Vec<_> = validator_infos
@@ -507,6 +516,7 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
         .collect();
 
     let epoch = Epoch(0);
+    let round = Round(0);
     let validator_set: Vec<_> = validator_infos
         .iter()
         .map(|v| (v.nodeid, Stake::ONE))
@@ -520,11 +530,14 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
     let cmd_tx_refs: Vec<_> = cmd_txs.iter().collect();
     let mut event_rx_refs: Vec<_> = event_rxs.iter_mut().collect();
 
+    let node_ids: Vec<_> = validator_infos.iter().map(|v| v.nodeid).collect();
+
     establish_connections(
         &cmd_tx_refs,
         ready_rxs,
         epoch,
         validator_set,
+        &node_ids,
         &mut event_rx_refs,
     )
     .await;
@@ -564,7 +577,7 @@ async fn run_test_scenario(num_auth_nodes: usize, routing_type: RoutingType, mes
         RoutingType::Raptorcast | RoutingType::Broadcast => {
             let message = MockMessage::new(1000, message_size);
             let target = match routing_type {
-                RoutingType::Raptorcast => monad_types::RouterTarget::Raptorcast(epoch),
+                RoutingType::Raptorcast => monad_types::RouterTarget::Raptorcast { round, epoch },
                 RoutingType::Broadcast => monad_types::RouterTarget::Broadcast(epoch),
                 _ => unreachable!(),
             };
@@ -596,7 +609,7 @@ async fn test_rate_limiting_basic() {
     let validator_infos: Vec<_> = (1..=NUM_TEST_NODES as u8).map(ValidatorInfo::new).collect();
 
     let dataplanes: Vec<_> = (0..NUM_TEST_NODES)
-        .map(|_| create_dataplane_for_tests(true, false))
+        .map(|_| create_dataplane_for_tests(false))
         .collect();
 
     let name_records: HashMap<_, _> = validator_infos
@@ -605,12 +618,7 @@ async fn test_rate_limiting_basic() {
         .map(|(v, dp)| {
             (
                 v.nodeid,
-                v.create_name_record(
-                    dp.tcp_addr,
-                    dp.auth_addr.expect("auth enabled"),
-                    None,
-                    dp.non_auth_addr,
-                ),
+                v.create_name_record(dp.tcp_addr, dp.auth_addr, None, dp.non_auth_addr),
             )
         })
         .collect();
@@ -624,7 +632,7 @@ async fn test_rate_limiting_basic() {
     let peers_for_check: Vec<_> = validator_infos
         .iter()
         .zip(dataplanes.iter())
-        .map(|(v, dp)| (dp.auth_addr.expect("auth enabled"), v.pubkey))
+        .map(|(v, dp)| (dp.auth_addr, v.pubkey))
         .collect();
 
     let validators: Vec<_> = validator_infos
@@ -664,12 +672,14 @@ async fn test_rate_limiting_basic() {
 
     let cmd_tx_refs: Vec<_> = cmd_txs.iter().collect();
     let mut event_rx_refs: Vec<_> = event_rxs.iter_mut().collect();
+    let node_ids: Vec<_> = validator_infos.iter().map(|v| v.nodeid).collect();
 
     establish_connections(
         &cmd_tx_refs,
         ready_rxs,
         epoch,
         validator_set,
+        &node_ids,
         &mut event_rx_refs,
     )
     .await;
@@ -746,9 +756,6 @@ async fn test_rate_limiting_basic() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-// This test depends on broadcasting to validators as non-validators,
-// which is now prohibited.
-#[ignore]
 async fn test_rate_limiting_p2p() {
     init_tracing();
 
@@ -785,13 +792,13 @@ async fn run_send_with_record_uses_name_record_address() {
     let alice_info = ValidatorInfo::new(1);
     let bob_info = ValidatorInfo::new(2);
 
-    let alice_dp = create_dataplane_for_tests(true, false);
-    let bob1_dp = create_dataplane_for_tests(true, false);
-    let bob2_dp = create_dataplane_for_tests(true, false);
+    let alice_dp = create_dataplane_for_tests(false);
+    let bob1_dp = create_dataplane_for_tests(false);
+    let bob2_dp = create_dataplane_for_tests(false);
 
-    let alice_auth_addr = alice_dp.auth_addr.expect("auth enabled");
-    let bob1_auth_addr = bob1_dp.auth_addr.expect("auth enabled");
-    let bob2_auth_addr = bob2_dp.auth_addr.expect("auth enabled");
+    let alice_auth_addr = alice_dp.auth_addr;
+    let bob1_auth_addr = bob1_dp.auth_addr;
+    let bob2_auth_addr = bob2_dp.auth_addr;
     let bob2_non_auth_addr = bob2_dp.non_auth_addr;
     let bob2_tcp_addr = bob2_dp.tcp_addr;
     assert_ne!(bob1_auth_addr, bob2_auth_addr);
@@ -852,12 +859,14 @@ async fn run_send_with_record_uses_name_record_address() {
     let cmd_txs = [&alice.cmd_tx, &bob1.cmd_tx];
     let mut event_rxs = [alice.event_rx, bob1.event_rx];
     let mut event_rx_refs: Vec<_> = event_rxs.iter_mut().collect();
+    let node_ids = [alice_info.nodeid, bob_info.nodeid];
 
     establish_connections(
         &cmd_txs,
         vec![alice.ready_rx, bob1.ready_rx],
         epoch,
         validator_set.clone(),
+        &node_ids,
         &mut event_rx_refs,
     )
     .await;
@@ -912,7 +921,7 @@ async fn run_send_with_record_uses_name_record_address() {
     let bob2_name_record = NameRecord::new(
         Ipv4Addr::new(127, 0, 0, 1),
         bob2_tcp_addr.port(),
-        bob2_non_auth_addr.port(),
+        Some(bob2_non_auth_addr.port()),
         bob2_auth_addr.port(),
         0,
         1,

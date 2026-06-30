@@ -180,9 +180,12 @@ where
 
                     match prepared_txs {
                         Ok(txs) => {
-                            self.metrics[GAUGE_COSMOS_TXPOOL_PROPOSAL_TOTAL_US] +=
-                                proposal_start.elapsed().as_micros() as u64;
-                            self.metrics[GAUGE_COSMOS_TXPOOL_PROPOSAL_COUNT] += 1;
+                            self.metrics
+                                .gauge(GAUGE_COSMOS_TXPOOL_PROPOSAL_TOTAL_US)
+                                .add(proposal_start.elapsed().as_micros() as u64);
+                            self.metrics
+                                .gauge(GAUGE_COSMOS_TXPOOL_PROPOSAL_COUNT)
+                                .inc();
 
                             let txs = match self.committed_seen_txs.lock() {
                                 Ok(seen) => txs

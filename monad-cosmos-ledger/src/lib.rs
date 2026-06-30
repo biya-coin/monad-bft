@@ -203,9 +203,12 @@ where
                         self.bft_block_persist
                             .update_proposed_head(&block.get_id())
                             .unwrap();
-                        self.metrics[GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_TOTAL_US] +=
-                            write_start.elapsed().as_micros() as u64;
-                        self.metrics[GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_COUNT] += 1;
+                        self.metrics
+                            .gauge(GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_TOTAL_US)
+                            .add(write_start.elapsed().as_micros() as u64);
+                        self.metrics
+                            .gauge(GAUGE_COSMOS_LEDGER_PROPOSED_HEAD_WRITE_COUNT)
+                            .inc();
                     }
                     self.update_cache(block);
                 }
@@ -219,8 +222,10 @@ where
                     let block_num = block.get_seq_num().0;
                     let tx_count = block.body().execution_body.txs.len();
                     info!(block_num, tx_count, "committed cosmos block");
-                    self.metrics[GAUGE_COSMOS_LEDGER_NUM_COMMITS] += 1;
-                    self.metrics[GAUGE_COSMOS_LEDGER_BLOCK_NUM] = block_num;
+                    self.metrics.gauge(GAUGE_COSMOS_LEDGER_NUM_COMMITS).inc();
+                    self.metrics
+                        .gauge(GAUGE_COSMOS_LEDGER_BLOCK_NUM)
+                        .set(block_num);
                     self.last_commit = Some((block.get_seq_num(), block.get_block_round()));
                     self.bft_block_persist
                         .update_finalized_head(&block_id)

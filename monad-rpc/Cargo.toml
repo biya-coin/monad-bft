@@ -52,10 +52,13 @@ alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-rpc-types = { workspace = true, features = ["eth"] }
 async-stream = { workspace = true }
+async-trait = { workspace = true }
+auto_impl = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
+dyn-clone = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
@@ -63,8 +66,8 @@ hex = { workspace = true }
 inotify = { workspace = true }
 itertools = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics", "trace"] }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace"] }
 pin-project = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -74,6 +77,7 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_cbor = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "fs"] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
@@ -83,12 +87,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies.tikv-jemallocator]
 workspace = true
-features = [
-    "profiling",
-    "stats",
-    "unprefixed_malloc_on_supported_platforms",
-    "background_threads",
-]
+features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"]
 optional = true
 
 [build-dependencies]
@@ -108,6 +107,7 @@ awc = { workspace = true }
 brotli = { workspace = true }
 criterion = { workspace = true }
 flate2 = { workspace = true }
+paste = { workspace = true }
 proptest = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }

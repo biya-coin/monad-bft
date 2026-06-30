@@ -40,10 +40,16 @@ use tracing_subscriber::{
     Layer,
 };
 
-use crate::{cli::Cli, error::NodeSetupError};
+use crate::{cli::Cli, error::NodeSetupError, metrics::Label};
 
 const REMOTE_FORKPOINT_URL_ENV: &str = "REMOTE_FORKPOINT_URL";
 const REMOTE_VALIDATORS_URL_ENV: &str = "REMOTE_VALIDATORS_URL";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub addr: String,
+    pub labels: Vec<Label>,
+}
 
 pub struct NodeState {
     pub node_config: MonadNodeConfig,
@@ -59,6 +65,8 @@ pub struct NodeState {
     pub forkpoint_path: PathBuf,
     pub validators_path: PathBuf,
     pub wal_path: PathBuf,
+    pub wal_chunks: u64,
+    pub wal_chunk_size_bytes: u64,
     pub ledger_path: PathBuf,
     pub mempool_ipc_path: PathBuf,
     pub control_panel_ipc_path: PathBuf,
@@ -67,6 +75,7 @@ pub struct NodeState {
     pub triedb_path: PathBuf,
     pub persisted_peers_path: PathBuf,
 
+    pub metrics: Option<MetricsConfig>,
     pub otel_endpoint_interval: Option<(String, Duration)>,
     pub pprof: String,
     pub reload_handle: Box<dyn TracingReload>,
@@ -85,19 +94,25 @@ impl NodeState {
             validators_path: validators_config_path,
             devnet_chain_config_override: maybe_devnet_chain_config_override_path,
             wal_path,
+            wal_chunks,
+            wal_chunk_size_bytes,
             ledger_path,
             mempool_ipc_path,
             triedb_path,
             control_panel_ipc_path,
             statesync_ipc_path,
             statesync_sq_thread_cpu,
-            keystore_password,
             otel_endpoint,
+            keystore_password,
             record_metrics_interval_seconds,
+            metrics,
+            metrics_labels,
             pprof,
             manytrace_socket,
             persisted_peers_path,
         } = Cli::from_arg_matches_mut(&mut cmd.get_matches_mut())?;
+
+        let metrics = parse_metrics_config(metrics, metrics_labels)?;
 
         let (reload_handle, agent) = NodeState::setup_tracing(manytrace_socket)?;
 
@@ -154,20 +169,6 @@ impl NodeState {
         let chain_config =
             MonadChainConfig::new(node_config.chain_id, devnet_chain_config_override)?;
 
-        let wal_path = wal_path.with_file_name(format!(
-            "{}_{}",
-            wal_path
-                .file_name()
-                .expect("no wal file name")
-                .to_owned()
-                .into_string()
-                .expect("invalid wal path"),
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .expect("time went backwards")
-                .as_millis()
-        ));
-
         let otel_endpoint_interval = match (otel_endpoint, record_metrics_interval_seconds) {
             (Some(otel_endpoint), Some(record_metrics_interval_seconds)) => Some((
                 otel_endpoint,
@@ -191,6 +192,8 @@ impl NodeState {
             forkpoint_path: forkpoint_config_path,
             validators_path: validators_config_path,
             wal_path,
+            wal_chunks,
+            wal_chunk_size_bytes,
             ledger_path,
             triedb_path,
             mempool_ipc_path,
@@ -198,6 +201,7 @@ impl NodeState {
             statesync_ipc_path,
             statesync_sq_thread_cpu,
 
+            metrics,
             otel_endpoint_interval,
             pprof,
             reload_handle,
@@ -255,6 +259,24 @@ impl NodeState {
             tracing::subscriber::set_global_default(subscriber)?;
             Ok((Box::new(reload_handle), None))
         }
+    }
+}
+
+fn parse_metrics_config(
+    addr: String,
+    labels: Vec<Label>,
+) -> Result<Option<MetricsConfig>, NodeSetupError> {
+    if addr.is_empty() {
+        if labels.is_empty() {
+            Ok(None)
+        } else {
+            Err(NodeSetupError::Custom {
+                kind: ErrorKind::MissingRequiredArgument,
+                msg: "--metrics-labels requires --metrics".to_owned(),
+            })
+        }
+    } else {
+        Ok(Some(MetricsConfig { addr, labels }))
     }
 }
 
@@ -376,15 +398,33 @@ fn get_latest_configs(
 
             // if remote config is more recent, use that over local config
             if remote_forkpoint_round > local_forkpoint_round + remote_configs_threshold {
-                info!(
-                    ?remote_forkpoint_round,
-                    ?local_forkpoint_round,
-                    "local forkpoint over {} rounds older than remote forkpoint, using remote configs",
-                    remote_configs_threshold.0
-                );
+                let maybe_missing_epoch =
+                    remote_forkpoint_config
+                        .validator_sets
+                        .iter()
+                        .find_map(|locked_epoch| {
+                            remote_validators_config
+                                .get_validator_set(&locked_epoch.epoch)
+                                .is_none()
+                                .then_some(locked_epoch.epoch)
+                        });
+                if let Some(epoch) = maybe_missing_epoch {
+                    info!(
+                        "remote validators config missing validator set for remote forkpoint at epoch {}, using local configs",
+                        epoch
+                    );
+                    return Ok((local_forkpoint_config, local_validators_config));
+                } else {
+                    info!(
+                        ?remote_forkpoint_round,
+                        ?local_forkpoint_round,
+                        "local forkpoint over {} rounds older than remote forkpoint, using remote configs",
+                        remote_configs_threshold
+                    );
 
-                replace_local_configs(&remote_forkpoint_config, &remote_validators_config);
-                return Ok((remote_forkpoint_config, remote_validators_config));
+                    replace_local_configs(&remote_forkpoint_config, &remote_validators_config);
+                    return Ok((remote_forkpoint_config, remote_validators_config));
+                }
             }
 
             info!(

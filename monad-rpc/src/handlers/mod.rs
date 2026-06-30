@@ -17,7 +17,7 @@ use actix_web::{web, HttpResponse};
 use monad_tracing_timing::TimingSpanExtension;
 use monad_triedb_utils::triedb_env::Triedb;
 use serde_json::value::RawValue;
-use tracing::{debug, info, trace_span, Instrument, Span};
+use tracing::{debug, trace_span, Instrument, Span};
 use tracing_actix_web::RootSpan;
 
 use self::{
@@ -42,6 +42,7 @@ use self::{
             monad_eth_estimateGas, monad_eth_feeHistory, monad_eth_fillTransaction,
             monad_eth_gasPrice, monad_eth_maxPriorityFeePerGas,
         },
+        simulate::monad_simulate_v1,
         txn::{
             monad_eth_getLogs, monad_eth_getTransactionByBlockHashAndIndex,
             monad_eth_getTransactionByBlockNumberAndIndex, monad_eth_getTransactionByHash,
@@ -192,7 +193,7 @@ pub async fn rpc_handler(
     // log the request and response based on the response content
     match &response {
         ResponseWrapper::Single(resp) => match resp.error {
-            Some(_) => info!(?body, ?response, "rpc_request/response error"),
+            Some(_) => debug!(?body, ?response, "rpc_request/response error"),
             None => debug!(
                 ?body,
                 ?response,
@@ -385,6 +386,35 @@ async fn eth_call(
 }
 
 #[allow(non_snake_case)]
+async fn eth_simulateV1(
+    request_id: TimingRequestId,
+    app_state: &MonadRpcResources,
+    params: RequestParams<'_>,
+) -> Result<Box<RawValue>, JsonRpcError> {
+    let data_provider = app_state.data_provider.as_ref().method_not_supported()?;
+    let eth_call_handler = app_state.eth_call_handler.as_ref().method_not_supported()?;
+    let params = serde_json::from_str(params.get()).invalid_params()?;
+    let permit = eth_call_handler.acquire(request_id).await?;
+
+    permit
+        .execute(|config, executor| {
+            monad_simulate_v1(
+                data_provider,
+                executor,
+                app_state.chain_id,
+                // TODO(dhil): We use the eth call gas limit for individual calls within the simulation. We should consider adding more granular gas limits in the future.
+                config.provider_gas_limit_eth_call,
+                config.provider_gas_limit_eth_simulate,
+                config.provider_max_calls_eth_simulate,
+                config.provider_max_blocks_eth_simulate,
+                params,
+            )
+        })
+        .await
+        .map(serialize_result)?
+}
+
+#[allow(non_snake_case)]
 async fn eth_sendRawTransaction(
     _: TimingRequestId,
     app_state: &MonadRpcResources,
@@ -411,17 +441,19 @@ async fn eth_sendRawTransactionSync(
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    // Require both data_provider and txpool_bridge_client
     let txpool_bridge_client = app_state
         .txpool_bridge_client
         .as_ref()
         .method_not_supported()?;
-    let data_provider = app_state.data_provider.as_ref().method_not_supported()?;
+    let event_server_client = app_state
+        .event_server_client
+        .as_ref()
+        .method_not_supported()?;
     let params = serde_json::from_str(params.get()).invalid_params()?;
 
     monad_eth_sendRawTransactionSync(
         txpool_bridge_client,
-        data_provider,
+        event_server_client,
         params,
         app_state.chain_id,
         app_state.allow_unprotected_txs,
@@ -876,6 +908,7 @@ enabled_methods!(
     debug_traceCall,
     debug_traceTransaction,
     eth_call,
+    eth_simulateV1,
     eth_sendRawTransaction,
     eth_sendRawTransactionSync,
     eth_createAccessList,

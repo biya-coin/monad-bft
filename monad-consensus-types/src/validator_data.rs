@@ -13,21 +13,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::BTreeMap, error::Error, ops::Bound, path::Path};
+use std::{collections::BTreeMap, error::Error, path::Path};
 
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_types::{Epoch, ExecutionProtocol, LimitedVec, NodeId, Stake};
-use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
+use monad_validator::{
+    signature_collection::{SignatureCollection, SignatureCollectionPubKeyType},
+    validator_set::MAX_VALIDATOR_SET_SIZE,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::checkpoint::Checkpoint;
-
-/// Maximum validator set size with some additional buffer.
-/// Needs to be updated alongside constant in <execution>/monad/staking/util/constants.hpp
-pub const MAX_VALIDATORS: usize = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable)]
 pub struct ValidatorSetDataWithEpoch<SCT: SignatureCollection> {
@@ -44,7 +43,7 @@ pub struct ValidatorSetDataWithEpoch<SCT: SignatureCollection> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable)]
 pub struct ValidatorSetData<SCT: SignatureCollection>(
     #[serde(bound(serialize = "", deserialize = ""))]
-    pub LimitedVec<ValidatorData<SCT>, MAX_VALIDATORS>,
+    pub LimitedVec<ValidatorData<SCT>, MAX_VALIDATOR_SET_SIZE>,
 );
 
 #[derive(
@@ -117,31 +116,32 @@ impl<SCT: SignatureCollection> ValidatorsConfig<SCT> {
         })
     }
 
-    pub fn get_validator_set(&self, epoch: &Epoch) -> &ValidatorSetData<SCT> {
-        self.validators
-            .range((Bound::Included(Epoch(0)), Bound::Included(*epoch)))
-            .last()
-            .expect("no validator set <= block.epoch")
-            .1
+    pub fn get_validator_set(&self, epoch: &Epoch) -> Option<&ValidatorSetData<SCT>> {
+        self.validators.get(epoch)
     }
 
     pub fn get_locked_validator_sets<ST, EPT>(
         &self,
         forkpoint: &Checkpoint<ST, SCT, EPT>,
-    ) -> Vec<ValidatorSetDataWithEpoch<SCT>>
+    ) -> Result<Vec<ValidatorSetDataWithEpoch<SCT>>, Epoch>
     where
         ST: CertificateSignatureRecoverable,
         SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
         EPT: ExecutionProtocol,
     {
-        forkpoint
-            .validator_sets
-            .iter()
-            .map(|locked_epoch| ValidatorSetDataWithEpoch {
+        let mut validator_sets = Vec::new();
+        for locked_epoch in &forkpoint.validator_sets {
+            let validators = match self.get_validator_set(&locked_epoch.epoch) {
+                Some(v) => v.clone(),
+                None => return Err(locked_epoch.epoch),
+            };
+            validator_sets.push(ValidatorSetDataWithEpoch {
                 epoch: locked_epoch.epoch,
-                validators: self.get_validator_set(&locked_epoch.epoch).clone(),
-            })
-            .collect()
+                validators,
+            });
+        }
+
+        Ok(validator_sets)
     }
 }
 
@@ -180,6 +180,12 @@ impl<SCT: SignatureCollection> ValidatorSetData<SCT> {
     pub fn new(
         validators: Vec<(SCT::NodeIdPubKey, Stake, SignatureCollectionPubKeyType<SCT>)>,
     ) -> Self {
+        assert!(
+            validators.len() <= MAX_VALIDATOR_SET_SIZE,
+            "validator set size {} exceeds MAX_VALIDATOR_SET_SIZE {}",
+            validators.len(),
+            MAX_VALIDATOR_SET_SIZE,
+        );
         Self(
             validators
                 .into_iter()
@@ -268,4 +274,73 @@ where
         <SCT as SignatureCollection>::NodeIdPubKey::from_bytes(&bytes)
             .map_err(<D::Error as serde::de::Error>::custom)?,
     ))
+}
+
+#[cfg(test)]
+mod test {
+    use monad_crypto::NopSignature;
+    use monad_testutil::signing::MockSignatures;
+    use monad_types::{BlockId, Epoch, Hash, LimitedVec, Round};
+
+    use crate::{
+        block::MockExecutionProtocol,
+        checkpoint::{Checkpoint, LockedEpoch},
+        quorum_certificate::QuorumCertificate,
+        validator_data::{ValidatorSetData, ValidatorsConfig},
+        RoundCertificate,
+    };
+
+    type SignatureType = NopSignature;
+    type SignatureCollectionType = MockSignatures<SignatureType>;
+    type ExecutionProtocolType = MockExecutionProtocol;
+
+    #[test]
+    fn test_get_locked_validator_sets() {
+        let mut validators = std::collections::BTreeMap::new();
+        validators.insert(
+            Epoch(1),
+            ValidatorSetData::<SignatureCollectionType>(Default::default()),
+        );
+        validators.insert(
+            Epoch(2),
+            ValidatorSetData::<SignatureCollectionType>(Default::default()),
+        );
+        let validators_config = ValidatorsConfig { validators };
+
+        let forkpoint_success = Checkpoint {
+            root: BlockId(Hash::default()),
+            high_certificate: RoundCertificate::Qc(QuorumCertificate::genesis_qc()),
+            validator_sets: LimitedVec(vec![
+                LockedEpoch {
+                    epoch: Epoch(1),
+                    round: Round(10),
+                },
+                LockedEpoch {
+                    epoch: Epoch(2),
+                    round: Round(20),
+                },
+            ]),
+        };
+        assert!(validators_config
+            .get_locked_validator_sets::<SignatureType, ExecutionProtocolType>(&forkpoint_success)
+            .is_ok());
+
+        let forkpoint_failure = Checkpoint {
+            root: BlockId(Hash::default()),
+            high_certificate: RoundCertificate::Qc(QuorumCertificate::genesis_qc()),
+            validator_sets: LimitedVec(vec![
+                LockedEpoch {
+                    epoch: Epoch(2),
+                    round: Round(10),
+                },
+                LockedEpoch {
+                    epoch: Epoch(3),
+                    round: Round(20),
+                },
+            ]),
+        };
+        assert!(validators_config
+            .get_locked_validator_sets::<SignatureType, ExecutionProtocolType>(&forkpoint_failure)
+            .is_err_and(|missing_epoch| missing_epoch == Epoch(3)));
+    }
 }

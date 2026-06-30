@@ -13,564 +13,524 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::VecDeque, ops::Range};
 
+use alloy_primitives::U256;
 use bytes::BytesMut;
 use monad_crypto::certificate_signature::PubKey;
+use monad_raptor::r10::lt::MAX_TRIPLES;
 use monad_types::{NodeId, Stake};
-use rand::{rngs::StdRng, seq::SliceRandom as _, SeedableRng as _};
+use rand::{seq::SliceRandom as _, SeedableRng as _};
+use rand_chacha::ChaCha20Rng;
 
 use super::{BuildError, Chunk, Result};
-use crate::util::Recipient;
+use crate::util::{ensure, PrimaryBroadcastGroup, Recipient, Redundancy, SecondaryBroadcastGroup};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkOrder {
-    // A roughly GSO-concatenation friendly ordering, such that each
-    // recipients' chunks are continuous
-    GsoFriendly,
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct NodeIndex(usize);
 
-    // Each recipient receives chunks in round-robin order
-    RoundRobin,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkTarget {
+    // the first-hop recipient
+    node_index: NodeIndex,
+
+    // if None, rebroadcast to all other recipients. reserved for
+    // stake-proportional multicast rounding chunks.
+    rebroadcast_targets: Option<Vec<NodeIndex>>,
+}
+
+impl From<NodeIndex> for ChunkTarget {
+    fn from(value: NodeIndex) -> Self {
+        Self {
+            node_index: value,
+            rebroadcast_targets: None,
+        }
+    }
+}
+
+// A frozen ordered list of nodes, indexable by NodeIndex. Captures
+// the concept of "the recipient table for a ChunkAssignment".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderedNodes<PT: PubKey>(Box<[NodeId<PT>]>);
+
+impl<PT: PubKey> OrderedNodes<PT> {
+    pub fn singleton(node: NodeId<PT>) -> Self {
+        Self(Box::new([node]))
+    }
+
+    pub fn get(&self, index: NodeIndex) -> Option<&NodeId<PT>> {
+        self.0.get(index.0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (NodeIndex, &NodeId<PT>)> + '_ {
+        self.0.iter().enumerate().map(|(i, n)| (NodeIndex(i), n))
+    }
+}
+
+impl<PT: PubKey> FromIterator<NodeId<PT>> for OrderedNodes<PT> {
+    fn from_iter<I: IntoIterator<Item = NodeId<PT>>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+// A Partition produces a ChunkAssignment from its internal node set.
+pub(crate) trait Partition {
+    type PubKey: PubKey;
+
+    // [u8; 32] == <ChaCha20Rng as SeedableRng>::Seed
+    fn shuffle(&mut self, seed: [u8; 32]);
+
+    fn assign(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Result<ChunkAssignment<Self::PubKey>>;
+
+    fn num_chunks_hint(&self, num_base_symbols: usize, redundancy: Redundancy) -> Option<usize>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkSlice<'a, PT: PubKey> {
-    recipient: &'a Recipient<PT>,
-    chunk_id_range: Range<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkAssignment<'a, PT: PubKey> {
-    // The number of chunks (=packets) to be generated
-    total_chunks: usize,
-    assignments: Vec<ChunkSlice<'a, PT>>,
-
-    // The following fields are hints for performance optimization
-    // purposes. Unspecified or inaccurate hints will not result in
-    // faulty chunk generation.
-
-    // the order of the chunk slices, used in reordering
-    order: Option<ChunkOrder>,
-
-    // used in reordering allocation
-    num_recipients: Option<usize>,
-
-    // used in reused symbol encoding optimization
-    unique_symbol_id: Option<bool>,
-}
-
-type NodeHash<'a> = &'a [u8; 20];
-
-impl<'a, PT: PubKey> ChunkAssignment<'a, PT> {
-    fn empty() -> Self {
-        Self {
-            total_chunks: 0,
-            assignments: Vec::new(),
-
-            num_recipients: None,
-            order: None,
-            unique_symbol_id: None,
-        }
-    }
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            total_chunks: 0,
-            assignments: Vec::with_capacity(capacity),
-
-            num_recipients: None,
-            order: None,
-            unique_symbol_id: None,
-        }
-    }
-
-    fn hint_num_recipients(&mut self, num_recipients: usize) {
-        self.num_recipients = Some(num_recipients);
-    }
-
-    fn hint_unique_symbol_id(&mut self, unique: bool) {
-        self.unique_symbol_id = Some(unique);
-    }
-
-    fn hint_order(&mut self, order: ChunkOrder) {
-        self.order = Some(order);
-    }
-
-    pub fn total_chunks(&self) -> usize {
-        self.total_chunks
-    }
-
-    // Return true if the generated chunk each has unique chunk id.
-    // Used to provide hint for optimized symbol encoding.
-    pub fn unique_chunk_id(&self) -> bool {
-        self.unique_symbol_id.unwrap_or(false)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total_chunks == 0
-    }
-
-    fn push(&mut self, recipient: &'a Recipient<PT>, chunk_id_range: Range<usize>) {
-        let slice = ChunkSlice {
-            recipient,
-            chunk_id_range,
-        };
-        self.push_slice(slice);
-    }
-
-    fn push_slice(&mut self, slice: ChunkSlice<'a, PT>) {
-        if slice.chunk_id_range.is_empty() {
-            return;
-        }
-
-        self.total_chunks += slice.chunk_id_range.len();
-
-        // we expect no allocation to occur for performance reasons.
-        debug_assert!(self.assignments.len() < self.assignments.capacity());
-        self.assignments.push(slice);
-    }
-
-    pub fn ensure_order(&mut self, expected_order: Option<ChunkOrder>) {
-        let Some(expected_order) = expected_order else {
-            // no order specified, nothing to do.
-            return;
-        };
-
-        if self.order.is_some_and(|o| o == expected_order) {
-            // already in the expected order, nothing to do.
-            return;
-        }
-
-        if self.assignments.is_empty() {
-            // empty assignment is compatible with any ordering
-            self.order = Some(expected_order);
-            return;
-        }
-
-        match expected_order {
-            ChunkOrder::GsoFriendly => {
-                self.assignments = Self::reorder_to_gso(
-                    std::mem::take(&mut self.assignments),
-                    self.num_recipients,
-                );
-            }
-            ChunkOrder::RoundRobin => {
-                self.assignments = Self::reorder_to_round_robin(
-                    std::mem::take(&mut self.assignments),
-                    self.total_chunks,
-                );
-            }
-        }
-    }
-
-    // This method is best effort, as it may not always produce the
-    // optimal GSO grouping if the chunk slices's chunk range are not
-    // ordered.
-    fn reorder_to_gso(
-        chunk_slices: Vec<ChunkSlice<'a, PT>>,
-        hint_num_recipients: Option<usize>,
-    ) -> Vec<ChunkSlice<'a, PT>> {
-        use std::collections::hash_map::Entry;
-
-        let num_recipients = hint_num_recipients.unwrap_or(chunk_slices.len());
-        let mut messages: HashMap<NodeHash, (&'a Recipient<_>, Vec<Range<usize>>)> =
-            HashMap::with_capacity(num_recipients);
-
-        let mut out_slices_count = 0;
-
-        for chunk_slice in chunk_slices {
-            let recipient = chunk_slice.recipient;
-            let key = recipient.node_hash();
-
-            match messages.entry(key) {
-                Entry::Vacant(e) => {
-                    out_slices_count += 1;
-                    e.insert((recipient, vec![chunk_slice.chunk_id_range]));
-                }
-                Entry::Occupied(mut e) => {
-                    let (_recipient, ranges) = e.get_mut();
-                    let last = ranges.last_mut().expect("occupied entry never empty");
-                    if last.end == chunk_slice.chunk_id_range.start {
-                        last.end = chunk_slice.chunk_id_range.end;
-                        continue;
-                    }
-
-                    out_slices_count += 1;
-                    ranges.push(chunk_slice.chunk_id_range);
-                }
-            }
-        }
-
-        let mut reordered = Vec::with_capacity(out_slices_count);
-        for (recipient, ranges) in messages.into_values() {
-            for range in ranges {
-                reordered.push(ChunkSlice {
-                    recipient,
-                    chunk_id_range: range,
-                });
-            }
-        }
-        reordered
-    }
-
-    fn reorder_to_round_robin(
-        chunk_slices: Vec<ChunkSlice<'a, PT>>,
-        total_chunks: usize,
-    ) -> Vec<ChunkSlice<'a, PT>> {
-        use std::collections::{BTreeMap, VecDeque};
-
-        let mut buckets: BTreeMap<NodeHash, VecDeque<ChunkSlice<_>>> = BTreeMap::new();
-
-        // Group by recipients
-        for slice in chunk_slices {
-            buckets
-                .entry(slice.recipient.node_hash())
-                .or_default()
-                .push_back(slice);
-        }
-
-        // Each recipient get their own queue of chunks.
-        let mut queues: Vec<VecDeque<ChunkSlice<_>>> = buckets.into_values().collect();
-
-        // Optimized algorithm:
-        //
-        // 1. go through each recipient's queue in order
-        // 2. if the queue is not empty, add the front chunk into the output
-        // 3. otherwise, delete the empty queue from the Vec of queues
-        // 4. repeat until there is no queue left
-        let mut output = Vec::with_capacity(total_chunks);
-
-        while !queues.is_empty() {
-            queues.retain_mut(|queue| {
-                let Some(front) = queue.front_mut() else {
-                    return false; // drop the empty queue
-                };
-
-                if front.chunk_id_range.is_empty() {
-                    queue.pop_front();
-                    return !queue.is_empty(); // drop queue if empty
-                }
-
-                let start = front.chunk_id_range.start;
-                let chunk_id_range = start..(start + 1);
-                front.chunk_id_range.start = start + 1;
-
-                output.push(ChunkSlice {
-                    recipient: front.recipient,
-                    chunk_id_range,
-                });
-
-                true // keep the non-empty queue
-            });
-        }
-
-        output
-    }
-
-    pub fn generate(&self, segment_len: usize) -> Vec<Chunk<PT>> {
-        let mut buffer = BytesMut::zeroed(self.total_chunks * segment_len);
-        let mut all_chunks = Vec::with_capacity(self.total_chunks);
-
-        for slice in &self.assignments {
-            split_off_chunks_into(
-                &mut all_chunks,
-                &mut buffer,
-                slice.recipient,
-                slice.chunk_id_range.clone(),
-                segment_len,
-            );
-        }
-
-        debug_assert_eq!(all_chunks.len(), self.total_chunks);
-        debug_assert!(buffer.is_empty());
-
-        all_chunks
-    }
-
-    // Two assignments are equivalent if their normalized chunks are
-    // equal. Used in testing.
+pub struct ChunkAssignment<PT: PubKey> {
+    // mapping from NodeIndex to NodeId. The ordering is frozen on
+    // assignment.
     //
-    // Internally, it breaks down the underlying chunk slices into a
-    // single-chunk slices and sorted in a consistent order.
-    #[cfg(test)]
-    pub fn normalized_chunks(&self) -> Vec<ChunkSlice<'a, PT>> {
-        let mut slices = Vec::with_capacity(self.total_chunks);
-        for slice in &self.assignments {
-            for chunk_id in slice.chunk_id_range.clone() {
-                slices.push(ChunkSlice {
-                    recipient: slice.recipient,
-                    chunk_id_range: chunk_id..(chunk_id + 1),
-                })
-            }
-        }
-        slices.sort_unstable_by_key(|s| (s.chunk_id_range.start, s.recipient.node_hash()));
-        slices
-    }
+    // Invariant: every target.node_index is < nodes.len().
+    nodes: OrderedNodes<PT>,
+
+    // mapping from chunk_id to the target node
+    targets: Vec<ChunkTarget>,
 }
 
-pub(crate) struct Replicated<PT: PubKey> {
-    // each recipient receives all the same chunks, used by broadcast
-    // target and point-to-point target
-    recipients: Vec<Recipient<PT>>,
-}
-
-impl<PT: PubKey> Replicated<PT> {
-    pub fn from_broadcast(recipients: impl IntoIterator<Item = NodeId<PT>>) -> Self {
+impl<PT: PubKey> ChunkAssignment<PT> {
+    fn with_capacity(capacity: usize, nodes: OrderedNodes<PT>) -> Self {
         Self {
-            recipients: recipients.into_iter().map(Recipient::new).collect(),
-        }
-    }
-}
-
-pub(crate) trait ChunkAssigner<PT: PubKey> {
-    fn assign_chunks(
-        &self,
-        num_symbols: usize,
-        preferred_order: Option<ChunkOrder>,
-    ) -> Result<ChunkAssignment<'_, PT>>;
-}
-
-impl<PT: PubKey> ChunkAssigner<PT> for Replicated<PT> {
-    fn assign_chunks(
-        &self,
-        num_symbols: usize,
-        preferred_order: Option<ChunkOrder>,
-    ) -> Result<ChunkAssignment<'_, PT>> {
-        if self.recipients.is_empty() {
-            tracing::warn!("no recipients specified for chunk assigner");
-            return Ok(ChunkAssignment::empty());
-        }
-
-        let total_chunks = num_symbols * self.recipients.len();
-        let mut assignment;
-
-        match preferred_order {
-            None | Some(ChunkOrder::GsoFriendly) => {
-                assignment = ChunkAssignment::with_capacity(self.recipients.len());
-                assignment.hint_order(ChunkOrder::GsoFriendly);
-                for recipient in &self.recipients {
-                    assignment.push(recipient, 0..num_symbols);
-                }
-            }
-            Some(ChunkOrder::RoundRobin) => {
-                assignment = ChunkAssignment::with_capacity(total_chunks);
-                assignment.hint_order(ChunkOrder::RoundRobin);
-                for chunk_id in 0..num_symbols {
-                    for recipient in &self.recipients {
-                        assignment.push(recipient, chunk_id..(chunk_id + 1));
-                    }
-                }
-            }
-        };
-
-        debug_assert_eq!(assignment.total_chunks(), total_chunks);
-        assignment.hint_num_recipients(self.recipients.len());
-        assignment.hint_unique_symbol_id(self.recipients.len() <= 1);
-        Ok(assignment)
-    }
-}
-
-pub(crate) struct Partitioned<PT: PubKey> {
-    weighted_nodes: Vec<(Recipient<PT>, Stake)>,
-    total_stake: Stake,
-}
-
-impl<PT: PubKey> Partitioned<PT> {
-    // This assigner is only used for full-node raptorcast, which is
-    // based on homogeneous peers. RaptorCast between validators has
-    // switched to StakeBasedWithRC assigner.
-    #[cfg_attr(not(test), expect(unused))]
-    pub fn from_validator_set(validator_set: Vec<(NodeId<PT>, Stake)>) -> Self {
-        let mut total_stake = Stake::ZERO;
-        let weighted_nodes = validator_set
-            .into_iter()
-            .map(|(nid, stake)| {
-                total_stake += stake;
-                (Recipient::new(nid), stake)
-            })
-            .collect();
-
-        Self {
-            weighted_nodes,
-            total_stake,
+            nodes,
+            targets: Vec::with_capacity(capacity),
         }
     }
 
-    pub fn from_homogeneous_peers(peers: Vec<NodeId<PT>>) -> Self {
-        let weighted_nodes: Vec<_> = peers
-            .into_iter()
-            .map(|p| (Recipient::new(p), Stake::ONE))
-            .collect();
-        let total_stake = Stake::from(weighted_nodes.len() as u64);
-        Self {
-            weighted_nodes,
-            total_stake,
-        }
-    }
-
-    fn assign_gso(&self, num_symbols: usize) -> ChunkAssignment<'_, PT> {
-        let num_nodes = self.weighted_nodes.len();
-        let mut assignment = ChunkAssignment::with_capacity(num_nodes);
-        assignment.hint_order(ChunkOrder::GsoFriendly);
-        assignment.hint_num_recipients(num_nodes);
-        assignment.hint_unique_symbol_id(true);
-
-        let mut running_stake = Stake::ZERO;
-        for (recipient, stake) in &self.weighted_nodes {
-            let start_id = (num_symbols as f64 * (running_stake / self.total_stake)) as usize;
-            running_stake += *stake;
-            let end_id = (num_symbols as f64 * (running_stake / self.total_stake)) as usize;
-            assignment.push(recipient, start_id..end_id);
-        }
-
+    pub fn unicast(recipient: NodeId<PT>, num_chunks: usize) -> Self {
+        let mut assignment = Self::with_capacity(num_chunks, OrderedNodes::singleton(recipient));
+        assignment.push_range(NodeIndex(0), 0..num_chunks);
         assignment
     }
-}
 
-impl<PT: PubKey> ChunkAssigner<PT> for Partitioned<PT> {
-    fn assign_chunks(
-        &self,
-        num_symbols: usize,
-        _preferred_order: Option<ChunkOrder>,
-    ) -> Result<ChunkAssignment<'_, PT>> {
-        if self.weighted_nodes.is_empty() {
-            tracing::warn!("no nodes specified for partitioned chunk assigner");
-            return Ok(ChunkAssignment::empty());
+    pub fn num_chunks(&self) -> usize {
+        self.targets.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    fn push_range(&mut self, target: impl Into<ChunkTarget>, chunk_id_range: Range<usize>) {
+        assert_eq!(chunk_id_range.start, self.targets.len());
+
+        let target = target.into();
+        assert!(target.node_index.0 < self.nodes.len());
+
+        for _ in chunk_id_range {
+            self.targets.push(target.clone());
         }
-        if self.total_stake == Stake::ZERO {
-            return Err(BuildError::ZeroTotalStake);
+    }
+
+    fn push(&mut self, target: impl Into<ChunkTarget>, chunk_id: usize) {
+        assert_eq!(chunk_id, self.targets.len());
+
+        let target = target.into();
+        assert!(target.node_index.0 < self.nodes.len());
+
+        self.targets.push(target);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &ChunkTarget)> {
+        self.targets.iter().enumerate()
+    }
+
+    // Resolve the target information for a given chunk_id. Returns
+    // None if chunk_id is out of range.
+    pub fn resolve_chunk_id(&self, chunk_id: usize) -> Option<ChunkRouting<'_, PT>> {
+        let target = self.targets.get(chunk_id)?;
+        let recipient = self.nodes.get(target.node_index)?;
+        Some(ChunkRouting {
+            recipient,
+            target,
+            nodes: &self.nodes,
+        })
+    }
+
+    pub(crate) fn materialize(&self, segment_len: usize) -> Result<Vec<Chunk<PT>>> {
+        if self.targets.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(self.assign_gso(num_symbols))
+        ensure!(self.num_chunks() <= MAX_TRIPLES, BuildError::TooManyChunks);
+
+        let mut chunks = Vec::with_capacity(self.num_chunks());
+        let mut buffer = BytesMut::zeroed(self.num_chunks() * segment_len);
+        let mut recipients = vec![None; self.nodes.len()];
+
+        for (chunk_id, target) in self.iter() {
+            assert!(target.node_index.0 < recipients.len());
+            // SAFETY: guaranteed by the invariant on target.node_index
+            let node_id = self
+                .nodes
+                .get(target.node_index)
+                .expect("invalid target node index");
+            let recipient = recipients[target.node_index.0]
+                .get_or_insert_with(|| Recipient::new(*node_id))
+                .clone();
+
+            let payload = buffer.split_to(segment_len);
+            let chunk = Chunk::new(chunk_id, recipient, payload);
+            chunks.push(chunk);
+        }
+
+        debug_assert_eq!(chunks.len(), self.num_chunks());
+        debug_assert_eq!(buffer.len(), 0);
+
+        Ok(chunks)
     }
 }
 
-// each validator gets an additional rounding chunk
-pub(crate) struct StakeBasedWithRC<PT: PubKey> {
-    validator_set: Vec<(Recipient<PT>, Stake)>,
+// Resolved routing for a single chunk, used to get the first-hop
+// recipient and the rebroadcast targets.
+pub struct ChunkRouting<'a, PT: PubKey> {
+    recipient: &'a NodeId<PT>,
+    target: &'a ChunkTarget,
+    nodes: &'a OrderedNodes<PT>,
+}
+
+impl<'a, PT: PubKey> ChunkRouting<'a, PT> {
+    pub fn recipient(&self) -> &NodeId<PT> {
+        self.recipient
+    }
+
+    pub fn rebroadcast_targets(&self) -> Vec<NodeId<PT>> {
+        let recipient_idx = self.target.node_index;
+        match &self.target.rebroadcast_targets {
+            None => self
+                .nodes
+                .iter()
+                .filter(|(idx, _)| *idx != recipient_idx)
+                .map(|(_, node_id)| *node_id)
+                .collect(),
+            Some(indices) => indices
+                .iter()
+                .filter(|idx| **idx != recipient_idx)
+                .filter_map(|idx| self.nodes.get(*idx).copied())
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct EvenPartition<PT: PubKey> {
+    nodes: Vec<NodeId<PT>>,
+}
+
+impl<PT: PubKey> EvenPartition<PT> {
+    #[cfg(test)]
+    pub fn new(nodes: Vec<NodeId<PT>>) -> Self {
+        Self { nodes }
+    }
+
+    pub fn from_group(group: &SecondaryBroadcastGroup<'_, PT>) -> Self {
+        Self {
+            nodes: group.iter().cloned().collect(),
+        }
+    }
+
+    fn snapshot_nodes(&self) -> OrderedNodes<PT> {
+        self.nodes.iter().copied().collect()
+    }
+}
+
+impl<PT: PubKey> Partition for EvenPartition<PT> {
+    type PubKey = PT;
+
+    fn shuffle(&mut self, seed: [u8; 32]) {
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        self.nodes.shuffle(&mut rng);
+    }
+
+    fn assign(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Result<ChunkAssignment<PT>> {
+        let num_symbols = redundancy
+            .scale(num_base_symbols)
+            .ok_or(BuildError::TooManyChunks)?;
+        let num_nodes = self.nodes.len();
+        let mut assignment = ChunkAssignment::with_capacity(num_symbols, self.snapshot_nodes());
+        if num_nodes == 0 {
+            tracing::warn!("no nodes specified for even partition chunk assigner");
+            return Ok(assignment);
+        }
+
+        for chunk_id in 0..num_symbols {
+            let target = NodeIndex(chunk_id % num_nodes);
+            assignment.push(target, chunk_id);
+        }
+
+        Ok(assignment)
+    }
+
+    fn num_chunks_hint(&self, num_base_symbols: usize, redundancy: Redundancy) -> Option<usize> {
+        even_partition_num_chunks(num_base_symbols, redundancy)
+    }
+}
+
+#[inline(always)]
+pub fn even_partition_num_chunks(num_base_symbols: usize, redundancy: Redundancy) -> Option<usize> {
+    // EvenPartition::assign emits exactly redundancy.scale(num_base_symbols)
+    // chunks regardless of group size.
+    redundancy.scale(num_base_symbols)
+}
+
+// Proportional to stake, plus each validator gets an optional
+// rounding chunk
+pub(crate) struct StakePartition<PT: PubKey> {
+    // Validator set with the publisher node excluded.
+    //
+    // Invariant: all stake must be non-zero
+    validators: Vec<(NodeId<PT>, Stake)>,
+
+    // Invariant: total_stake == sum of validators' stakes
+    // Invariant: validators.is_empty() iff total_stake == Stake::ZERO
+    // (i.e. singleton validator set)
     total_stake: Stake,
 }
 
-impl<PT: PubKey> StakeBasedWithRC<PT> {
+#[inline(always)]
+pub fn stake_partition_num_chunks_hint(
+    num_base_symbols: usize,
+    redundancy: Redundancy,
+    group_size: usize,
+) -> Option<usize> {
+    let num_validators = group_size.checked_sub(1)?; // exclude author
+    let num_scaled_symbols = redundancy.scale(num_base_symbols)?;
+    num_scaled_symbols.checked_add(num_validators)
+}
+
+impl<PT: PubKey> Partition for StakePartition<PT> {
+    type PubKey = PT;
+
     // Shuffle the validator stake map for chunk assignment. This uses
-    // a deterministic seed, as in the future, it will be required
-    // that the leader and all validators compute the shuffling in the
-    // same way (for features not yet implemented).  In the future,
-    // this should be done using known shuffling algorithm to allow
-    // for easy implementation in other languages, e.g., using Mt19937
-    // and Fisher Yates shuffle.
-    pub fn shuffle_validators(validators: &mut [(NodeId<PT>, Stake)], seed: [u8; 32]) {
-        let mut rng = StdRng::from_seed(seed);
-        validators.shuffle(&mut rng);
+    // a deterministic seed. It is required that the publisher and all
+    // validators compute the shuffling using the same seed and
+    // algorithm for deterministic raptorcast.
+    fn shuffle(&mut self, seed: [u8; 32]) {
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        self.validators.shuffle(&mut rng);
     }
 
-    pub fn from_validator_set(validator_set: Vec<(NodeId<PT>, Stake)>) -> Self {
-        let mut total_stake = Stake::ZERO;
-        let validator_set: Vec<_> = validator_set
-            .into_iter()
-            .map(|(nid, stake)| {
-                total_stake += stake;
-                (Recipient::new(nid), stake)
-            })
-            .collect();
+    fn assign(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Result<ChunkAssignment<PT>> {
+        self.assign(num_base_symbols, redundancy)
+    }
 
-        Self {
-            validator_set,
-            total_stake,
-        }
+    fn num_chunks_hint(&self, num_base_symbols: usize, redundancy: Redundancy) -> Option<usize> {
+        self.num_chunks_hint(num_base_symbols, redundancy)
     }
 }
 
-impl<PT: PubKey> ChunkAssigner<PT> for StakeBasedWithRC<PT> {
-    fn assign_chunks(
+impl<PT: PubKey> StakePartition<PT> {
+    pub fn from_group(group: &PrimaryBroadcastGroup<'_, PT>) -> Self {
+        let mut total_stake = Stake::ZERO;
+        let mut validators = Vec::with_capacity(group.len().into());
+
+        for (node, stake) in group.iter() {
+            if node == group.author() {
+                // skip author
+                continue;
+            }
+            // stake is guaranteed to be non-zero from PrimaryBroadcastGroup's invariant.
+            debug_assert!(!stake.0.is_zero());
+            validators.push((*node, *stake));
+            total_stake += *stake;
+        }
+
+        Self {
+            validators,
+            total_stake,
+        }
+    }
+
+    #[cfg(test)]
+    // accepts u64/U256 as stake
+    fn from_stakes<T>(validators: Vec<(NodeId<PT>, T)>) -> Self
+    where
+        // Use TryInto instead of Into as U256 does not implement
+        // From<u64>.
+        T: TryInto<U256>,
+    {
+        let validators: Vec<_> = validators
+            .into_iter()
+            .map(|(n, s)| {
+                let s = s.try_into().ok().unwrap();
+                assert!(!s.is_zero());
+                (n, Stake(s))
+            })
+            .collect();
+        let total_stake = validators.iter().map(|(_, s)| *s).sum::<Stake>();
+        Self {
+            validators,
+            total_stake,
+        }
+    }
+
+    fn snapshot_nodes(&self) -> OrderedNodes<PT> {
+        self.validators.iter().map(|(n, _)| *n).collect()
+    }
+
+    pub fn assign(
         &self,
-        num_symbols: usize,
-        _preferred_order: Option<ChunkOrder>,
-    ) -> Result<ChunkAssignment<'_, PT>> {
-        if self.validator_set.is_empty() {
-            tracing::warn!("no nodes specified for partitioned chunk assigner");
-            return Ok(ChunkAssignment::empty());
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Result<ChunkAssignment<PT>> {
+        if self.validators.is_empty() {
+            return Ok(ChunkAssignment::with_capacity(0, self.snapshot_nodes()));
         }
-        if self.total_stake == Stake::ZERO {
-            return Err(BuildError::ZeroTotalStake);
-        }
+        self.assign_round_robin(num_base_symbols, redundancy)
+            .ok_or(BuildError::TooManyChunks)
+    }
 
-        let num_validators = self.validator_set.len();
-        let obligations = self
-            .validator_set
-            .iter()
-            .map(|(_, s)| num_symbols as f64 * (*s / self.total_stake));
+    pub fn num_chunks_hint(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Option<usize> {
+        let group_size = self.validators.len() + 1; // add back the author
+        stake_partition_num_chunks_hint(num_base_symbols, redundancy, group_size)
+    }
 
-        let mut ic = vec![0usize; num_validators];
-        let mut rc = vec![false; num_validators];
+    // Compute O = num_scaled_symbols * stake / total_stake, split the
+    // result into the number of whole chunks (floor(O)) and the
+    // remainder (num_scaled_symbols * stake % total_stake).
+    //
+    // Returns None on overflow.
+    fn obligation(&self, num_scaled_symbols: usize, stake: Stake) -> Option<(usize, Stake)> {
+        let stake = stake.0;
+        debug_assert!(!stake.is_zero());
+        let prod = stake.checked_mul(U256::from(num_scaled_symbols))?;
 
-        for (i, o) in obligations.enumerate() {
-            ic[i] = o as usize; // ic := floor(o)
-            rc[i] = o.fract() > 0.0; // rc := ceil(o - floor(o))
-        }
+        let total = self.total_stake.0;
+        debug_assert!(!total.is_zero());
 
-        let mut assignment = ChunkAssignment::with_capacity(num_validators * 2);
-        assignment.hint_order(ChunkOrder::GsoFriendly);
-        assignment.hint_num_recipients(num_validators);
-        assignment.hint_unique_symbol_id(true);
+        // SAFETY: obligation getting called implies the presence of
+        // at least one validator in `validators`, thus we must have
+        // total_stake > 0 from the invariant.
+        let (quo, rem) = prod.div_rem(total);
+        let quo = quo.try_into().ok()?;
+        let rem = Stake(rem);
+        Some((quo, rem))
+    }
+
+    #[cfg(test)]
+    // Returns None on overflow.
+    fn assign_proportional(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Option<ChunkAssignment<PT>> {
+        let capacity = self.num_chunks_hint(num_base_symbols, redundancy)?;
+        let num_scaled_symbols = redundancy.scale(num_base_symbols)?;
+        let mut assignment = ChunkAssignment::with_capacity(capacity, self.snapshot_nodes());
 
         let mut curr_chunk_id = 0;
-        for (i, (recipient, _stake)) in self.validator_set.iter().enumerate() {
-            let next_chunk_id = curr_chunk_id + ic[i] + rc[i] as usize;
-            assignment.push(recipient, curr_chunk_id..next_chunk_id);
+        for (i, (_node_id, stake)) in self.validators.iter().enumerate() {
+            let (whole_chunks, remainder) = self.obligation(num_scaled_symbols, *stake)?;
+            // 1 if there's a non-zero remainder, else 0
+            let rounding_chunks = (!remainder.0.is_zero()) as usize;
+            let next_chunk_id = curr_chunk_id + whole_chunks + rounding_chunks;
+            // TODO(xinyuan): restrict rebroadcast targets for rounding chunks
+            assignment.push_range(NodeIndex(i), curr_chunk_id..next_chunk_id);
             curr_chunk_id = next_chunk_id;
         }
 
-        Ok(assignment)
+        assert!(assignment.num_chunks() >= num_scaled_symbols);
+        assert!(assignment.num_chunks() <= capacity);
+
+        Some(assignment)
     }
-}
 
-fn split_off_chunks_into<PT: PubKey>(
-    output: &mut Vec<Chunk<PT>>,
-    buffer: &mut BytesMut,
-    recipient: &Recipient<PT>,
-    chunk_ids: Range<usize>,
-    segment_len: usize,
-) {
-    debug_assert!(
-        buffer.len() >= segment_len * chunk_ids.len(),
-        "insufficient buffer space"
-    );
+    // Returns None on overflow.
+    fn assign_round_robin(
+        &self,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+    ) -> Option<ChunkAssignment<PT>> {
+        let capacity = self.num_chunks_hint(num_base_symbols, redundancy)?;
+        let num_scaled_symbols = redundancy.scale(num_base_symbols)?;
+        let mut assignment = ChunkAssignment::with_capacity(capacity, self.snapshot_nodes());
 
-    for chunk_id in chunk_ids {
-        let segment = buffer.split_to(segment_len);
-        let chunk = Chunk::new(chunk_id, recipient.clone(), segment);
-        output.push(chunk);
+        let mut remaining: VecDeque<(NodeIndex, usize)> =
+            VecDeque::with_capacity(self.validators.len());
+        for (i, (_node_id, stake)) in self.validators.iter().enumerate() {
+            let (whole_chunks, remainder) = self.obligation(num_scaled_symbols, *stake)?;
+            // 1 if there's a non-zero remainder, else 0
+            let rounding_chunks = (!remainder.0.is_zero()) as usize;
+            let obligation = whole_chunks + rounding_chunks;
+            // TODO(xinyuan): restrict rebroadcast targets for rounding chunks
+            remaining.push_back((NodeIndex(i), obligation));
+        }
+
+        let mut chunk_id = 0;
+        while !remaining.is_empty() {
+            // optimization to avoid iterating over the whole list
+            // when only one validator has remaining obligation
+            if remaining.len() == 1 {
+                let (node_idx, rem) = remaining.pop_front().unwrap();
+                assignment.push_range(node_idx, chunk_id..(chunk_id + rem));
+                break;
+            }
+
+            remaining.retain_mut(|(node_idx, rem)| {
+                if *rem == 0 {
+                    return false;
+                }
+                assignment.push(*node_idx, chunk_id);
+                *rem -= 1;
+                chunk_id += 1;
+                *rem > 0
+            })
+        }
+
+        assert!(assignment.num_chunks() >= num_scaled_symbols);
+        assert!(assignment.num_chunks() <= capacity);
+
+        Some(assignment)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{BTreeSet, HashMap},
-        ops::Range,
-    };
+    use std::collections::HashMap;
 
-    use alloy_primitives::U256;
-    use itertools::Itertools as _;
-    use monad_crypto::certificate_signature::CertificateSignaturePubKey;
+    use alloy_primitives::{utils::parse_ether, U256};
+    use monad_crypto::certificate_signature::{CertificateSignaturePubKey, PubKey};
     use monad_secp::SecpSignature;
     use monad_testutil::signing::get_key;
     use monad_types::{NodeId, Stake};
-    use rand::{seq::SliceRandom, Rng};
-    use rand_distr::{Distribution, Normal};
+    use monad_validator::validator_set::MAX_VALIDATOR_SET_SIZE;
+    use rstest::rstest;
 
-    use super::{ChunkAssignment, ChunkOrder, Partitioned, StakeBasedWithRC};
+    use super::{ChunkAssignment, EvenPartition, NodeIndex, Partition, StakePartition};
     use crate::{
-        packet::{assigner::Replicated, regular, ChunkAssigner as _},
-        util::{Recipient, Redundancy},
+        packet::{assigner::stake_partition_num_chunks_hint, BuildError, Result},
+        util::Redundancy,
     };
 
-    const DEFAULT_SEGMENT_LEN: usize = 1400;
-    const DEFAULT_MERKLE_TREE_DEPTH: u8 = 6;
-    const DEFAULT_LAYOUT: regular::PacketLayout =
-        regular::PacketLayout::new(DEFAULT_SEGMENT_LEN, DEFAULT_MERKLE_TREE_DEPTH);
-    const DEFAULT_SYMBOL_LEN: usize = DEFAULT_LAYOUT.symbol_len();
+    const R3: Redundancy = Redundancy::from_u8(3);
 
     type ST = SecpSignature;
     type PT = CertificateSignaturePubKey<ST>;
@@ -581,341 +541,673 @@ mod tests {
         NodeId::new(key_pair.pubkey())
     }
 
-    struct StaticAssigner {
-        slices: Vec<(Recipient<PT>, Range<usize>)>,
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
+
+    // Count how many chunks each NodeIndex receives in an assignment.
+    fn chunk_counts<PT: PubKey>(assignment: &ChunkAssignment<PT>) -> HashMap<usize, usize> {
+        let mut counts = HashMap::new();
+        for (_, target) in assignment.iter() {
+            *counts.entry(target.node_index.0).or_default() += 1;
+        }
+        counts
     }
 
-    impl StaticAssigner {
-        fn from_template(slices: &[(NodeNum, Range<usize>)]) -> Self {
-            let recipients: HashMap<NodeNum, Recipient<_>> = slices
-                .iter()
-                .map(|(n, _)| n)
-                .unique()
-                .map(|n| (*n, Recipient::new(node_id(*n))))
-                .collect();
-            let slices = slices
-                .iter()
-                .map(|(n, range)| (recipients[n].clone(), range.clone()))
-                .collect();
-            Self { slices }
-        }
-
-        fn assign_chunks(&self) -> ChunkAssignment<'_, PT> {
-            let mut assignment = ChunkAssignment::with_capacity(self.slices.len());
-            for slice in &self.slices {
-                assignment.push(&slice.0, slice.1.clone());
-            }
-            assignment
+    // Assert chunk_ids are contiguous from 0..num_chunks.
+    fn assert_contiguous<PT: PubKey>(assignment: &ChunkAssignment<PT>) {
+        for (i, (chunk_id, _)) in assignment.iter().enumerate() {
+            assert_eq!(chunk_id, i, "chunk_ids must be contiguous from 0");
         }
     }
 
-    fn rand_validator_set(rng: &mut impl rand::Rng, max_n: usize) -> Vec<(NodeId<PT>, Stake)> {
-        let n: usize = rng.gen_range(1..=max_n);
-        let mut validator_set = Vec::with_capacity(n);
-
-        let mon = U256::from(1_000_000_000_000_000_000u64);
-        let min_stake = mon * U256::from(100_000); // approximated
-        let mean = f64::from(min_stake * U256::from(100)); // estimated
-        let std_dev = f64::from(mon * U256::from(500_000)); // estimated
-        let stake_distr = Normal::new(mean, std_dev).unwrap();
-
-        loop {
-            let mut total_stake = Stake::ZERO;
-
-            for i in 1..=n {
-                let stake = stake_distr.sample(rng).max(f64::from(min_stake));
-                let stake = Stake::from(u256_from_f64_lossy(stake));
-
-                // NOTE: we don't forbid individual stake to be zero,
-                // as long as total stake is non-zero. we do this to
-                // test the robustness of assignment algorithm.
-                total_stake += stake;
-                validator_set.push((node_id(i as u64), stake));
-            }
-
-            if total_stake != Stake::ZERO {
-                break;
-            }
+    // Assert all node indices in an assignment are within bounds.
+    fn assert_indices_valid<PT: PubKey>(assignment: &ChunkAssignment<PT>, num_nodes: usize) {
+        for (_, target) in assignment.iter() {
+            assert!(
+                target.node_index.0 < num_nodes,
+                "node_index {} out of bounds (num_nodes={})",
+                target.node_index.0,
+                num_nodes,
+            );
         }
-
-        validator_set.shuffle(rng);
-        validator_set
     }
 
-    fn rand_node_set(rng: &mut impl rand::Rng, max_n: usize) -> Vec<NodeId<PT>> {
-        let n: usize = rng.gen_range(1..=max_n);
-        let mut node_set = Vec::with_capacity(n);
+    // ---------------------------------------------------------------
+    // ChunkAssignment::unicast
+    // ---------------------------------------------------------------
 
-        for i in 1..=n {
-            node_set.push(node_id(i as u64));
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(100)]
+    fn test_unicast(#[case] num_chunks: usize) {
+        let assignment = ChunkAssignment::unicast(node_id(0), num_chunks);
+        assert_eq!(assignment.num_chunks(), num_chunks);
+        assert_contiguous(&assignment);
+        // all chunks target NodeIndex(0)
+        for (_, target) in assignment.iter() {
+            assert_eq!(target.node_index, NodeIndex(0));
         }
+    }
 
-        node_set.shuffle(rng);
-        node_set
+    // ---------------------------------------------------------------
+    // ChunkAssignment::materialize
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_materialize_single_node() {
+        let node = node_id(1);
+        let assignment = ChunkAssignment::unicast(node, 3);
+        let chunks = assignment.materialize(64).unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_id(), i);
+            assert_eq!(chunk.recipient().node_id(), &node);
+            assert_eq!(chunk.payload().len(), 64);
+        }
     }
 
     #[test]
-    fn test_replicated_assignment() {
-        let rng = &mut rand::thread_rng();
+    fn test_materialize_multiple_nodes() {
+        let partition = EvenPartition::new(vec![node_id(1), node_id(2), node_id(3)]);
+        // 2 base symbols * 3 redundancy = 6 symbols
+        let assignment = partition.assign(2, R3).unwrap();
+        let chunks = assignment.materialize(32).unwrap();
 
-        for _ in 0..100 {
-            let node_set = rand_node_set(rng, 2000);
-            let assigner = Replicated::from_broadcast(node_set);
-            let num_symbols = rng.gen_range(0..10);
+        assert_eq!(chunks.len(), 6);
+        // chunks should round-robin: 0->n1, 1->n2, 2->n3, 3->n1, ...
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_id(), i);
+            let expected_node = node_id((i % 3 + 1) as u64);
+            assert_eq!(chunk.recipient().node_id(), &expected_node);
+        }
+    }
 
-            let assignment_1 = assigner
-                .assign_chunks(num_symbols, Some(ChunkOrder::GsoFriendly))
-                .expect("should assign successfully");
-            let assignment_2 = assigner
-                .assign_chunks(num_symbols, Some(ChunkOrder::RoundRobin))
-                .expect("should assign successfully");
+    // ---------------------------------------------------------------
+    // ChunkAssignment::target (AssignedTarget)
+    // ---------------------------------------------------------------
 
-            assert_eq!(
-                assignment_1.normalized_chunks(),
-                assignment_2.normalized_chunks()
+    #[test]
+    fn test_target_recipient_lookup() {
+        let partition = EvenPartition::new(vec![node_id(1), node_id(2), node_id(3)]);
+        // 2 base * 3 redundancy = 6 symbols
+        let assignment = partition.assign(2, R3).unwrap();
+
+        // round-robin: 0->n1, 1->n2, 2->n3, 3->n1, 4->n2, 5->n3
+        let expected = [1, 2, 3, 1, 2, 3];
+        for (chunk_id, &n) in expected.iter().enumerate() {
+            let t = assignment.resolve_chunk_id(chunk_id).unwrap();
+            assert_eq!(t.recipient(), &node_id(n));
+        }
+
+        // out of range
+        assert!(assignment.resolve_chunk_id(6).is_none());
+        assert!(assignment.resolve_chunk_id(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_target_single_node() {
+        let node = node_id(42);
+        let assignment = ChunkAssignment::unicast(node, 3);
+
+        let t = assignment.resolve_chunk_id(0).unwrap();
+        assert_eq!(t.recipient(), &node);
+        assert!(t.rebroadcast_targets().is_empty());
+
+        assert!(assignment.resolve_chunk_id(3).is_none());
+    }
+
+    #[test]
+    fn test_target_rebroadcast_excludes_recipient() {
+        let partition = EvenPartition::new(vec![node_id(1), node_id(2), node_id(3)]);
+        // 1 base * 3 redundancy = 3 symbols
+        let assignment = partition.assign(1, R3).unwrap();
+
+        // chunk 0 -> recipient n1, rebroadcast to [n2, n3]
+        let t = assignment.resolve_chunk_id(0).unwrap();
+        assert_eq!(t.recipient(), &node_id(1));
+        assert_eq!(t.rebroadcast_targets(), vec![node_id(2), node_id(3)]);
+
+        // chunk 1 -> recipient n2, rebroadcast to [n1, n3]
+        let t = assignment.resolve_chunk_id(1).unwrap();
+        assert_eq!(t.recipient(), &node_id(2));
+        assert_eq!(t.rebroadcast_targets(), vec![node_id(1), node_id(3)]);
+
+        // chunk 2 -> recipient n3, rebroadcast to [n1, n2]
+        let t = assignment.resolve_chunk_id(2).unwrap();
+        assert_eq!(t.recipient(), &node_id(3));
+        assert_eq!(t.rebroadcast_targets(), vec![node_id(1), node_id(2)]);
+    }
+
+    #[test]
+    fn test_target_out_of_range() {
+        let partition = EvenPartition::new(vec![node_id(1), node_id(2)]);
+        let assignment = partition.assign(1, R3).unwrap();
+
+        assert!(assignment.resolve_chunk_id(99).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // EvenPartition
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_even_partition_empty_nodes() {
+        let partition = EvenPartition::<PT>::new(vec![]);
+        let assignment = partition.assign(10, R3).unwrap();
+        assert!(assignment.is_empty());
+    }
+
+    #[rstest]
+    #[case(1, 0)]
+    #[case(1, 1)]
+    #[case(1, 7)]
+    #[case(3, 1)]
+    #[case(3, 3)]
+    #[case(3, 10)]
+    #[case(100, 1)]
+    #[case(100, 99)]
+    #[case(100, 100)]
+    #[case(100, 101)]
+    #[case(100, 1000)]
+    fn test_even_partition_distribution(#[case] num_nodes: usize, #[case] num_base_symbols: usize) {
+        let nodes: Vec<_> = (1..=num_nodes as u64).map(node_id).collect();
+        let partition = EvenPartition::new(nodes);
+        let assignment = partition.assign(num_base_symbols, R3).unwrap();
+
+        let num_symbols = num_base_symbols * 3;
+        assert_eq!(assignment.num_chunks(), num_symbols);
+        assert_contiguous(&assignment);
+        assert_indices_valid(&assignment, num_nodes);
+
+        // each node gets floor(S/N) or ceil(S/N) chunks
+        let counts = chunk_counts(&assignment);
+        let floor = num_symbols / num_nodes;
+        let ceil = num_symbols.div_ceil(num_nodes);
+        for &count in counts.values() {
+            assert!(
+                count == floor || count == ceil,
+                "count={count} not in [{floor}, {ceil}]"
             );
         }
     }
 
     #[test]
-    fn test_partitioned_assignment() {
-        let rng = &mut rand::thread_rng();
+    fn test_even_partition_round_robin_order() {
+        // 3 nodes, 3 base * 3 redundancy = 9 symbols -> 0,1,2,0,1,2,0,1,2
+        let partition = EvenPartition::new(vec![node_id(1), node_id(2), node_id(3)]);
+        let assignment = partition.assign(3, R3).unwrap();
 
-        for _ in 0..30 {
-            let validator_set = rand_validator_set(rng, 2000);
-            let assigner = Partitioned::from_validator_set(validator_set);
-            let num_symbols = rng.gen_range(0..1000);
+        let expected = [0, 1, 2, 0, 1, 2, 0, 1, 2];
+        for (i, (_, target)) in assignment.iter().enumerate() {
+            assert_eq!(target.node_index.0, expected[i]);
+        }
+    }
 
-            let assignment_1 = assigner
-                .assign_chunks(num_symbols, Some(ChunkOrder::GsoFriendly))
-                .expect("should assign successfully");
-            let assignment_2 = assigner
-                .assign_chunks(num_symbols, Some(ChunkOrder::RoundRobin))
-                .expect("should assign successfully");
+    #[test]
+    fn test_even_partition_shuffle() {
+        let mut partition = EvenPartition::new(vec![node_id(1), node_id(2), node_id(3)]);
+        let before = partition.nodes.clone();
 
+        partition.shuffle([42u8; 32]);
+        let after = partition.nodes.clone();
+
+        // same elements, different order (with overwhelming probability)
+        assert_ne!(before, after);
+        assert_eq!(before.len(), after.len());
+        for node in &before {
+            assert!(after.contains(node));
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // StakePartition
+    // ---------------------------------------------------------------
+
+    // Reference implementation of stake partitioning using f64 for
+    // shares.
+    pub(super) struct F64StakePartition<PT: PubKey> {
+        // Publisher node excluded.
+        //
+        // Invariant: validators.map(.1).sum() == 1.0
+        validators: Vec<(NodeId<PT>, f64)>,
+    }
+
+    impl<PT: PubKey> F64StakePartition<PT> {
+        pub(super) fn from_shares(validators: Vec<(NodeId<PT>, f64)>) -> Self {
+            Self { validators }
+        }
+
+        fn snapshot_nodes(&self) -> super::OrderedNodes<PT> {
+            self.validators.iter().map(|(n, _)| *n).collect()
+        }
+
+        pub(super) fn assign(
+            &self,
+            num_base_symbols: usize,
+            redundancy: Redundancy,
+        ) -> Result<ChunkAssignment<PT>> {
+            if self.validators.is_empty() {
+                return Ok(ChunkAssignment::with_capacity(0, self.snapshot_nodes()));
+            }
+            self.assign_round_robin(num_base_symbols, redundancy)
+        }
+
+        pub(super) fn num_chunks_hint(
+            &self,
+            num_base_symbols: usize,
+            redundancy: Redundancy,
+        ) -> Option<usize> {
+            let group_size = self.validators.len() + 1;
+            stake_partition_num_chunks_hint(num_base_symbols, redundancy, group_size)
+        }
+
+        #[expect(unused)] // reference implementation
+        fn assign_proportional(
+            &self,
+            num_base_symbols: usize,
+            redundancy: Redundancy,
+        ) -> Result<ChunkAssignment<PT>> {
+            let capacity = self
+                .num_chunks_hint(num_base_symbols, redundancy)
+                .ok_or(BuildError::TooManyChunks)?;
+            let num_scaled_symbols = redundancy
+                .scale(num_base_symbols)
+                .ok_or(BuildError::TooManyChunks)?;
+            let mut assignment = ChunkAssignment::with_capacity(capacity, self.snapshot_nodes());
+
+            let mut curr_chunk_id = 0;
+            for (i, (_node_id, share)) in self.validators.iter().enumerate() {
+                let obligation = num_scaled_symbols as f64 * share;
+                let next_chunk_id: usize = curr_chunk_id + obligation.ceil() as usize;
+                assignment.push_range(NodeIndex(i), curr_chunk_id..next_chunk_id);
+                curr_chunk_id = next_chunk_id;
+            }
+
+            assert!(assignment.num_chunks() >= num_scaled_symbols);
+            assert!(assignment.num_chunks() <= capacity);
+
+            Ok(assignment)
+        }
+
+        fn assign_round_robin(
+            &self,
+            num_base_symbols: usize,
+            redundancy: Redundancy,
+        ) -> Result<ChunkAssignment<PT>> {
+            use std::collections::VecDeque;
+
+            let capacity = self
+                .num_chunks_hint(num_base_symbols, redundancy)
+                .ok_or(BuildError::TooManyChunks)?;
+            let num_scaled_symbols = redundancy
+                .scale(num_base_symbols)
+                .ok_or(BuildError::TooManyChunks)?;
+            let mut assignment = ChunkAssignment::with_capacity(capacity, self.snapshot_nodes());
+
+            let mut remaining: VecDeque<_> = self
+                .validators
+                .iter()
+                .enumerate()
+                .map(|(i, (_node_id, share))| {
+                    let obligation = share * num_scaled_symbols as f64;
+                    (NodeIndex(i), obligation.ceil() as usize)
+                })
+                .collect();
+
+            let mut chunk_id = 0;
+            while !remaining.is_empty() {
+                if remaining.len() == 1 {
+                    let (node_idx, rem) = remaining.pop_front().unwrap();
+                    assignment.push_range(node_idx, chunk_id..(chunk_id + rem));
+                    break;
+                }
+
+                remaining.retain_mut(|(node_idx, rem)| {
+                    if *rem == 0 {
+                        return false;
+                    }
+                    assignment.push(*node_idx, chunk_id);
+                    *rem -= 1;
+                    chunk_id += 1;
+                    *rem > 0
+                })
+            }
+
+            assert!(assignment.num_chunks() >= num_scaled_symbols);
+            assert!(assignment.num_chunks() <= capacity);
+
+            Ok(assignment)
+        }
+    }
+
+    // Build matching f64-share and integer-stake partition algorithms
+    // from a single list of (node_seed, raw_stake) entries for
+    // differential testing.
+    fn make_paired_partitions(
+        stakes: &[(NodeNum, U256)],
+    ) -> (F64StakePartition<PT>, StakePartition<PT>) {
+        let total: U256 = stakes
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(U256::ZERO, |a, b| a + b);
+        let f64_validators: Vec<_> = stakes
+            .iter()
+            .map(|(n, s)| {
+                let share = Stake::from(*s) / Stake::from(total);
+                (node_id(*n), share)
+            })
+            .collect();
+        let int_validators: Vec<_> = stakes.iter().map(|(n, s)| (node_id(*n), *s)).collect();
+        (
+            F64StakePartition::from_shares(f64_validators),
+            StakePartition::from_stakes(int_validators),
+        )
+    }
+
+    #[test]
+    fn test_stake_partition_single_validator() {
+        let partition = StakePartition::from_stakes(vec![(node_id(1), 7)]);
+        // 10 base * 3 redundancy = 30 symbols
+        let assignment = partition.assign(10, R3).unwrap();
+        assert_eq!(assignment.num_chunks(), 30);
+        assert_contiguous(&assignment);
+        for (_, target) in assignment.iter() {
+            assert_eq!(target.node_index, NodeIndex(0));
+        }
+    }
+
+    #[rstest]
+    // all assuming redundancy=3
+    // equal stakes: each gets ceil(15 * 1/2) = 8 -> 16 total
+    #[case(vec![(1, 1u64), (2, 1)], 5, vec![(0, 8), (1, 8)])]
+    // 1:2 ratio: ceil(12 * 1/3) = 4, ceil(12 * 2/3) = 8 -> 12 total
+    #[case(vec![(1, 1), (2, 2)], 4, vec![(0, 4), (1, 8)])]
+    // 1:2:3 ratio: ceil(36 * 1/6) = 6, ceil(36 * 2/6) = 12, ceil(36 * 3/6) = 18
+    #[case(vec![(1, 1), (2, 2), (3, 3)], 12, vec![(0, 6), (1, 12), (2, 18)])]
+    fn test_stake_partition_chunk_counts(
+        #[case] stakes: Vec<(u64, u64)>,
+        #[case] num_base_symbols: usize,
+        #[case] expected_counts: Vec<(usize, usize)>,
+    ) {
+        let validators: Vec<_> = stakes.into_iter().map(|(n, s)| (node_id(n), s)).collect();
+        let partition = StakePartition::from_stakes(validators);
+        let assignment = partition.assign(num_base_symbols, R3).unwrap();
+
+        assert_contiguous(&assignment);
+        let counts = chunk_counts(&assignment);
+        for (node_idx, expected) in expected_counts {
             assert_eq!(
-                assignment_1.normalized_chunks(),
-                assignment_2.normalized_chunks()
+                counts.get(&node_idx).copied().unwrap_or(0),
+                expected,
+                "node_idx={node_idx}"
             );
         }
     }
 
     #[test]
-    fn test_stake_with_rc() {
-        // test the numerical stability of stakes on different scales
+    fn test_stake_partition_round_robin_order() {
+        // 1:2 ratio with 2 base * 3 redundancy = 6 symbols
+        // obligations: ceil(6*1/3)=2, ceil(6*2/3)=4 -> total 6
+        // round-robin: 0,1,0,1,1,1
+        let partition = StakePartition::from_stakes(vec![(node_id(1), 1u64), (node_id(2), 2u64)]);
+        let assignment = partition.assign(2, R3).unwrap();
+
+        assert_eq!(assignment.num_chunks(), 6);
+        let node_indices: Vec<usize> = assignment.iter().map(|(_, t)| t.node_index.0).collect();
+        assert_eq!(node_indices, vec![0, 1, 0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_stake_partition_rounding_bounds() {
+        // With N validators, rounding can add at most N extra chunks.
+        let stakes = vec![
+            (node_id(1), 1u64),
+            (node_id(2), 2u64),
+            (node_id(3), 3u64),
+            (node_id(4), 4u64),
+        ];
+        let partition = StakePartition::from_stakes(stakes);
+        let num_base_symbols = 100;
+        let assignment = partition.assign(num_base_symbols, R3).unwrap();
+
+        let num_symbols = num_base_symbols * 3;
+        assert!(assignment.num_chunks() >= num_symbols);
+        assert!(assignment.num_chunks() <= num_symbols + 4);
+        assert_contiguous(&assignment);
+        assert_indices_valid(&assignment, 4);
+    }
+
+    #[rstest]
+    // simple 1:2 stake ratio
+    #[case(vec![(1, 1), (2, 2)], 10)]
+    // three validators with unequal stake
+    #[case(vec![(1, 1), (2, 3), (3, 6)], 50)]
+    // four validators with small differences
+    #[case(vec![(1, 20), (2, 25), (3, 25), (4, 30)], 100)]
+    // extreme: one validator has almost all stake
+    #[case(vec![(1, 1), (2, 999)], 100)]
+    // large validator set
+    #[case({
+        let n = MAX_VALIDATOR_SET_SIZE as u64;
+        (1..=n).map(|i| (i, n)).collect::<Vec<_>>()
+    }, 5000)]
+    fn test_proportional_vs_round_robin_same_counts(
+        #[case] stakes: Vec<(u64, u64)>,
+        #[case] num_symbols: usize,
+    ) {
+        let validators: Vec<_> = stakes.into_iter().map(|(n, s)| (node_id(n), s)).collect();
+        let partition = StakePartition::from_stakes(validators);
+
+        let proportional = partition.assign_proportional(num_symbols, R3).unwrap();
+        let round_robin = partition.assign_round_robin(num_symbols, R3).unwrap();
+
+        assert_eq!(proportional.num_chunks(), round_robin.num_chunks());
+        assert_eq!(chunk_counts(&proportional), chunk_counts(&round_robin));
+        assert_contiguous(&proportional);
+        assert_contiguous(&round_robin);
+    }
+
+    #[test]
+    fn test_stake_partition_numerical_stability() {
+        use crate::packet::regular;
+
+        const DEFAULT_SEGMENT_LEN: usize = 1400;
+        const DEFAULT_MERKLE_TREE_DEPTH: u8 = 6;
+        const DEFAULT_LAYOUT: regular::PacketLayout =
+            regular::PacketLayout::new(DEFAULT_SEGMENT_LEN, DEFAULT_MERKLE_TREE_DEPTH);
+        let symbol_len = DEFAULT_LAYOUT.symbol_len();
+
         for scale in [
             U256::from(1),
             U256::from(u64::MAX),
-            U256::MAX / U256::from(16),
+            parse_ether("100_000_000_000").unwrap(), // 100B
         ] {
-            // c_h = 20
-            let message_len = DEFAULT_SYMBOL_LEN * 10;
+            // message_len chosen to produce 10 base symbols, * 2 redundancy = 20
+            let message_len = symbol_len * 10;
             let redundancy = Redundancy::from_u8(2);
+            let num_base_symbols = DEFAULT_LAYOUT.num_base_symbols(message_len);
+            assert_eq!(num_base_symbols, 10);
 
             // total stake = 16*scale
-            let validator_set = vec![
-                // get floor(1/16*20) chunks + 1 rounding chunk (total: 2)
-                (node_id(1), Stake::from(U256::from(1) * scale)),
-                // get floor(4/16*20) chunks (total: 5)
-                (node_id(2), Stake::from(U256::from(4) * scale)),
-                // get floor(5/16*20) chunks + 1 rounding chunk (total: 7)
-                (node_id(3), Stake::from(U256::from(5) * scale)),
-                // get floor(6/16*20) chunks + 1 rounding chunk (total: 8)
-                (node_id(4), Stake::from(U256::from(6) * scale)),
+            let stakes = [
+                (1u64, U256::from(1) * scale), // 1/16 -> ceil(20/16) = 2
+                (2, U256::from(4) * scale),    // 4/16 -> ceil(80/16) = 5
+                (3, U256::from(5) * scale),    // 5/16 -> ceil(100/16) = 7
+                (4, U256::from(6) * scale),    // 6/16 -> ceil(120/16) = 8
             ];
 
-            let num_symbols = DEFAULT_LAYOUT
-                .calc_num_symbols(message_len, redundancy)
-                .expect("should not overflow");
-            let assigner = StakeBasedWithRC::from_validator_set(validator_set);
-            let assignment = assigner
-                .assign_chunks(num_symbols, None)
-                .expect("should assign successfully");
+            let validators: Vec<_> = stakes.iter().map(|(n, s)| (node_id(*n), *s)).collect();
+            let partition = StakePartition::from_stakes(validators);
+            let assignment = partition.assign(num_base_symbols, redundancy).unwrap();
 
-            let expected_assigner =
-                StaticAssigner::from_template(&[(1, 0..2), (2, 2..7), (3, 7..14), (4, 14..22)]);
-            let expected_assignment = expected_assigner.assign_chunks();
+            let counts = chunk_counts(&assignment);
+            assert_eq!(counts[&0], 2, "scale={scale}");
+            assert_eq!(counts[&1], 5, "scale={scale}");
+            assert_eq!(counts[&2], 7, "scale={scale}");
+            assert_eq!(counts[&3], 8, "scale={scale}");
 
-            assert_eq!(
-                assignment.normalized_chunks(),
-                expected_assignment.normalized_chunks()
-            );
+            // total should be 22 (20 symbols + 2 rounding chunks)
+            assert_eq!(assignment.num_chunks(), 22, "scale={scale}");
         }
     }
 
     #[test]
-    fn test_stake_with_rc_properties() {
-        let rng = &mut rand::thread_rng();
-        for _ in 0..50 {
-            let validator_set = rand_validator_set(rng, 2000);
-            let n_validators = validator_set.len();
-            let assigner = Partitioned::from_validator_set(validator_set.clone());
-            let assigner_rc = StakeBasedWithRC::from_validator_set(validator_set);
+    fn test_stake_partition_shuffle() {
+        let mut partition = StakePartition::from_stakes(vec![
+            (node_id(1), 1u64),
+            (node_id(2), 1),
+            (node_id(3), 1),
+            (node_id(4), 1),
+        ]);
+        let before: Vec<_> = partition.validators.iter().map(|(n, _)| *n).collect();
 
-            // estimated from at most 2MB data, 1400-byte segments, 3x redundancy
-            let num_symbols = rng.gen_range(1..5000);
-            let assignment = assigner
-                .assign_chunks(num_symbols, None)
-                .expect("should assign successfully");
-            let assignment_rc = assigner_rc
-                .assign_chunks(num_symbols, None)
-                .expect("should assign successfully");
+        partition.shuffle([7u8; 32]);
+        let after: Vec<_> = partition.validators.iter().map(|(n, _)| *n).collect();
 
-            // assignment with rc must produce at least the same number of chunks as without rc
-            assert!(assignment_rc.total_chunks() >= assignment.total_chunks());
-            // the difference in total chunks must not exceed number of validators
-            assert!(assignment_rc.total_chunks() - assignment.total_chunks() <= n_validators);
-
-            let chunk_ids: BTreeSet<_> = assignment
-                .assignments
-                .iter()
-                .flat_map(|slice| slice.chunk_id_range.clone())
-                .collect();
-            let chunk_ids_rc: BTreeSet<_> = assignment_rc
-                .assignments
-                .iter()
-                .flat_map(|slice| slice.chunk_id_range.clone())
-                .collect();
-
-            // both assignments must be continuous from 0 to total_chunks - 1
-            assert_eq!(chunk_ids.len(), assignment.total_chunks());
-            assert_eq!(chunk_ids.first().cloned(), Some(0));
-            assert_eq!(
-                chunk_ids.last().cloned(),
-                Some(assignment.total_chunks() - 1)
-            );
-
-            assert_eq!(chunk_ids_rc.len(), assignment_rc.total_chunks());
-            assert_eq!(chunk_ids_rc.first().cloned(), Some(0));
-            assert_eq!(
-                chunk_ids_rc.last().cloned(),
-                Some(assignment_rc.total_chunks() - 1)
-            );
-
-            let validator_to_chunks: HashMap<_, _> = assignment
-                .assignments
-                .iter()
-                .map(|slice| (slice.recipient.node_hash(), slice.chunk_id_range.len()))
-                .collect();
-            let validator_to_chunks_rc: HashMap<_, _> = assignment_rc
-                .assignments
-                .iter()
-                .map(|slice| (slice.recipient.node_hash(), slice.chunk_id_range.len()))
-                .collect();
-
-            for (validator, num_chunks) in validator_to_chunks {
-                let num_chunks_rc = validator_to_chunks_rc.get(validator);
-                // each validator that exist in non-rc assignment must
-                // also exist in rc assignment
-                assert!(num_chunks_rc.is_some());
-                // each validator must get at least as many chunks in rc assignment
-                assert!(*num_chunks_rc.unwrap() >= num_chunks);
-            }
+        assert_ne!(before, after);
+        assert_eq!(before.len(), after.len());
+        for node in &before {
+            assert!(after.contains(node));
         }
     }
 
-    #[test]
-    fn test_reorder_to_gso_merges_adjacent_ranges() {
-        // Test that adjacent ranges for the same recipient are merged correctly.
-        // This tests the fix for the off-by-one bug where `last.end + 1` was
-        // incorrectly used instead of `last.end` for Range (which is end-exclusive).
+    // ---------------------------------------------------------------
+    // Differential: F64StakePartition vs integer StakePartition
+    // ---------------------------------------------------------------
 
-        use super::ChunkSlice;
+    // Assignments are produced from the same (NodeId, stake) input
+    // and must agree both in per-node chunk counts and in the
+    // per-chunk recipient sequence. The order match relies on both
+    // implementations using the same VecDeque round-robin walk.
+    fn assert_assignments_match(
+        f64_partition: &F64StakePartition<PT>,
+        int_partition: &StakePartition<PT>,
+        num_base_symbols: usize,
+        redundancy: Redundancy,
+        ctx: &str,
+    ) {
+        let f64_assignment = f64_partition.assign(num_base_symbols, redundancy).unwrap();
+        let int_assignment = int_partition.assign(num_base_symbols, redundancy).unwrap();
 
-        let r1 = Recipient::new(node_id(1));
-        let r2 = Recipient::new(node_id(2));
-
-        // Create slices in round-robin order: interleaved recipients with adjacent chunk ranges
-        // Node 1 gets chunks 0..1, 1..2, 2..3 (should merge to 0..3 after reorder)
-        // Node 2 gets chunks 1..2, 2..3, 3..4 (should merge to 1..4 after reorder)
-        let slices = vec![
-            ChunkSlice {
-                recipient: &r1,
-                chunk_id_range: 0..1,
-            },
-            ChunkSlice {
-                recipient: &r2,
-                chunk_id_range: 1..2,
-            },
-            ChunkSlice {
-                recipient: &r1,
-                chunk_id_range: 1..2,
-            },
-            ChunkSlice {
-                recipient: &r2,
-                chunk_id_range: 2..3,
-            },
-            ChunkSlice {
-                recipient: &r1,
-                chunk_id_range: 2..3,
-            },
-            ChunkSlice {
-                recipient: &r2,
-                chunk_id_range: 3..4,
-            },
-        ];
-
-        let reordered = ChunkAssignment::reorder_to_gso(slices, Some(2));
-
-        // After reordering, each recipient should have their ranges merged
-        // Node 1: 0..1, 1..2, 2..3 -> 0..3
-        // Node 2: 1..2, 2..3, 3..4 -> 1..4
-        assert_eq!(reordered.len(), 2);
-
-        let r1_slice = reordered
-            .iter()
-            .find(|s| s.recipient.node_hash() == r1.node_hash())
-            .unwrap();
-        let r2_slice = reordered
-            .iter()
-            .find(|s| s.recipient.node_hash() == r2.node_hash())
-            .unwrap();
-
-        assert_eq!(r1_slice.chunk_id_range, 0..3);
-        assert_eq!(r2_slice.chunk_id_range, 1..4);
+        assert_eq!(
+            f64_assignment.num_chunks(),
+            int_assignment.num_chunks(),
+            "num_chunks mismatch [{ctx}]"
+        );
+        assert_eq!(
+            chunk_counts(&f64_assignment),
+            chunk_counts(&int_assignment),
+            "chunk_counts mismatch [{ctx}]"
+        );
+        let f64_indices: Vec<usize> = f64_assignment.iter().map(|(_, t)| t.node_index.0).collect();
+        let int_indices: Vec<usize> = int_assignment.iter().map(|(_, t)| t.node_index.0).collect();
+        assert_eq!(
+            f64_indices, int_indices,
+            "per-chunk node_index mismatch [{ctx}]"
+        );
     }
 
-    #[test]
-    fn test_reorder_to_gso_non_adjacent_ranges() {
-        // Test that non-adjacent ranges are NOT merged
-        // Node 1 gets chunks 0..1 and 2..3 (gap at 1, should not merge)
-
-        use super::ChunkSlice;
-
-        let r1 = Recipient::new(node_id(1));
-
-        let slices = vec![
-            ChunkSlice {
-                recipient: &r1,
-                chunk_id_range: 0..1,
-            },
-            ChunkSlice {
-                recipient: &r1,
-                chunk_id_range: 2..3,
-            },
-        ];
-
-        let reordered = ChunkAssignment::reorder_to_gso(slices, Some(1));
-
-        // Should have 2 slices since ranges are not adjacent
-        assert_eq!(reordered.len(), 2);
+    // Deterministic case set chosen so both implementations agree
+    // exactly: integer stakes well inside f64 precision and totals
+    // that don't trigger sub-ulp rounding boundaries.
+    #[rstest]
+    #[case(vec![(1, 1u64), (2, 1)], 10)]
+    #[case(vec![(1, 1), (2, 2)], 10)]
+    #[case(vec![(1, 1), (2, 2), (3, 3)], 30)]
+    #[case(vec![(1, 1), (2, 3), (3, 6)], 50)]
+    #[case(vec![(1, 4), (2, 5), (3, 5), (4, 6)], 100)]
+    #[case(vec![(1, 10), (2, 20), (3, 30), (4, 40)], 1000)]
+    fn test_diff_simple_inputs_agree(
+        #[case] stakes: Vec<(u64, u64)>,
+        #[case] num_base_symbols: usize,
+    ) {
+        let stakes_u256: Vec<_> = stakes.iter().map(|(n, s)| (*n, U256::from(*s))).collect();
+        let (f64_partition, int_partition) = make_paired_partitions(&stakes_u256);
+        let ctx = format!("stakes={stakes:?} num_base_symbols={num_base_symbols}");
+        assert_assignments_match(&f64_partition, &int_partition, num_base_symbols, R3, &ctx);
     }
 
-    // Ported from alloy_primitives::U256::from_f64_lossy from a newer version
-    fn u256_from_f64_lossy(value: f64) -> U256 {
-        if value >= 1.0 {
-            let bits = value.to_bits();
-            let exponent = ((bits >> 52) & 0x7ff) - 1023;
-            let mantissa = (bits & 0x0f_ffff_ffff_ffff) | 0x10_0000_0000_0000;
-            if exponent <= 52 {
-                U256::from(mantissa >> (52 - exponent))
-            } else if exponent >= 256 {
-                U256::MAX
-            } else {
-                U256::from(mantissa) << U256::from(exponent - 52)
+    // Random stake distributions for stakes up to 100B.
+    #[test]
+    fn test_diff_random_stakes_agree() {
+        use rand::{Rng as _, SeedableRng as _};
+
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([42u8; 32]);
+        let ether: U256 = parse_ether("1").unwrap(); // 10^18
+
+        for trial in 0..200 {
+            let num_validators = rng.gen_range(2..=64);
+            let stakes: Vec<(u64, U256)> = (0..num_validators)
+                .map(|i| {
+                    let a: u64 = rng.gen_range(1..=100_000);
+                    let b: u64 = rng.gen_range(1..=1_000_000);
+                    let stake = U256::from(a) * U256::from(b) * ether;
+                    (i as u64 + 1, stake)
+                })
+                .collect();
+
+            let num_base_symbols = rng.gen_range(1..=512);
+            let (f64_partition, int_partition) = make_paired_partitions(&stakes);
+            let ctx = format!("trial={trial} n={num_validators} m={num_base_symbols}");
+            assert_assignments_match(&f64_partition, &int_partition, num_base_symbols, R3, &ctx);
+        }
+    }
+
+    // Large validator set (MAX_VALIDATOR_SET_SIZE) with small
+    // integer stakes; both implementations should still agree.
+    #[test]
+    fn test_diff_large_set_small_stakes_agree() {
+        use alloy_primitives::U256;
+        use rand::{Rng as _, SeedableRng as _};
+
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7u8; 32]);
+        let stakes: Vec<_> = (1..=MAX_VALIDATOR_SET_SIZE as u64)
+            .map(|i| {
+                let s: u32 = rng.gen_range(1..=1_000_000);
+                (i, U256::from(s))
+            })
+            .collect();
+        let (f64_partition, int_partition) = make_paired_partitions(&stakes);
+        assert_assignments_match(
+            &f64_partition,
+            &int_partition,
+            2048,
+            R3,
+            "large_set_small_stakes",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Broadcast (replicated) pattern
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_pattern() {
+        // Simulates the broadcast code path: a unicast assignment
+        // built and materialized once per recipient.
+        let recipients = vec![node_id(1), node_id(2), node_id(3)];
+        let num_symbols = 5;
+        let segment_len = 32;
+
+        let mut all_chunks = Vec::new();
+        for recipient in &recipients {
+            let assignment = ChunkAssignment::unicast(*recipient, num_symbols);
+            all_chunks.extend(assignment.materialize(segment_len).unwrap());
+        }
+
+        // 3 recipients * 5 symbols = 15 chunks
+        assert_eq!(all_chunks.len(), 15);
+
+        // each recipient gets chunks 0..5
+        for (r_idx, recipient) in recipients.iter().enumerate() {
+            let start = r_idx * num_symbols;
+            for i in 0..num_symbols {
+                assert_eq!(all_chunks[start + i].chunk_id(), i);
+                assert_eq!(all_chunks[start + i].recipient().node_id(), recipient);
             }
-        } else {
-            U256::ZERO
         }
     }
 }

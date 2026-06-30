@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains implementation for the Monad consensus client and JsonRpc server. Monad consensus collects transactions and produces blocks which are written to a ledger filestream. These blocks are consumed by Monad execution, which then updates the state of the blockchain. The [triedb](monad-triedb/README.md) is a database which stores block information and the blockchain state.
+This repository contains implementation for the Monad consensus client and JsonRpc server. Monad consensus collects transactions and produces blocks which are written to a ledger filestream. These blocks are consumed by Monad execution, which then updates the state of the blockchain. The [triedb](https://github.com/category-labs/monad/blob/38f91f93efcdec8bad56fc07004bb982c9327d81/rust/crates/monad-triedb/README.md) is a database which stores block information and the blockchain state.
 
 ## Getting Started
 
@@ -56,7 +56,7 @@ The most straightforward way to start a consensus client + an execution client +
 
 #### Requirements
 
-* x86 processor - the Monad client is developed exclusively against x86 processors. Emulation techniques for other processors, e.g. ARM (Macbooks) are possible but not supported here
+* x86-64-v3 / AVX2-capable processor - the Monad client is developed exclusively against x86-64 processors. Emulation techniques for other processors, e.g. ARM (Macbooks) are possible but not supported here
 * 4+ physical cores (building times will be faster with more cores and higher clock speed)
 * 60 GB+ available hard drive space - Docker builds are about 500 MB each, but the build cache can consume 50 GB+.
 
@@ -68,6 +68,12 @@ After successfully cloning the `monad-bft` repo, run the following from the `mon
 2. `nets/run.sh`
 
 This script builds the docker images from source, which can take 500s+ depending on available memory and cores.  This will construct a build folder `docker/single-node/logs/$(date +%Y%m%d_%H%M%S)-$rand_hex"` and run `docker compose up` on the execution, consensus and rpc images.
+
+By default, the execution image is built with the `gcc-avx2` toolchain, which maps to `monad-execution/category/core/toolchains/gcc-avx2.cmake` and emits Haswell-era/x86-64-v3 machine code. To build with a different execution toolchain, pass the toolchain basename:
+
+```bash
+nets/run.sh --toolchain gcc-avx512
+```
 
 This will start a single node with chain ID of `20143` and RPC at `localhost:8080`. The known [Foundry/Anvil accounts](https://getfoundry.sh/anvil/overview/) have each been loaded with [large initial balances](https://github.com/category-labs/monad/blob/ce4101b11701bf4ef3a9cd996a6144883735187f/category/execution/monad/chain/monad_devnet_alloc.hpp#L22). The easiest way to fund transactions is to import the private key from one of those pre-allocated accounts.
 
@@ -104,7 +110,28 @@ To run a Monad consensus client, follow instructions [here](monad-node/README.md
  
 To run a JsonRpc server, follow instructions [here](monad-rpc/README.md).
 
-For the Cosmos ABCI integration debugging flow, see [docs/monad-cosmos-abci-debugging.md](docs/monad-cosmos-abci-debugging.md).
+#### Cargo targets that link Monad execution
+
+Some Rust targets depend on the execution C++ library through crates such as
+`monad-ethcall`, `monad-triedb`, or `monad-cxx`. When building or testing those
+targets directly with Cargo on x86, use the compiler and CPU feature settings
+documented by Monad execution:
+
+- [minimum development tool requirements](https://github.com/category-labs/monad/blob/184baba1c5f4f04cd80ae6df2b4bc06602496aa9/README.md#minimum-development-tool-requirements)
+- [CPU compilation requirements](https://github.com/category-labs/monad/blob/184baba1c5f4f04cd80ae6df2b4bc06602496aa9/README.md#cpu-compilation-requirements)
+- [compiling the execution code](https://github.com/category-labs/monad/blob/184baba1c5f4f04cd80ae6df2b4bc06602496aa9/README.md#compiling-the-execution-code)
+
+Set `TRIEDB_TARGET=triedb_driver` when the Cargo target needs the Rust build
+scripts to build and link the execution C++ library.
+
+If CMake was first configured with the wrong compiler or flags, remove the
+generated `monad-cxx` build directory for the relevant Cargo profile before
+retrying:
+
+```bash
+rm -rf "${CARGO_TARGET_DIR:-target}"/debug/build/monad-cxx-*
+rm -rf "${CARGO_TARGET_DIR:-target}"/release/build/monad-cxx-*
+```
 
 ## Architecture
 

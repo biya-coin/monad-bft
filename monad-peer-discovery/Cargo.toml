@@ -25,9 +25,9 @@ governor = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-tracing = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
 toml = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 monad-testutil = { workspace = true }

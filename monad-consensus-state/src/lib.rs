@@ -127,9 +127,17 @@ where
     fn eq(&self, other: &Self) -> bool {
         self.pending_block_tree.eq(&other.pending_block_tree)
             && self.vote_state.eq(&other.vote_state)
-            && self.pacemaker.eq(&other.pacemaker)
+            && self.no_endorsement_state.eq(&other.no_endorsement_state)
+            && self.scheduled_vote.eq(&other.scheduled_vote)
             && self.safety.eq(&other.safety)
             && self.pacemaker.eq(&other.pacemaker)
+            && self.block_sync_requests.eq(&other.block_sync_requests)
+            && self
+                .canonical_proposed_tip
+                .eq(&other.canonical_proposed_tip)
+            && self
+                .vote_delay_timer_start
+                .eq(&other.vote_delay_timer_start)
     }
 }
 
@@ -147,9 +155,13 @@ where
         f.debug_struct("ConsensusState")
             .field("pending_block_tree", &self.pending_block_tree)
             .field("vote_state", &self.vote_state)
-            .field("pacemaker", &self.pacemaker)
+            .field("no_endorsement_state", &self.no_endorsement_state)
+            .field("scheduled_vote", &self.scheduled_vote)
             .field("safety", &self.safety)
             .field("pacemaker", &self.pacemaker)
+            .field("block_sync_requests", &self.block_sync_requests)
+            .field("canonical_proposed_tip", &self.canonical_proposed_tip)
+            .field("vote_delay_timer_start", &self.vote_delay_timer_start)
             .finish()
     }
 }
@@ -157,13 +169,14 @@ where
 // The bound on future rounds/NEs that we'll buffer
 const FUTURE_VOTE_BOUND: Round = Round(10);
 
+#[derive(Debug, PartialEq, Eq)]
 struct BlockSyncRequestStatus {
     range: BlockRange,
     // once a block with round >= cancel_round is committed, this request will be canceled.
     cancel_round: Round,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OutgoingVoteStatus {
     TimerFired,
     VoteReady(Vote),
@@ -405,7 +418,7 @@ where
     pub fn handle_timeout_expiry(
         &mut self,
         timeout_round: Round,
-        record_local_timeout_metrics: bool,
+        _record_local_timeout_metrics: bool,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         let mut cmds = Vec::new();
 
@@ -413,13 +426,7 @@ where
             return cmds;
         }
 
-        if record_local_timeout_metrics {
-            self.metrics.consensus_events.local_timeout += 1;
-            if let Some(elapsed) = self.consensus.pacemaker.round_timer_elapsed() {
-                self.metrics.consensus_timing.local_timeout_total_us +=
-                    elapsed.as_micros() as u64;
-            }
-        }
+        self.metrics.consensus_events.local_timeout.inc();
 
         let lookup_leader = |round: Round| {
             let epoch = self
@@ -480,19 +487,7 @@ where
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         let block_id = p.tip.block_header.get_id();
         debug!(?author, proposal = ?p, ?block_id, "proposal message");
-        self.metrics.consensus_events.handle_proposal += 1;
-        info!(
-            ?author,
-            proposal_round = p.proposal_round.0,
-            block_round = p.tip.block_header.block_round.0,
-            seq_num = p.tip.block_header.seq_num.0,
-            ?block_id,
-            body_id = ?p.tip.block_header.block_body_id,
-            parent_id = ?p.tip.block_header.get_parent_id(),
-            qc_round = p.tip.block_header.qc.get_round().0,
-            current_round = self.consensus.pacemaker.get_current_round().0,
-            "MONAD_EXEC_DEBUG consensus_proposal_received"
-        );
+        self.metrics.consensus_events.handle_proposal.inc();
 
         let mut cmds = Vec::new();
 
@@ -528,7 +523,7 @@ where
         cmds.extend(process_certificate_cmds);
 
         if let Some(last_round_tc) = p.last_round_tc.as_ref() {
-            self.metrics.consensus_events.proposal_with_tc += 1;
+            self.metrics.consensus_events.proposal_with_tc.inc();
             cmds.extend(self.process_tc(last_round_tc));
         }
 
@@ -555,7 +550,10 @@ where
                 ?author,
                 "invalid proposal"
             );
-            self.metrics.consensus_events.invalid_proposal_round_leader += 1;
+            self.metrics
+                .consensus_events
+                .invalid_proposal_round_leader
+                .inc();
             return cmds;
         }
 
@@ -601,7 +599,7 @@ where
         // before R because of network conditions. The proposals are still valid
         if proposal_round != pacemaker_round {
             debug!(?pacemaker_round, ?proposal_round, "out-of-order proposal");
-            self.metrics.consensus_events.out_of_order_proposals += 1;
+            self.metrics.consensus_events.out_of_order_proposals.inc();
         }
 
         cmds
@@ -737,28 +735,14 @@ where
             "MONAD_EXEC_DEBUG consensus_vote_received"
         );
         if vote_round < self.consensus.pacemaker.get_current_round() {
-            info!(
-                ?author,
-                vote_round = vote_round.0,
-                current_round = self.consensus.pacemaker.get_current_round().0,
-                vote_block_id = ?vote_msg.vote.id,
-                "MONAD_EXEC_DEBUG consensus_vote_drop_old"
-            );
-            self.metrics.consensus_events.old_vote_received += 1;
+            self.metrics.consensus_events.old_vote_received.inc();
             return Default::default();
         }
         if vote_round > self.consensus.pacemaker.get_current_round() + FUTURE_VOTE_BOUND {
-            info!(
-                ?author,
-                vote_round = vote_round.0,
-                current_round = self.consensus.pacemaker.get_current_round().0,
-                vote_block_id = ?vote_msg.vote.id,
-                "MONAD_EXEC_DEBUG consensus_vote_drop_future"
-            );
-            self.metrics.consensus_events.future_vote_received += 1;
+            self.metrics.consensus_events.future_vote_received.inc();
             return Default::default();
         }
-        self.metrics.consensus_events.vote_received += 1;
+        self.metrics.consensus_events.vote_received.inc();
 
         let mut cmds = Vec::new();
 
@@ -784,13 +768,7 @@ where
 
         if let Some(qc) = maybe_qc {
             debug!(?qc, "created QC");
-            info!(
-                qc_round = qc.get_round().0,
-                qc_block_id = ?qc.get_block_id(),
-                current_round = self.consensus.pacemaker.get_current_round().0,
-                "MONAD_EXEC_DEBUG consensus_qc_created"
-            );
-            self.metrics.consensus_events.created_qc += 1;
+            self.metrics.consensus_events.created_qc.inc();
 
             cmds.extend(self.process_qc(&qc));
             // Note that this try_propose is superfluous because process_qc calls it internally
@@ -832,12 +810,14 @@ where
         let mut cmds = Vec::new();
         let timeout = timeout_message.as_ref();
         if timeout.tminfo.round < self.consensus.pacemaker.get_current_round() {
-            self.metrics.consensus_events.old_remote_timeout += 1;
+            self.metrics.consensus_events.old_remote_timeout.inc();
             return cmds;
         }
+        // Note that last_round_certificate might have been mutated to None by
+        // TimeoutMessage::validate if timeout.round == current_round
 
         debug!(?author, ?timeout, "remote timeout message");
-        self.metrics.consensus_events.remote_timeout_msg += 1;
+        self.metrics.consensus_events.remote_timeout_msg.inc();
 
         let epoch = self
             .epoch_manager
@@ -874,7 +854,10 @@ where
         let current_round = self.consensus.pacemaker.get_current_round();
         match &timeout.last_round_certificate {
             Some(RoundCertificate::Tc(tc)) if tc.round == current_round => {
-                self.metrics.consensus_events.remote_timeout_msg_with_tc += 1;
+                self.metrics
+                    .consensus_events
+                    .remote_timeout_msg_with_tc
+                    .inc();
 
                 // broadcast Timeout message immediately if received
                 // TC to advance round. this helps other validators to
@@ -885,7 +868,8 @@ where
             Some(RoundCertificate::Tc(tc)) if tc.round > current_round => {
                 self.metrics
                     .consensus_events
-                    .remote_timeout_msg_with_future_tc += 1;
+                    .remote_timeout_msg_with_future_tc
+                    .inc();
 
                 // broadcast AdvanceRound message with the TC for
                 // skipped round. this helps other validators to
@@ -908,6 +892,9 @@ where
             }
             None => {
                 // don't do anything
+
+                // Note that last_round_certificate might have been mutated to None by
+                // TimeoutMessage::validate if timeout.round == current_round
             }
         }
 
@@ -978,7 +965,7 @@ where
         round_recovery: RoundRecoveryMessage<ST, SCT, EPT>,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         info!(?author, ?round_recovery, "received round recovery request");
-        self.metrics.consensus_events.handle_round_recovery += 1;
+        self.metrics.consensus_events.handle_round_recovery.inc();
 
         let mut cmds = Vec::new();
 
@@ -1011,7 +998,10 @@ where
                 ?author,
                 "invalid round recovery message"
             );
-            self.metrics.consensus_events.invalid_round_recovery_leader += 1;
+            self.metrics
+                .consensus_events
+                .invalid_round_recovery_leader
+                .inc();
             return cmds;
         }
 
@@ -1075,16 +1065,25 @@ where
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         debug!(?author, ?no_endorsement_msg, "no endorsement message");
         if no_endorsement_msg.msg.round < self.consensus.pacemaker.get_current_round() {
-            self.metrics.consensus_events.old_no_endorsement_received += 1;
+            self.metrics
+                .consensus_events
+                .old_no_endorsement_received
+                .inc();
             return Default::default();
         }
-        if no_endorsement_msg.msg.round
-            > self.consensus.pacemaker.get_current_round() + FUTURE_VOTE_BOUND
-        {
-            self.metrics.consensus_events.future_no_endorsement_received += 1;
+        if no_endorsement_msg.msg.round > self.consensus.pacemaker.get_current_round() {
+            self.metrics
+                .consensus_events
+                .future_no_endorsement_received
+                .inc();
             return Default::default();
         }
-        self.metrics.consensus_events.handle_no_endorsement += 1;
+        debug_assert_eq!(
+            no_endorsement_msg.msg.round,
+            self.consensus.pacemaker.get_current_round()
+        );
+
+        self.metrics.consensus_events.handle_no_endorsement.inc();
 
         let mut cmds = Vec::new();
 
@@ -1111,7 +1110,7 @@ where
 
         if let Some(nec) = maybe_nec {
             debug!(?nec, "created NEC");
-            self.metrics.consensus_events.created_nec += 1;
+            self.metrics.consensus_events.created_nec.inc();
 
             cmds.extend(self.try_propose());
         };
@@ -1126,7 +1125,7 @@ where
         advance_round_msg: AdvanceRoundMessage<ST, SCT, EPT>,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         debug!(?author, ?advance_round_msg, "advance round message");
-        self.metrics.consensus_events.handle_advance_round += 1;
+        self.metrics.consensus_events.handle_advance_round.inc();
 
         let mut cmds = Vec::new();
 
@@ -1137,7 +1136,7 @@ where
                 // we do this here because we also forward the AdvanceRound to the next leader
                 // this effectively deduplicates any AdvanceRound forwarding within a round
                 if qc.info.round < self.consensus.pacemaker.get_current_round() {
-                    self.metrics.consensus_events.process_old_qc += 1;
+                    self.metrics.consensus_events.process_old_qc.inc();
                 } else {
                     cmds.extend(self.process_qc(&qc));
 
@@ -1285,7 +1284,7 @@ where
         }
         .sign(self.keypair);
 
-        self.metrics.consensus_events.created_vote += 1;
+        self.metrics.consensus_events.created_vote.inc();
 
         let get_leader = |round: Round| {
             // TODO this grouping should be enforced by epoch_manager/val_epoch_map to be less
@@ -1318,9 +1317,11 @@ where
         debug!(?round, ?vote, ?current_leader, ?next_leader, "sending vote");
 
         if let Some(ready_at) = self.consensus.vote_ready_at.take() {
-            self.metrics.consensus_timing.vote_send_wait_total_us +=
-                ready_at.elapsed().as_micros() as u64;
-            self.metrics.consensus_timing.vote_send_wait_count += 1;
+            self.metrics
+                .consensus_timing
+                .vote_send_wait_total_us
+                .add(ready_at.elapsed().as_micros() as u64);
+            self.metrics.consensus_timing.vote_send_wait_count.add(1);
         }
 
         // start the vote-timer for the next round
@@ -1354,24 +1355,10 @@ where
         qc: &QuorumCertificate<SCT>,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         if qc.info.round < self.consensus.pacemaker.get_current_round() {
-            info!(
-                qc_round = qc.info.round.0,
-                current_round = self.consensus.pacemaker.get_current_round().0,
-                qc_block_id = ?qc.get_block_id(),
-                "MONAD_EXEC_DEBUG consensus_qc_drop_old"
-            );
-            self.metrics.consensus_events.process_old_qc += 1;
+            self.metrics.consensus_events.process_old_qc.inc();
             return Vec::new();
         }
-        self.metrics.consensus_events.process_qc += 1;
-        info!(
-            qc_round = qc.get_round().0,
-            qc_block_id = ?qc.get_block_id(),
-            current_round = self.consensus.pacemaker.get_current_round().0,
-            root_seq_num = self.consensus.pending_block_tree.root().seq_num.0,
-            root_round = self.consensus.pending_block_tree.root().round.0,
-            "MONAD_EXEC_DEBUG consensus_process_qc"
-        );
+        self.metrics.consensus_events.process_qc.inc();
 
         let mut cmds = Vec::new();
 
@@ -1465,10 +1452,10 @@ where
         tc: &TimeoutCertificate<ST, SCT, EPT>,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         if tc.round < self.consensus.pacemaker.get_current_round() {
-            self.metrics.consensus_events.process_old_tc += 1;
+            self.metrics.consensus_events.process_old_tc.inc();
             return Vec::new();
         }
-        self.metrics.consensus_events.process_tc += 1;
+        self.metrics.consensus_events.process_tc.inc();
 
         let mut cmds = Vec::new();
         cmds.extend(
@@ -1599,7 +1586,7 @@ where
             );
             // when epoch boundary block is committed, this updates
             // epoch manager records
-            self.metrics.consensus_events.commit_block += 1;
+            self.metrics.consensus_events.commit_block.inc();
             self.block_policy.update_committed_block(block);
             self.epoch_manager
                 .schedule_epoch_start(block.header().seq_num, block.get_block_round());
@@ -1786,7 +1773,7 @@ where
             )
             .is_none()
         {
-            self.metrics.consensus_events.failed_ts_validation += 1;
+            self.metrics.consensus_events.failed_ts_validation.inc();
             warn!(
                 prev_block_ts = ?parent_timestamp,
                 curr_block_ts = ?tip.block_header.timestamp_ns,
@@ -1851,8 +1838,11 @@ where
 
         debug!(?v, "vote successful");
         if let Some(start) = self.consensus.proposal_vote_start.take() {
-            self.metrics.consensus_timing.vote_total_us += start.elapsed().as_micros() as u64;
-            self.metrics.consensus_timing.vote_count += 1;
+            self.metrics
+                .consensus_timing
+                .vote_total_us
+                .add(start.elapsed().as_micros() as u64);
+            self.metrics.consensus_timing.vote_count.add(1);
         }
         info!(
             vote_round = v.round.0,
@@ -2052,7 +2042,10 @@ where
                 );
 
                 cmds.push(ConsensusCommand::Publish {
-                    target: RouterTarget::Raptorcast(self.consensus.pacemaker.get_current_epoch()),
+                    target: RouterTarget::Raptorcast {
+                        round: self.consensus.pacemaker.get_current_round(),
+                        epoch: self.consensus.pacemaker.get_current_epoch(),
+                    },
                     message: ConsensusMessage {
                         version: self.version,
                         message: ProtocolMessage::Proposal(ProposalMessage {
@@ -2126,12 +2119,17 @@ where
                         ?try_propose_seq_num,
                         "no eth_header found, can't propose"
                     );
-                    self.metrics.consensus_events.rx_execution_lagging += 1;
+                    self.metrics.consensus_events.rx_execution_lagging.inc();
                     return cmds;
                 };
-                self.metrics.consensus_timing.execution_result_query_total_us +=
-                    exec_result_start.elapsed().as_micros() as u64;
-                self.metrics.consensus_timing.execution_result_query_count += 1;
+                self.metrics
+                    .consensus_timing
+                    .execution_result_query_total_us
+                    .add(exec_result_start.elapsed().as_micros() as u64);
+                self.metrics
+                    .consensus_timing
+                    .execution_result_query_count
+                    .add(1);
                 let _create_proposal_span =
                     tracing::info_span!("create_proposal_span", ?round).entered();
 
@@ -2260,7 +2258,10 @@ mod test {
     use monad_consensus::{
         messages::{
             consensus_message::ProtocolMessage,
-            message::{AdvanceRoundMessage, ProposalMessage, TimeoutMessage, VoteMessage},
+            message::{
+                AdvanceRoundMessage, NoEndorsementMessage, ProposalMessage, TimeoutMessage,
+                VoteMessage,
+            },
         },
         pacemaker::PacemakerCommand,
         validation::{safety::Safety, signing::Verified},
@@ -2273,6 +2274,7 @@ mod test {
         block_validator::BlockValidator,
         checkpoint::RootInfo,
         metrics::Metrics,
+        no_endorsement::NoEndorsement,
         payload::{ConsensusBlockBody, ConsensusBlockBodyInner, RoundSignature},
         quorum_certificate::QuorumCertificate,
         tip::ConsensusTip,
@@ -2497,6 +2499,25 @@ mod test {
             >,
         > {
             self.wrapped_state().handle_vote_message(author, p)
+        }
+
+        fn handle_no_endorsement_message(
+            &mut self,
+            author: NodeId<SCT::NodeIdPubKey>,
+            p: NoEndorsementMessage<SCT>,
+        ) -> Vec<
+            ConsensusCommand<
+                ST,
+                SCT,
+                EthExecutionProtocol,
+                BPT,
+                SBT,
+                MockChainConfig,
+                MockChainRevision,
+            >,
+        > {
+            self.wrapped_state()
+                .handle_no_endorsement_message(author, p)
         }
 
         fn handle_block_sync(
@@ -3002,7 +3023,7 @@ mod test {
     {
         cmds.iter().find_map(|c| match c {
             ConsensusCommand::Publish {
-                target: RouterTarget::Raptorcast(_),
+                target: RouterTarget::Raptorcast { .. },
                 message,
             } => match &message.deref().deref().message {
                 ProtocolMessage::Proposal(p) => Some(p.clone()),
@@ -3179,7 +3200,134 @@ mod test {
                 .get_round(),
             expected_qc_high_round
         );
-        assert_eq!(wrapped_state.metrics.consensus_events.vote_received, 3);
+        assert_eq!(
+            wrapped_state.metrics.consensus_events.vote_received.get(),
+            3
+        );
+    }
+
+    #[test]
+    fn future_no_endorsements_are_not_accumulated() {
+        let num_state = 4;
+        let execution_delay = SeqNum::MAX;
+        let (env, mut ctx) = setup::<
+            SignatureType,
+            SignatureCollectionType,
+            BlockPolicyType,
+            StateBackendType,
+            BlockValidatorType,
+            _,
+            _,
+        >(
+            num_state,
+            ValidatorSetFactory::default(),
+            SimpleRoundRobin::default(),
+            || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
+            || InMemoryStateInner::genesis(execution_delay),
+            EthBlockValidator::default,
+            execution_delay,
+        );
+
+        assert_eq!(ctx[0].consensus_state.get_current_round(), Round(1));
+
+        let no_endorsements = [1_usize, 2, 3]
+            .iter()
+            .copied()
+            .map(|i| {
+                let no_endorsement_msg = NoEndorsementMessage::<SignatureCollectionType>::new(
+                    NoEndorsement {
+                        epoch: Epoch(1),
+                        round: Round(2),
+                        tip_qc_round: Round(0),
+                    },
+                    &env.cert_keys[i],
+                );
+                Verified::<SignatureType, _>::new(no_endorsement_msg, &env.keys[i])
+            })
+            .collect_vec();
+
+        for no_endorsement in no_endorsements {
+            let _ = ctx[0].handle_no_endorsement_message(
+                *no_endorsement.author(),
+                no_endorsement.deref().clone(),
+            );
+        }
+
+        assert_eq!(
+            ctx[0]
+                .metrics
+                .consensus_events
+                .future_no_endorsement_received
+                .get(),
+            3
+        );
+        assert_eq!(
+            ctx[0].metrics.consensus_events.handle_no_endorsement.get(),
+            0
+        );
+        assert_eq!(ctx[0].metrics.consensus_events.created_nec.get(), 0);
+    }
+
+    #[test]
+    fn current_round_no_endorsements_can_form_nec() {
+        let num_state = 4;
+        let execution_delay = SeqNum::MAX;
+        let (env, mut ctx) = setup::<
+            SignatureType,
+            SignatureCollectionType,
+            BlockPolicyType,
+            StateBackendType,
+            BlockValidatorType,
+            _,
+            _,
+        >(
+            num_state,
+            ValidatorSetFactory::default(),
+            SimpleRoundRobin::default(),
+            || EthBlockPolicy::new(GENESIS_SEQ_NUM, execution_delay.0),
+            || InMemoryStateInner::genesis(execution_delay),
+            EthBlockValidator::default,
+            execution_delay,
+        );
+
+        assert_eq!(ctx[0].consensus_state.get_current_round(), Round(1));
+
+        let no_endorsements = [1_usize, 2, 3]
+            .iter()
+            .copied()
+            .map(|i| {
+                let no_endorsement_msg = NoEndorsementMessage::<SignatureCollectionType>::new(
+                    NoEndorsement {
+                        epoch: Epoch(1),
+                        round: Round(1),
+                        tip_qc_round: Round(0),
+                    },
+                    &env.cert_keys[i],
+                );
+                Verified::<SignatureType, _>::new(no_endorsement_msg, &env.keys[i])
+            })
+            .collect_vec();
+
+        for no_endorsement in no_endorsements {
+            let _ = ctx[0].handle_no_endorsement_message(
+                *no_endorsement.author(),
+                no_endorsement.deref().clone(),
+            );
+        }
+
+        assert_eq!(
+            ctx[0]
+                .metrics
+                .consensus_events
+                .future_no_endorsement_received
+                .get(),
+            0
+        );
+        assert_eq!(
+            ctx[0].metrics.consensus_events.handle_no_endorsement.get(),
+            3
+        );
+        assert_eq!(ctx[0].metrics.consensus_events.created_nec.get(), 1);
     }
 
     // When a node locally timesout on a round, it no longer produces votes in that round
@@ -4032,7 +4180,7 @@ mod test {
 
         assert_eq!(n0.consensus_state.get_current_round(), Round(5));
 
-        assert_eq!(n0.metrics.consensus_events.rx_execution_lagging, 0);
+        assert_eq!(n0.metrics.consensus_events.rx_execution_lagging.get(), 0);
 
         // Block 11 carries the state root hash from executing block 6 the state
         // root hash is missing. The certificates are processed - consensus enters new round and commit blocks, but it doesn't vote
@@ -4046,7 +4194,7 @@ mod test {
         let cmds = n0.handle_proposal_message(author, p);
         // invalid execution result, so incoherent and we don't vote
         assert!(!n0.consensus_state.pending_block_tree.is_coherent(&bid_2));
-        assert_eq!(n0.metrics.consensus_events.rx_bad_state_root, 1);
+        assert_eq!(n0.metrics.consensus_events.rx_bad_state_root.get(), 1);
 
         assert_eq!(n0.consensus_state.get_current_round(), Round(6));
         assert_eq!(cmds.len(), 5);
@@ -4490,7 +4638,10 @@ mod test {
         // p2 is not added because author is not the round leader
         assert_eq!(node.consensus_state.blocktree().size(), 1);
         assert_eq!(
-            node.metrics.consensus_events.invalid_proposal_round_leader,
+            node.metrics
+                .consensus_events
+                .invalid_proposal_round_leader
+                .get(),
             1
         );
     }

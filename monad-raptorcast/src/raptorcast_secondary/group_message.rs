@@ -19,11 +19,12 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_peer_discovery::MonadNameRecord;
-use monad_types::{LimitedVec, NodeId, Round, RoundSpan};
+use monad_types::{BoundedU64, LimitedVec, NodeId, Round, RoundSpan};
 
 /// Maximum number of peers/name records allowed in a secondary raptorcast message.
-/// This is to set an upper bound on RLP deserialization memory usage.
-const MAX_PEERS_IN_GROUP: usize = 500;
+/// This is to set an upper bound on RLP deserialization memory usage, and the upper
+/// bound on full-node group size used by deterministic secondary raptorcast.
+pub(crate) const MAX_PEERS_IN_GROUP: usize = 500;
 
 #[derive(RlpEncodable, RlpDecodable, Debug, Eq, PartialEq, Clone)]
 pub struct PrepareGroup<PT: PubKey> {
@@ -92,8 +93,7 @@ pub struct NoConfirm<PT: PubKey> {
 #[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
 pub struct PeerParticipation<PT: PubKey> {
     pub peer: NodeId<PT>,
-    // A score within the range of 0 to 100 representing the peer's rebroadcast participation
-    pub participation_score: u64,
+    pub participation_score: BoundedU64<100>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
@@ -216,7 +216,7 @@ mod tests {
                 let port = (seed + 16) as u16;
 
                 MonadNameRecord::<ST>::new(
-                    NameRecord::new(ip, port, port, port, 0, (seed + 200) as u64),
+                    NameRecord::new(ip, port, Some(port), port, 0, (seed + 200) as u64),
                     &key,
                 )
             })
@@ -311,15 +311,15 @@ mod tests {
             peer_scores: vec![
                 PeerParticipation {
                     peer: nid(2),
-                    participation_score: 85,
+                    participation_score: BoundedU64::new(85).unwrap(),
                 },
                 PeerParticipation {
                     peer: nid(3),
-                    participation_score: 100,
+                    participation_score: BoundedU64::new(100).unwrap(),
                 },
                 PeerParticipation {
                     peer: nid(4),
-                    participation_score: 0,
+                    participation_score: BoundedU64::new(0).unwrap(),
                 },
             ]
             .into(),

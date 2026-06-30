@@ -257,10 +257,10 @@ where
         debug!(?certificate, "advancing round");
         match &certificate {
             RoundCertificate::Qc(_) => {
-                metrics.consensus_events.enter_new_round_qc += 1;
+                metrics.consensus_events.enter_new_round_qc.inc();
             }
             RoundCertificate::Tc(_) => {
-                metrics.consensus_events.enter_new_round_tc += 1;
+                metrics.consensus_events.enter_new_round_tc.inc();
             }
         };
 
@@ -420,7 +420,7 @@ where
                 validator_mapping,
             ) {
                 Ok(tc) => {
-                    metrics.consensus_events.created_tc += 1;
+                    metrics.consensus_events.created_tc.inc();
                     ret_commands.extend(self.process_certificate(
                         metrics,
                         epoch_manager,
@@ -681,8 +681,8 @@ mod test {
             NodeId::new(keys[2].pubkey()),
             tm2,
         );
-        assert_eq!(metrics.consensus_events.created_tc, 1);
-        assert_eq!(metrics.consensus_events.enter_new_round_tc, 1);
+        assert_eq!(metrics.consensus_events.created_tc.get(), 1);
+        assert_eq!(metrics.consensus_events.enter_new_round_tc.get(), 1);
         assert_eq!(pacemaker.get_current_round(), Round(2));
         assert_eq!(pacemaker.phase, PhaseHonest::Zero);
         assert_eq!(
@@ -796,8 +796,8 @@ mod test {
             NodeId::new(keys[2].pubkey()),
             tm2_invalid,
         );
-        assert_eq!(metrics.consensus_events.created_tc, 0);
-        assert_eq!(metrics.consensus_events.enter_new_round_tc, 0);
+        assert_eq!(metrics.consensus_events.created_tc.get(), 0);
+        assert_eq!(metrics.consensus_events.enter_new_round_tc.get(), 0);
         assert_eq!(pacemaker.get_current_round(), Round(1));
         assert_eq!(cmds, vec![]);
         assert_eq!(pacemaker.phase, PhaseHonest::One);
@@ -915,8 +915,8 @@ mod test {
             NodeId::new(keys[2].pubkey()),
             tm2_valid,
         );
-        assert_eq!(metrics.consensus_events.created_tc, 1);
-        assert_eq!(metrics.consensus_events.enter_new_round_tc, 1);
+        assert_eq!(metrics.consensus_events.created_tc.get(), 1);
+        assert_eq!(metrics.consensus_events.enter_new_round_tc.get(), 1);
         assert_eq!(pacemaker.phase, PhaseHonest::Zero);
         assert_eq!(pacemaker.get_current_round(), Round(2));
 

@@ -21,26 +21,23 @@ use std::{
     time::Duration,
 };
 
-use ffi::SyncRequest;
+use alloy_consensus::Header;
 use futures::{Stream, StreamExt};
-use ipc::StateSyncIpc;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
-use monad_eth_types::EthExecutionProtocol;
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{MonadEvent, StateSyncCommand, StateSyncEvent, StateSyncNetworkMessage};
-use monad_types::{NodeId, SeqNum};
+use monad_types::{ExecutionProtocol, FinalizedHeader, NodeId, SeqNum};
 use monad_validator::signature_collection::SignatureCollection;
 
-#[allow(dead_code, non_camel_case_types, non_upper_case_globals)]
-pub mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/state_sync.rs"));
-}
+use crate::{
+    client::{StateSyncClient, SyncRequest},
+    ipc::StateSyncIpc,
+};
 
-mod ffi;
+mod client;
 mod ipc;
-mod outbound_requests;
 
 monad_executor::metric_consts! {
     GAUGE_STATESYNC_SYNCING {
@@ -73,9 +70,39 @@ monad_executor::metric_consts! {
     }
 }
 
-pub struct StateSync<ST, SCT>
+fn init_executor_metrics() -> ExecutorMetrics {
+    ExecutorMetrics::with_metric_defs(&[
+        GAUGE_STATESYNC_SYNCING,
+        GAUGE_STATESYNC_PROGRESS_ESTIMATE,
+        GAUGE_STATESYNC_LAST_TARGET,
+        GAUGE_STATESYNC_SERVER_PENDING_REQUESTS,
+        GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_SUCCESS,
+        GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_FAILED,
+        GAUGE_STATESYNC_SERVER_TOTAL_SERVICE_TIME_US,
+    ])
+}
+
+enum StateSyncMode<PT: PubKey> {
+    Sync(StateSyncClient<PT>),
+    /// transitions to Live once the StartExecution command is executed
+    /// note that Live -> Sync is not a valid state transition
+    Live(StateSyncIpc<PT>),
+}
+
+/// State sync only tracks block height; execution payload is handled elsewhere.
+fn sync_target_from_finalized_header<EPT: ExecutionProtocol>(
+    header: &EPT::FinalizedHeader,
+) -> Header {
+    Header {
+        number: header.seq_num().0,
+        ..Default::default()
+    }
+}
+
+pub struct StateSyncExecutor<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
+    EPT: ExecutionProtocol,
 {
     incoming_request_timeout: Duration,
     uds_path: String,
@@ -84,12 +111,13 @@ where
 
     waker: Option<Waker>,
     metrics: ExecutorMetrics,
-    _phantom: PhantomData<(ST, SCT)>,
+    _phantom: PhantomData<(ST, SCT, EPT)>,
 }
 
-impl<ST, SCT> StateSync<ST, SCT>
+impl<ST, SCT, EPT> StateSyncExecutor<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
+    EPT: ExecutionProtocol,
 {
     pub fn new(
         db_paths: Vec<String>,
@@ -106,7 +134,7 @@ where
             incoming_request_timeout,
             uds_path,
 
-            mode: StateSyncMode::Sync(ffi::StateSync::start(
+            mode: StateSyncMode::Sync(StateSyncClient::start(
                 &db_paths,
                 sq_thread_cpu,
                 &state_sync_init_peers,
@@ -115,7 +143,7 @@ where
             )),
 
             waker: None,
-            metrics: Default::default(),
+            metrics: init_executor_metrics(),
             _phantom: Default::default(),
         };
 
@@ -125,26 +153,22 @@ where
     }
 
     fn update_syncing_metrics(&mut self) {
-        self.metrics[GAUGE_STATESYNC_SYNCING] = match &self.mode {
-            StateSyncMode::Sync(_) => 1,
-            StateSyncMode::Live(_) => 0,
-        };
+        self.metrics
+            .gauge(GAUGE_STATESYNC_SYNCING)
+            .set(match &self.mode {
+                StateSyncMode::Sync(_) => 1,
+                StateSyncMode::Live(_) => 0,
+            });
     }
 }
 
-enum StateSyncMode<PT: PubKey> {
-    Sync(ffi::StateSync<PT>),
-    /// transitions to Live once the StartExecution command is executed
-    /// note that Live -> Sync is not a valid state transition
-    Live(StateSyncIpc<PT>),
-}
-
-impl<ST, SCT> Executor for StateSync<ST, SCT>
+impl<ST, SCT, EPT> Executor for StateSyncExecutor<ST, SCT, EPT>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
 {
-    type Command = StateSyncCommand<ST, EthExecutionProtocol>;
+    type Command = StateSyncCommand<ST, EPT>;
 
     fn exec(&mut self, commands: Vec<Self::Command>) {
         for command in commands {
@@ -156,8 +180,11 @@ where
                             unreachable!("Live -> Sync is not a valid state transition")
                         }
                     };
-                    self.metrics[GAUGE_STATESYNC_LAST_TARGET] = header.0.number;
-                    statesync.update_target(header.0);
+                    let target = sync_target_from_finalized_header::<EPT>(&header);
+                    self.metrics
+                        .gauge(GAUGE_STATESYNC_LAST_TARGET)
+                        .set(target.number);
+                    statesync.update_target(target);
                     if let Some(waker) = self.waker.take() {
                         waker.wake();
                     }
@@ -281,13 +308,14 @@ where
     }
 }
 
-impl<ST, SCT> Stream for StateSync<ST, SCT>
+impl<ST, SCT, EPT> Stream for StateSyncExecutor<ST, SCT, EPT>
 where
     Self: Unpin,
     ST: CertificateSignatureRecoverable + Unpin,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>> + Unpin,
+    EPT: ExecutionProtocol,
 {
-    type Item = MonadEvent<ST, SCT, EthExecutionProtocol>;
+    type Item = MonadEvent<ST, SCT, EPT>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.deref_mut();
@@ -301,7 +329,9 @@ where
         match &mut this.mode {
             StateSyncMode::Sync(sync) => {
                 if let Some(progress) = sync.progress_estimate() {
-                    this.metrics[GAUGE_STATESYNC_PROGRESS_ESTIMATE] = progress.0;
+                    this.metrics
+                        .gauge(GAUGE_STATESYNC_PROGRESS_ESTIMATE)
+                        .set(progress.0);
                 }
 
                 if let Poll::Ready(event) = sync.poll_next_unpin(cx) {
@@ -330,15 +360,21 @@ where
                 }
             }
             StateSyncMode::Live(execution_ipc) => {
-                this.metrics[GAUGE_STATESYNC_SERVER_PENDING_REQUESTS] =
-                    execution_ipc.pending_request_len() as u64
-                        + execution_ipc.is_servicing_request() as u64;
-                this.metrics[GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_SUCCESS] =
-                    execution_ipc.num_syncdone_success() as u64;
-                this.metrics[GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_FAILED] =
-                    execution_ipc.num_syncdone_failed() as u64;
-                this.metrics[GAUGE_STATESYNC_SERVER_TOTAL_SERVICE_TIME_US] =
-                    execution_ipc.total_service_time_us() as u64;
+                this.metrics
+                    .gauge(GAUGE_STATESYNC_SERVER_PENDING_REQUESTS)
+                    .set(
+                        execution_ipc.pending_request_len() as u64
+                            + execution_ipc.is_servicing_request() as u64,
+                    );
+                this.metrics
+                    .gauge(GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_SUCCESS)
+                    .set(execution_ipc.num_syncdone_success() as u64);
+                this.metrics
+                    .gauge(GAUGE_STATESYNC_SERVER_NUM_SYNCDONE_FAILED)
+                    .set(execution_ipc.num_syncdone_failed() as u64);
+                this.metrics
+                    .gauge(GAUGE_STATESYNC_SERVER_TOTAL_SERVICE_TIME_US)
+                    .set(execution_ipc.total_service_time_us() as u64);
                 if let Poll::Ready(maybe_response) = execution_ipc.response_rx.poll_recv(cx) {
                     let (to, message, completion) = maybe_response.expect("did StateSyncIpc die?");
                     tracing::debug!(

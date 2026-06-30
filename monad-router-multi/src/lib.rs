@@ -108,10 +108,10 @@ where
         assert!(dp.block_until_ready(Duration::from_secs(1)));
 
         let tcp_socket = dp.tcp_sockets.take(TcpSocketId::Raptorcast).unwrap();
-        let authenticated = dp
+        let authenticated_socket = dp
             .udp_sockets
             .take(UdpSocketId::AuthenticatedRaptorcast)
-            .map(|socket| (socket, auth_protocol));
+            .expect("authenticated raptorcast socket");
         let direct_udp = match (
             dp.udp_sockets.take(UdpSocketId::DirectUdp),
             direct_udp_auth_protocol,
@@ -163,14 +163,13 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
 
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
             tcp_socket,
-            authenticated,
+            (authenticated_socket, auth_protocol),
             direct_udp,
             non_authenticated_socket,
             control,
@@ -222,7 +221,6 @@ where
             recv_group_messages,
             send_group_infos,
             send_outbound_to_primary,
-            current_epoch,
         );
         self.rc_secondary = rc_secondary;
     }
@@ -236,7 +234,6 @@ where
         channel_to_primary_outbound: UnboundedSender<
             SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
         >,
-        current_epoch: Epoch,
     ) -> Option<RaptorCastSecondary<ST, M, OM, SE, PD>> {
         let secondary_instance: RaptorCastConfigSecondary<CertificateSignaturePubKey<ST>> =
             match mode {
@@ -303,7 +300,6 @@ where
                 recv_group_messages,
                 send_group_infos,
                 channel_to_primary_outbound,
-                current_epoch,
             )),
         }
     }

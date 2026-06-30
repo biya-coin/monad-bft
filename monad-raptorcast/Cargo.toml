@@ -25,10 +25,11 @@ monad-types = { workspace = true }
 monad-validator = { workspace = true }
 monad-wireauth = { workspace = true }
 
+alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
-fixed = { workspace = true}
+fixed = { workspace = true }
 futures = { workspace = true }
 governor = { workspace = true }
 hex = { workspace = true }
@@ -39,13 +40,12 @@ lru = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+tracing = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
 monad-testutil = { workspace = true }
-alloy-primitives = { workspace = true }
 
 byte-unit = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -55,10 +55,9 @@ futures-util = { workspace = true }
 humantime = { workspace = true }
 insta = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
 opentelemetry-semantic-conventions = { workspace = true }
-rand_distr = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 rstest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tikv-jemallocator = { workspace = true }

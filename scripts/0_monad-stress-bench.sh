@@ -65,7 +65,7 @@ STRESS_NODE_ADDR="${STRESS_NODE_ADDR:-127.0.0.1:26657}"
 STRESS_GRPC_ADDR="${STRESS_GRPC_ADDR:-127.0.0.1:19900}"
 MIN_GAS_PRICE="${MIN_GAS_PRICE:-1byb}"
 # build 默认清 release 产物再编译，避免 monad-node 仍链接旧的 monad-chain-config 等 crate
-BUILD_NO_CACHE="${BUILD_NO_CACHE:-0}"
+BUILD_NO_CACHE="${BUILD_NO_CACHE:-1}"
 
 # SeiDB SS（state store）/ SC（state commitment）启动参数
 # 默认启用 SeiDB（SC=memiavl committer.db / SS=pebbledb）。monad standalone bootstrap 兼容性
@@ -200,21 +200,66 @@ ensure_c23_compiler_env() {
   fi
 }
 
-ensure_cmake_env() {
-  # 系统 cmake 3.22 不满足 monad-event-ring（需 ≥3.23）；优先用 pip 安装的 cmake。
-  if [[ -x "${HOME}/.local/bin/cmake" ]]; then
-    export PATH="${HOME}/.local/bin:${PATH}"
-  fi
-  local ver
-  ver="$(cmake --version 2>/dev/null | awk '/version/ {print $3; exit}')"
-  if [[ -n "$ver" ]]; then
-    local major minor
-    IFS=. read -r major minor _ <<<"$ver"
-    if (( major < 3 || (major == 3 && minor < 23) )); then
-      echo "note: cmake $ver < 3.23，尝试 pip install --user 'cmake>=3.23' ..."
-      pip3 install --user 'cmake>=3.23' >/dev/null 2>&1 || true
-      [[ -x "${HOME}/.local/bin/cmake" ]] && export PATH="${HOME}/.local/bin:${PATH}"
+cmake_semver_ok() {
+  local ver="$1" major minor
+  [[ -n "$ver" ]] || return 1
+  IFS=. read -r major minor _ <<<"$ver"
+  (( major > 3 || (major == 3 && minor >= 23) ))
+}
+
+# 返回第一个可用且 >=3.23 的 cmake 路径；失败时不改 PATH。
+select_working_cmake() {
+  local candidate ver
+  for candidate in \
+    "${MONAD_CMAKE:-}" \
+    /usr/bin/cmake \
+    /usr/local/bin/cmake \
+    "${HOME}/.local/bin/cmake" \
+    cmake; do
+    [[ -n "$candidate" ]] || continue
+    [[ -x "$candidate" ]] || continue
+    ver="$("$candidate" --version 2>/dev/null | awk '/version/ {print $3; exit}')" || continue
+    if cmake_semver_ok "$ver"; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
+  done
+  return 1
+}
+
+ensure_cmake_env() {
+  # monad-event-ring 需 cmake >= 3.23。Ubuntu 24.04 自带 3.28；勿盲目把损坏的 pip cmake 放到 PATH 最前。
+  local cmake_bin ver
+  if cmake_bin="$(select_working_cmake)"; then
+    :
+  else
+    echo "note: 未找到 cmake>=3.23，尝试 pip install --user 'cmake>=3.23' ..."
+    pip3 install --user 'cmake>=3.23' >/dev/null 2>&1 || true
+    cmake_bin="$(select_working_cmake)" || true
+  fi
+  if [[ -z "${cmake_bin:-}" ]]; then
+    die "需要 cmake >= 3.23（sudo apt install cmake 或修复 ~/.local/bin/cmake）"
+  fi
+  ver="$("$cmake_bin" --version 2>/dev/null | awk '/version/ {print $3; exit}')" || true
+  export MONAD_CMAKE="$cmake_bin"
+  export CMAKE="$cmake_bin"
+  local cmake_dir
+  cmake_dir="$(dirname "$cmake_bin")"
+  # 避免 cargo/cmake-rs 仍命中损坏的 ~/.local/bin/cmake
+  if [[ -x "${HOME}/.local/bin/cmake" ]] && [[ "$cmake_bin" != "${HOME}/.local/bin/cmake" ]]; then
+    if ! "${HOME}/.local/bin/cmake" --version >/dev/null 2>&1; then
+      export PATH="${PATH//:${HOME}\/.local\/bin/:/:}"
+      export PATH="${PATH/#${HOME}\/.local\/bin:/}"
+      export PATH="${PATH/%:${HOME}\/.local\/bin/}"
+    fi
+  fi
+  if [[ "$cmake_dir" != "." && ":$PATH:" != *":$cmake_dir:"* ]]; then
+    export PATH="$cmake_dir:$PATH"
+  fi
+  if [[ "${cmake_bin}" == "${HOME}/.local/bin/cmake" ]] && [[ ! -x /usr/bin/cmake ]]; then
+    echo "note: 使用 pip cmake $ver"
+  elif [[ "${cmake_bin}" == /usr/bin/cmake ]]; then
+    echo "note: 使用系统 cmake $ver"
   fi
 }
 
@@ -239,13 +284,15 @@ have_boost_183() {
 check_build_full_prereqs() {
   local missing=0
   ensure_cmake_env
-  ver="$(cmake --version 2>/dev/null | awk '/version/ {print $3; exit}')"
+  ver="$("${MONAD_CMAKE:-cmake}" --version 2>/dev/null | awk '/version/ {print $3; exit}')" || ver=""
   if [[ -n "$ver" ]]; then
-    IFS=. read -r major minor _ <<<"$ver"
-    if (( major < 3 || (major == 3 && minor < 23) )); then
+    if ! cmake_semver_ok "$ver"; then
       echo "error: cmake $ver < 3.23（pip3 install --user 'cmake>=3.23'）" >&2
       missing=1
     fi
+  else
+    echo "error: 无法获取 cmake 版本" >&2
+    missing=1
   fi
   if ! command -v clang-19 >/dev/null 2>&1; then
     echo "error: 未找到 clang-19。monad-rpc 的 bindgen 需要 C23（bool/constexpr），clang-14 不够。" >&2
@@ -364,11 +411,8 @@ find target/release -maxdepth 4 -name "libmonad_execution.so" -type f -exec cp -
 cmd_build() {
   prepare_fresh_release_build
   echo "==> build biyachaind"
-  if build_no_cache_enabled; then
-    (cd "$REPO/biyachain-core" && go build -a -o bin/biyachaind ./cmd/biyachaind)
-  else
-    (cd "$REPO/biyachain-core" && go build -o bin/biyachaind ./cmd/biyachaind)
-  fi
+  (cd "$REPO/biyachain-core" && go build -o bin/biyachaind ./cmd/biyachaind)
+  echo "biyachaind build done"
   ensure_bindgen_clang_env
   ensure_cmake_env
   ensure_c23_compiler_env
@@ -384,6 +428,7 @@ cmd_build() {
   fi
   # compose 挂载 target/release/keystore，cargo 产物名为 monad-keystore
   ln -sf monad-keystore "$REPO/target/release/keystore"
+  stage_release_execution_libs
   [[ -f "$REPO/target/release/monad-node" ]] || die "monad-node 未生成，请检查编译日志"
   echo "build done（cosmos-txpool-feed serve :26657，可替代 monad-rpc 给 chain-stresser）"
   print_release_bin_times
@@ -409,6 +454,7 @@ cmd_build_full() {
     exit 1
   fi
   ln -sf monad-keystore "$REPO/target/release/keystore"
+  stage_release_execution_libs
   echo "build-full done."
   print_release_bin_times
   [[ -f "$REPO/target/release/monad-rpc" ]] && \
@@ -695,6 +741,30 @@ cleanup_bench_stale_files() {
   fi
 }
 
+stage_release_execution_libs() {
+  local triedb_so exec_so lib
+  triedb_so="$(find "$REPO/target/release" -name "libtriedb_driver.so" -type f 2>/dev/null | head -1)"
+  if [[ -n "$triedb_so" ]]; then
+    cp -a "$triedb_so" "$REPO/target/release/"
+    if [[ -f "$REPO/docker/filter-dependent-shared-objects.py" ]]; then
+      ldd "$triedb_so" | python3 "$REPO/docker/filter-dependent-shared-objects.py" | while read -r lib; do
+        [[ -f "$lib" ]] && cp -a "$lib" "$REPO/target/release/"
+      done
+    fi
+  fi
+  exec_so="$(find "$REPO/target/release" -maxdepth 5 -name "libmonad_execution.so" -type f 2>/dev/null | head -1)"
+  if [[ -n "$exec_so" ]]; then
+    cp -a "$exec_so" "$REPO/target/release/"
+  fi
+}
+
+prepare_monad_ld_path() {
+  local libdir="$REPO/target/release"
+  if [[ -f "$libdir/libmonad_execution.so" ]]; then
+    export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
 prepare_biyachaind_ld_path() {
   local lib
   lib="$(biyachain_lib_path || true)"
@@ -820,6 +890,7 @@ run_monad_node() {
 
   if [[ "$mode" == fg ]]; then
     [[ -S "$abci_sock" ]] || die "ABCI socket 不存在: $abci_sock（请先: $0 biyachaind $n）"
+    prepare_monad_ld_path
     export MONAD_ABCI_ENDPOINT="unix://$abci_sock"
     export MONAD_COSMOS_GENESIS_PATH="$WORK/genesis.json.reference"
     export RUST_LOG="${RUST_LOG:-info}"
@@ -833,8 +904,10 @@ run_monad_node() {
   logdir="$(node_log_dir_abs)"
   logf="$logdir/monad-${n}.log"
   pidf="$logdir/monad-${n}.pid"
+  prepare_monad_ld_path
   : >"$logf"
   nohup env \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
     MONAD_ABCI_ENDPOINT="unix://$abci_sock" \
     MONAD_COSMOS_GENESIS_PATH="$WORK/genesis.json.reference" \
     RUST_LOG="${RUST_LOG:-info}" \
@@ -897,6 +970,7 @@ cmd_start() {
     cmd_setup_ips
   fi
   apply_monad_sysctl
+  ensure_monad_p2p_bind_ips
 
   echo "==> 启动 biyachaind x4"
   for n in "${MONAD_BENCH_NODES[@]}"; do
@@ -917,7 +991,7 @@ cmd_start() {
   done
 
   echo "==> 等待 P2P 就绪"
-  sleep 3
+  wait_mempool_socket "$WORK/monad-a/mempool.sock" "monad-a" 120
   if bench_start_rpc_enabled; then
     start_rpc_feeds_bg
   fi
@@ -1169,11 +1243,28 @@ start_rpc_feed_bg() {
   echo "    feed-$n: listen=${bind}:$port pid=$! log=$logf"
 }
 
+ensure_monad_p2p_bind_ips() {
+  if bench_p2p_remote_enabled; then
+    return 0
+  fi
+  local n host bind
+  for n in "${MONAD_BENCH_NODES[@]}"; do
+    host="$(node_monad_ip "$n")"
+    bind="$(grep -E '^bind_address_host' "$WORK/monad-$n/node.toml" 2>/dev/null | sed -n 's/^bind_address_host = "\([^"]*\)".*/\1/p')"
+    if [[ -n "$bind" && "$bind" != "$host" ]]; then
+      echo "==> monad-$n P2P 绑定 $bind != $host，重建 node.toml / bootstrap（$0 repair-monad）"
+      MONAD_BFT_ROOT="$REPO" WORK="$WORK" "$REPO/scripts/mult-run.sh" init-monad-node
+      return 0
+    fi
+  done
+}
+
 start_rpc_feeds_bg() {
   local n shards
   shards="$(stress_shard_count)"
   echo "==> 后台启动 cosmos-txpool-feed x${shards}"
   for n in "${MONAD_BENCH_NODES[@]:0:$shards}"; do
+    wait_mempool_socket "$WORK/monad-$n/mempool.sock" "monad-$n" 120
     start_rpc_feed_bg "$n"
   done
 }
