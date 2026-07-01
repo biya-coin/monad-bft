@@ -53,27 +53,32 @@ pub async fn broadcast_tx_async(
     json_ok(id, ResultBroadcastTx::accepted(hash))
 }
 
-/// `broadcast_tx_sync` – forward tx and wait for the IPC send to complete.
+/// `broadcast_tx_sync` – forward tx and wait for CheckTx.
 ///
 /// Mirrors `BroadcastTxSync` in mempool.go:
-///   - Waits for the cosmos-txpool-ipc socket write to finish (equivalent of
-///     CheckTx acknowledgement at the transport level).
+///   - Waits for monad-node to run ABCI CheckTx through the cosmos-txpool-ipc
+///     socket.
 ///   - Does NOT wait for block inclusion.
-///   - Returns `{code:0, hash:"..."}` on success.
-///
-/// Note: monad-bft does not expose a CheckTx response over the IPC socket
-/// (unlike standard CometBFT which runs ABCI CheckTx).  We therefore return
-/// `code=0` whenever the forwarding succeeds.  Full CheckTx semantics can be
-/// added later by piping a response channel through the IPC protocol.
+///   - Returns the CheckTx code/log/codespace on success.
 pub async fn broadcast_tx_sync(
     resources: &NodeRpcResources,
     tx_b64: &str,
     id: i64,
 ) -> actix_web::HttpResponse {
-    // For now, sync == async at the transport level.
-    // When monad-bft adds a CheckTx response channel this function will block
-    // on the response instead of returning immediately.
-    broadcast_tx_async(resources, tx_b64, id).await
+    let tx_bytes = match decode_tx(tx_b64, id) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    let hash = tx_hash(&tx_bytes);
+    debug!(hash = %hex::encode_upper(hash), "broadcast_tx_sync: forwarding tx");
+
+    let response = match forward_tx_sync(resources, tx_bytes, id).await {
+        Ok(response) => response,
+        Err(resp) => return resp,
+    };
+
+    json_ok(id, ResultBroadcastTx::from_check_tx(hash, response))
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +158,27 @@ async fn forward_tx(
         .await
         .map_err(|e| {
             warn!("broadcast_tx: IPC forward failed: {e}");
+            json_err(id, -32603, format!("failed to forward tx to mempool: {e}"))
+        })
+}
+
+async fn forward_tx_sync(
+    resources: &NodeRpcResources,
+    tx_bytes: Vec<u8>,
+    id: i64,
+) -> Result<monad_cometbft_proto::cometbft::abci::v1::CheckTxResponse, actix_web::HttpResponse> {
+    let ipc_path = resources.cosmos_ipc_path.as_ref().ok_or_else(|| {
+        json_err(
+            id,
+            -32603,
+            "cosmos IPC path not configured; broadcast unavailable",
+        )
+    })?;
+
+    monad_txpool::cosmos_txpool_ipc::feed_raw_tx_sync(ipc_path, tx_bytes)
+        .await
+        .map_err(|e| {
+            warn!("broadcast_tx_sync: IPC forward failed: {e}");
             json_err(id, -32603, format!("failed to forward tx to mempool: {e}"))
         })
 }

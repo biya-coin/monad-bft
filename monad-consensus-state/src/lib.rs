@@ -107,6 +107,12 @@ where
     canonical_proposed_tip: Option<BlockId>,
     vote_delay_timer_start: Option<VoteDelayTimerStart>,
     vote_delay_metrics: VoteDelayMetricsWindow,
+    /// Set when handling a proposal; consumed when the node reaches vote-ready.
+    proposal_vote_start: Option<std::time::Instant>,
+    /// Set when vote is scheduled (VoteReady); consumed when the vote is sent.
+    vote_ready_at: Option<std::time::Instant>,
+    /// Set after emitting a finalized commit; used to measure finalized block intervals.
+    last_finalized_commit_at: Option<std::time::Instant>,
 }
 
 impl<ST, SCT, EPT, BPT, SBT, CCT, CRT> PartialEq
@@ -287,6 +293,9 @@ where
             canonical_proposed_tip: None,
             vote_delay_timer_start: None,
             vote_delay_metrics: VoteDelayMetricsWindow::default(),
+            proposal_vote_start: None,
+            vote_ready_at: None,
+            last_finalized_commit_at: None,
         }
     }
 
@@ -399,6 +408,7 @@ where
     pub fn handle_timeout_expiry(
         &mut self,
         timeout_round: Round,
+        record_local_timeout_metrics: bool,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         let mut cmds = Vec::new();
 
@@ -406,7 +416,13 @@ where
             return cmds;
         }
 
-        self.metrics.consensus_events.local_timeout += 1;
+        if record_local_timeout_metrics {
+            self.metrics.consensus_events.local_timeout += 1;
+            if let Some(elapsed) = self.consensus.pacemaker.round_timer_elapsed() {
+                self.metrics.consensus_timing.local_timeout_total_us +=
+                    elapsed.as_micros() as u64;
+            }
+        }
 
         let lookup_leader = |round: Round| {
             let epoch = self
@@ -468,10 +484,29 @@ where
         let block_id = p.tip.block_header.get_id();
         debug!(?author, proposal = ?p, ?block_id, "proposal message");
         self.metrics.consensus_events.handle_proposal += 1;
+        info!(
+            ?author,
+            proposal_round = p.proposal_round.0,
+            block_round = p.tip.block_header.block_round.0,
+            seq_num = p.tip.block_header.seq_num.0,
+            ?block_id,
+            body_id = ?p.tip.block_header.block_body_id,
+            parent_id = ?p.tip.block_header.get_parent_id(),
+            qc_round = p.tip.block_header.qc.get_round().0,
+            current_round = self.consensus.pacemaker.get_current_round().0,
+            "MONAD_EXEC_DEBUG consensus_proposal_received"
+        );
 
         let mut cmds = Vec::new();
 
         if p.proposal_round <= self.consensus.pending_block_tree.root().round {
+            info!(
+                proposal_round = p.proposal_round.0,
+                root_round = self.consensus.pending_block_tree.root().round.0,
+                seq_num = p.tip.block_header.seq_num.0,
+                ?block_id,
+                "MONAD_EXEC_DEBUG consensus_proposal_drop_old"
+            );
             debug!(
                 proposal_round = ?p.proposal_round,
                 block_round =? p.tip.block_header.block_round,
@@ -507,6 +542,15 @@ where
             .election
             .get_leader(proposal_round, validator_set.get_members());
         if proposal_round > pacemaker_round || author != expected_leader {
+            info!(
+                ?author,
+                ?expected_leader,
+                proposal_round = proposal_round.0,
+                pacemaker_round = pacemaker_round.0,
+                seq_num = p.tip.block_header.seq_num.0,
+                ?block_id,
+                "MONAD_EXEC_DEBUG consensus_proposal_drop_leader_or_round"
+            );
             debug!(
                 ?pacemaker_round,
                 ?proposal_round,
@@ -524,6 +568,12 @@ where
             .safety
             .is_safe_to_handle_proposal(proposal_round)
         {
+            info!(
+                proposal_round = proposal_round.0,
+                seq_num = p.tip.block_header.seq_num.0,
+                ?block_id,
+                "MONAD_EXEC_DEBUG consensus_proposal_drop_not_safe_to_handle"
+            );
             // TODO emit evidence if this is a *different* block for the same round
             debug!(
                 ?proposal_round,
@@ -533,7 +583,15 @@ where
         }
         self.consensus.safety.handle_proposal(proposal_round);
 
+        self.consensus.proposal_vote_start = Some(std::time::Instant::now());
         let Some(block) = self.validate_block(p.tip.block_header.clone(), p.block_body) else {
+            self.consensus.proposal_vote_start = None;
+            info!(
+                proposal_round = proposal_round.0,
+                seq_num = p.tip.block_header.seq_num.0,
+                ?block_id,
+                "MONAD_EXEC_DEBUG consensus_proposal_drop_validate_block"
+            );
             return cmds;
         };
 
@@ -575,6 +633,7 @@ where
         let block_round = header.block_round;
         let block_author = header.author;
         let seq_num = header.seq_num;
+        let block_id = header.get_id();
 
         let epoch = self
             .epoch_manager
@@ -588,6 +647,14 @@ where
             .election
             .get_leader(block_round, validator_set.get_members());
         if block_author != block_round_leader {
+            info!(
+                ?block_author,
+                ?block_round_leader,
+                block_round = block_round.0,
+                seq_num = seq_num.0,
+                ?block_id,
+                "MONAD_EXEC_DEBUG consensus_validate_block_drop_not_leader"
+            );
             return None;
         }
 
@@ -615,9 +682,25 @@ where
                     ?err,
                     "dropping proposal, block validation failed"
                 );
+                info!(
+                    block_round = block_round.0,
+                    ?block_author,
+                    seq_num = seq_num.0,
+                    ?block_id,
+                    ?err,
+                    "MONAD_EXEC_DEBUG consensus_validate_block_error"
+                );
                 return None;
             }
         };
+        info!(
+            block_round = block_round.0,
+            ?block_author,
+            seq_num = seq_num.0,
+            block_id = ?block.get_id(),
+            body_id = ?block.get_body_id(),
+            "MONAD_EXEC_DEBUG consensus_validate_block_ok"
+        );
 
         // TODO: ts adjustments are disabled anyways. this needs to be moved to
         // where timestamp validation is done, in block_policy right now.
@@ -649,11 +732,32 @@ where
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         debug!(?author, ?vote_msg, "vote message");
         let vote_round = vote_msg.vote.round;
+        info!(
+            ?author,
+            vote_round = vote_round.0,
+            vote_block_id = ?vote_msg.vote.id,
+            current_round = self.consensus.pacemaker.get_current_round().0,
+            "MONAD_EXEC_DEBUG consensus_vote_received"
+        );
         if vote_round < self.consensus.pacemaker.get_current_round() {
+            info!(
+                ?author,
+                vote_round = vote_round.0,
+                current_round = self.consensus.pacemaker.get_current_round().0,
+                vote_block_id = ?vote_msg.vote.id,
+                "MONAD_EXEC_DEBUG consensus_vote_drop_old"
+            );
             self.metrics.consensus_events.old_vote_received += 1;
             return Default::default();
         }
         if vote_round > self.consensus.pacemaker.get_current_round() + FUTURE_VOTE_BOUND {
+            info!(
+                ?author,
+                vote_round = vote_round.0,
+                current_round = self.consensus.pacemaker.get_current_round().0,
+                vote_block_id = ?vote_msg.vote.id,
+                "MONAD_EXEC_DEBUG consensus_vote_drop_future"
+            );
             self.metrics.consensus_events.future_vote_received += 1;
             return Default::default();
         }
@@ -683,6 +787,12 @@ where
 
         if let Some(qc) = maybe_qc {
             debug!(?qc, "created QC");
+            info!(
+                qc_round = qc.get_round().0,
+                qc_block_id = ?qc.get_block_id(),
+                current_round = self.consensus.pacemaker.get_current_round().0,
+                "MONAD_EXEC_DEBUG consensus_qc_created"
+            );
             self.metrics.consensus_events.created_qc += 1;
 
             cmds.extend(self.process_qc(&qc));
@@ -772,7 +882,7 @@ where
                 // broadcast Timeout message immediately if received
                 // TC to advance round. this helps other validators to
                 // form their own TC
-                cmds.extend(self.handle_timeout_expiry(tc.round));
+                cmds.extend(self.handle_timeout_expiry(tc.round, false));
                 cmds.extend(self.process_tc(tc));
             }
             Some(RoundCertificate::Tc(tc)) if tc.round > current_round => {
@@ -1210,6 +1320,12 @@ where
 
         debug!(?round, ?vote, ?current_leader, ?next_leader, "sending vote");
 
+        if let Some(ready_at) = self.consensus.vote_ready_at.take() {
+            self.metrics.consensus_timing.vote_send_wait_total_us +=
+                ready_at.elapsed().as_micros() as u64;
+            self.metrics.consensus_timing.vote_send_wait_count += 1;
+        }
+
         // start the vote-timer for the next round
         let next_round = round + Round(1);
         let vote_pace = self
@@ -1241,10 +1357,24 @@ where
         qc: &QuorumCertificate<SCT>,
     ) -> Vec<ConsensusCommand<ST, SCT, EPT, BPT, SBT, CCT, CRT>> {
         if qc.info.round < self.consensus.pacemaker.get_current_round() {
+            info!(
+                qc_round = qc.info.round.0,
+                current_round = self.consensus.pacemaker.get_current_round().0,
+                qc_block_id = ?qc.get_block_id(),
+                "MONAD_EXEC_DEBUG consensus_qc_drop_old"
+            );
             self.metrics.consensus_events.process_old_qc += 1;
             return Vec::new();
         }
         self.metrics.consensus_events.process_qc += 1;
+        info!(
+            qc_round = qc.get_round().0,
+            qc_block_id = ?qc.get_block_id(),
+            current_round = self.consensus.pacemaker.get_current_round().0,
+            root_seq_num = self.consensus.pending_block_tree.root().seq_num.0,
+            root_round = self.consensus.pending_block_tree.root().round.0,
+            "MONAD_EXEC_DEBUG consensus_process_qc"
+        );
 
         let mut cmds = Vec::new();
 
@@ -1255,6 +1385,14 @@ where
             .pending_block_tree
             .get_highest_coherent_block_on_path_from_root(&qc_block_id)
         {
+            info!(
+                qc_round = qc.get_round().0,
+                qc_block_id = ?qc_block_id,
+                voted_seq_num = voted_block.get_seq_num().0,
+                voted_round = voted_block.get_block_round().0,
+                voted_block_id = ?voted_block.get_id(),
+                "MONAD_EXEC_DEBUG consensus_emit_voted_commit"
+            );
             cmds.push(ConsensusCommand::CommitBlocks(
                 OptimisticPolicyCommit::Voted(voted_block.to_owned()),
             ));
@@ -1408,11 +1546,24 @@ where
         else {
             // the block that the qc points to doesn't exist
             // or parent block is root
+            info!(
+                qc_round = qc.get_round().0,
+                qc_block_id = ?qc.get_block_id(),
+                "MONAD_EXEC_DEBUG consensus_try_commit_missing_qc_block"
+            );
             return cmds;
         };
 
         let Some(committable_block_id) = qc.get_committable_id(qc_parent.header()) else {
             // qc is not committable (not consecutive rounds)
+            info!(
+                qc_round = qc.get_round().0,
+                qc_block_id = ?qc.get_block_id(),
+                qc_parent_round = qc_parent.get_block_round().0,
+                qc_parent_seq_num = qc_parent.get_seq_num().0,
+                parent_qc_round = qc_parent.header().qc.get_round().0,
+                "MONAD_EXEC_DEBUG consensus_try_commit_not_consecutive"
+            );
             return cmds;
         };
 
@@ -1423,6 +1574,12 @@ where
         {
             // the committable block is not (yet) coherent
             // likely because execution is lagging
+            info!(
+                qc_round = qc.get_round().0,
+                qc_block_id = ?qc.get_block_id(),
+                ?committable_block_id,
+                "MONAD_EXEC_DEBUG consensus_try_commit_not_coherent"
+            );
             return cmds;
         }
 
@@ -1432,6 +1589,25 @@ where
             .prune(&committable_block_id);
 
         for block in blocks_to_commit.iter() {
+            let finalized_commit_at = std::time::Instant::now();
+            let finalized_commit_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default();
+            let finalized_commit_interval_us = self
+                .consensus
+                .last_finalized_commit_at
+                .map(|last_commit_at| {
+                    finalized_commit_at.duration_since(last_commit_at).as_micros() as u64
+                });
+            info!(
+                seq_num = block.header().seq_num.0,
+                block_round = block.header().block_round.0,
+                block_id = ?block.get_id(),
+                finalized_commit_unix_ms,
+                finalized_commit_interval_us,
+                "MONAD_EXEC_DEBUG consensus_emit_finalized_commit"
+            );
             debug!(
                 seq_num =? block.header().seq_num,
                 block_round =? block.header().block_round,
@@ -1440,6 +1616,15 @@ where
             // when epoch boundary block is committed, this updates
             // epoch manager records
             self.metrics.consensus_events.commit_block += 1;
+            if let Some(interval_us) = finalized_commit_interval_us {
+                self.metrics
+                    .consensus_timing
+                    .finalized_commit_interval_total_us += interval_us;
+                self.metrics
+                    .consensus_timing
+                    .finalized_commit_interval_count += 1;
+            }
+            self.consensus.last_finalized_commit_at = Some(finalized_commit_at);
             self.block_policy.update_committed_block(block);
             self.epoch_manager
                 .schedule_epoch_start(block.header().seq_num, block.get_block_round());
@@ -1642,6 +1827,13 @@ where
             .pending_block_tree
             .is_coherent(&tip.block_header.get_id())
         {
+            info!(
+                proposal_round = proposal_round.0,
+                seq_num = tip.block_header.seq_num.0,
+                block_round = tip.block_header.block_round.0,
+                block_id = ?tip.block_header.get_id(),
+                "MONAD_EXEC_DEBUG consensus_vote_skip_not_coherent"
+            );
             warn!(
                 root =? self.consensus.pending_block_tree.root(),
                 block =? tip.block_header,
@@ -1664,6 +1856,12 @@ where
         {
             // we've already voted or timed out this round
             // or, we've already NE'd a different TC
+            info!(
+                proposal_round = proposal_round.0,
+                seq_num = tip.block_header.seq_num.0,
+                block_id = ?tip.block_header.get_id(),
+                "MONAD_EXEC_DEBUG consensus_vote_skip_not_safe"
+            );
             return cmds;
         }
         self.consensus
@@ -1677,11 +1875,27 @@ where
         };
 
         debug!(?v, "vote successful");
+        if let Some(start) = self.consensus.proposal_vote_start.take() {
+            self.metrics.consensus_timing.vote_total_us += start.elapsed().as_micros() as u64;
+            self.metrics.consensus_timing.vote_count += 1;
+        }
+        info!(
+            vote_round = v.round.0,
+            vote_block_id = ?v.id,
+            seq_num = tip.block_header.seq_num.0,
+            block_round = tip.block_header.block_round.0,
+            "MONAD_EXEC_DEBUG consensus_vote_ready"
+        );
         self.maybe_record_vote_delay_metrics(proposal_round, parent_block_round);
 
         match self.consensus.scheduled_vote {
             Some(OutgoingVoteStatus::TimerFired) => {
                 // timer already fired for this round so send vote immediately
+                info!(
+                    vote_round = v.round.0,
+                    vote_block_id = ?v.id,
+                    "MONAD_EXEC_DEBUG consensus_vote_send_immediate"
+                );
                 let vote_cmd = self.send_vote_and_reset_timer(v);
                 cmds.extend(vote_cmd);
             }
@@ -1706,10 +1920,23 @@ where
                 // if this is the next round after a timeout, we should vote immediately
                 // otherwise, schedule the vote for later
                 if parent_block_round + Round(1) != proposal_round {
+                    info!(
+                        vote_round = v.round.0,
+                        vote_block_id = ?v.id,
+                        parent_block_round = parent_block_round.0,
+                        "MONAD_EXEC_DEBUG consensus_vote_send_reproposal"
+                    );
                     let vote_cmd = self.send_vote_and_reset_timer(v);
                     cmds.extend(vote_cmd);
                 } else {
+                    info!(
+                        vote_round = v.round.0,
+                        vote_block_id = ?v.id,
+                        parent_block_round = parent_block_round.0,
+                        "MONAD_EXEC_DEBUG consensus_vote_scheduled"
+                    );
                     self.consensus.scheduled_vote = Some(OutgoingVoteStatus::VoteReady(v));
+                    self.consensus.vote_ready_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -1741,10 +1968,23 @@ where
         if node_id != leader {
             return cmds;
         }
+        info!(
+            ?node_id,
+            ?leader,
+            round = round.0,
+            current_epoch = self.consensus.pacemaker.get_current_epoch().0,
+            high_qc_round = self.consensus.pacemaker.high_certificate().qc().get_round().0,
+            "MONAD_EXEC_DEBUG consensus_try_propose_leader"
+        );
 
         cmds.extend(self.consensus.request_tip_if_missing());
 
         if !self.consensus.safety.is_safe_to_propose(round) {
+            info!(
+                ?node_id,
+                round = round.0,
+                "MONAD_EXEC_DEBUG consensus_try_propose_not_safe"
+            );
             return cmds;
         }
 
@@ -1896,6 +2136,7 @@ where
                         )
                     };
 
+                let exec_result_start = std::time::Instant::now();
                 let Ok(delayed_execution_results) =
                     self.block_policy.get_expected_execution_results(
                         try_propose_seq_num,
@@ -1913,6 +2154,9 @@ where
                     self.metrics.consensus_events.rx_execution_lagging += 1;
                     return cmds;
                 };
+                self.metrics.consensus_timing.execution_result_query_total_us +=
+                    exec_result_start.elapsed().as_micros() as u64;
+                self.metrics.consensus_timing.execution_result_query_count += 1;
                 let _create_proposal_span =
                     tracing::info_span!("create_proposal_span", ?round).entered();
 
@@ -1924,6 +2168,15 @@ where
                     ?qc,
                     ?try_propose_seq_num,
                     "emitting create proposal command to txpool"
+                );
+                info!(
+                    ?node_id,
+                    round = round.0,
+                    seq_num = try_propose_seq_num.0,
+                    qc_round = qc.get_round().0,
+                    qc_block_id = ?qc.get_block_id(),
+                    extending_blocks = pending_blocktree_blocks.len(),
+                    "MONAD_EXEC_DEBUG consensus_create_proposal"
                 );
 
                 cmds.push(ConsensusCommand::CreateProposal {
@@ -3990,7 +4243,7 @@ mod test {
         let node1_round = node1.consensus_state.get_current_round();
 
         // now timeout someone
-        let cmds = node1.wrapped_state().handle_timeout_expiry(node1_round);
+        let cmds = node1.wrapped_state().handle_timeout_expiry(node1_round, true);
         let tmo: Vec<
             &TimeoutMessage<SignatureType, SignatureCollectionType, EthExecutionProtocol>,
         > = cmds
@@ -5776,7 +6029,7 @@ mod test {
         };
         let timeout_locally = |node: &mut NodeContext<_, _, _, _, _, _, _>| {
             let round = node.consensus_state.get_current_round();
-            let cmds = node.wrapped_state().handle_timeout_expiry(round);
+            let cmds = node.wrapped_state().handle_timeout_expiry(round, true);
             let timeout = extract_timeout_msgs(cmds).remove(0);
             let _ = handle_own_timeout(node, &timeout);
             timeout
@@ -5911,7 +6164,7 @@ mod test {
         };
         let timeout_locally = |node: &mut NodeContext<_, _, _, _, _, _, _>| {
             let round = node.consensus_state.get_current_round();
-            let cmds = node.wrapped_state().handle_timeout_expiry(round);
+            let cmds = node.wrapped_state().handle_timeout_expiry(round, true);
             let timeout = extract_timeout_msgs(cmds).remove(0);
             let _ = handle_own_timeout(node, &timeout);
             timeout

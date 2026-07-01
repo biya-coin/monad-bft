@@ -16,7 +16,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use monad_chain_config::{revision::ChainRevision, ChainConfig};
@@ -47,7 +47,7 @@ use crate::{messages::message::TimeoutMessage, validation::safety::Safety};
 /// to other nodes
 /// Timeout msgs from other nodes are received and collected into
 /// a Timeout Certificate which will advance the round
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct Pacemaker<ST, SCT, EPT, CCT, CRT>
 where
     ST: CertificateSignatureRecoverable,
@@ -81,7 +81,40 @@ where
     /// one message at each phase of handling
     phase: PhaseHonest,
 
+    /// When the current Pacemaker round timer was last scheduled (for metrics).
+    round_timer_started_at: Option<Instant>,
+
     _phantom: PhantomData<CRT>,
+}
+
+impl<ST, SCT, EPT, CCT, CRT> PartialEq for Pacemaker<ST, SCT, EPT, CCT, CRT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
+    CCT: ChainConfig<CRT> + PartialEq,
+    CRT: ChainRevision + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.delta == other.delta
+            && self.chain_config == other.chain_config
+            && self.local_processing == other.local_processing
+            && self.current_epoch == other.current_epoch
+            && self.high_certificate == other.high_certificate
+            && self.pending_timeouts == other.pending_timeouts
+            && self.invalid_timeout_senders == other.invalid_timeout_senders
+            && self.phase == other.phase
+    }
+}
+
+impl<ST, SCT, EPT, CCT, CRT> Eq for Pacemaker<ST, SCT, EPT, CCT, CRT>
+where
+    ST: CertificateSignatureRecoverable,
+    SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+    EPT: ExecutionProtocol,
+    CCT: ChainConfig<CRT> + PartialEq,
+    CRT: ChainRevision + PartialEq,
+{
 }
 
 /// The different states of TimeoutMessage handling
@@ -153,8 +186,27 @@ where
             invalid_timeout_senders: BTreeSet::new(),
 
             phase: PhaseHonest::Zero,
+            round_timer_started_at: None,
             _phantom: Default::default(),
         }
+    }
+
+    /// Wall-clock time since the current Pacemaker timer was scheduled.
+    pub fn round_timer_elapsed(&self) -> Option<Duration> {
+        self.round_timer_started_at.map(|t| t.elapsed())
+    }
+
+    fn schedule_round_timer_command(&mut self, round: Round) -> PacemakerCommand<ST, SCT, EPT> {
+        self.round_timer_started_at = Some(Instant::now());
+        PacemakerCommand::Schedule {
+            round,
+            duration: self.get_round_timer(round),
+        }
+    }
+
+    fn schedule_reset_command(&mut self) -> PacemakerCommand<ST, SCT, EPT> {
+        self.round_timer_started_at = None;
+        PacemakerCommand::ScheduleReset
     }
 
     pub fn get_current_round(&self) -> Round {
@@ -163,6 +215,11 @@ where
 
     pub fn get_current_epoch(&self) -> Epoch {
         self.current_epoch
+    }
+
+    /// Duration of the local round timer for `round` (used when a timeout fires).
+    pub fn round_timer(&self, round: Round) -> Duration {
+        self.get_round_timer(round)
     }
 
     pub fn high_certificate(&self) -> &RoundCertificate<ST, SCT, EPT> {
@@ -223,10 +280,7 @@ where
                 self.get_current_round(),
                 self.high_certificate.clone(),
             ),
-            PacemakerCommand::Schedule {
-                round: self.get_current_round(),
-                duration: self.get_round_timer(self.get_current_round()),
-            },
+            self.schedule_round_timer_command(self.get_current_round()),
         ]
     }
 
@@ -235,7 +289,7 @@ where
     /// the local round timer
     #[must_use]
     fn local_timeout_round(
-        &self,
+        &mut self,
         safety: &mut Safety<ST, SCT, EPT>,
     ) -> Vec<PacemakerCommand<ST, SCT, EPT>> {
         let current_round = self.get_current_round();
@@ -265,21 +319,18 @@ where
         let last_round_rc = if high_extend_qc_round + Round(1) == current_round {
             None
         } else {
-            Some(&self.high_certificate)
+            Some(self.high_certificate.clone())
         };
 
         vec![
-            PacemakerCommand::ScheduleReset,
+            self.schedule_reset_command(),
             PacemakerCommand::PrepareTimeout(
                 timeout,
                 high_extend,
                 safe_to_include_vote,
-                last_round_rc.cloned(),
+                last_round_rc,
             ),
-            PacemakerCommand::Schedule {
-                round: current_round,
-                duration: self.get_round_timer(current_round),
-            },
+            self.schedule_round_timer_command(current_round),
         ]
     }
 

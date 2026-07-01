@@ -2,6 +2,8 @@
 
 # prepare environment
 
+set -euo pipefail
+
 export MONAD_BFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export WORK="$MONAD_BFT_ROOT/.monad"
 export CHAIN_ID="${CHAIN_ID:-biyachain-1}"
@@ -13,7 +15,13 @@ export GENTX_STAKE="${GENTX_STAKE:-500000000000000000000byb}"
 export STRESS_ACCOUNTS_NUM="${STRESS_ACCOUNTS_NUM:-1000}"
 export STRESS_ACCOUNTS_DIR="$WORK/instances/0"
 export STRESS_ACCOUNT_BALANCE_BYB="${STRESS_ACCOUNT_BALANCE_BYB:-1000000000000000000000000000byb}"
-export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-10000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
+export MAX_BLOCK_TXS="${MAX_BLOCK_TXS:-500}"
+# USDT(market 0xb322 的 quote 币)。原值 1e19 不够 chain-stresser spot-limit 初始化
+# deposit 的默认额度(1e23),会导致 MsgDeposit 失败 → 子账户空 → 订单被拒。提到 1e27。
+export STRESS_ACCOUNT_BALANCE_USDT="${STRESS_ACCOUNT_BALANCE_USDT:-1000000000000000000000000000peggy0xdAC17F958D2ee523a2206206994597C13D831ec7}"
+
+# 压测集群：四验证者 a/b/c/d（与 scripts/0_monad-stress-bench.sh 一致）
+MONAD_NODES=(a b c d)
 
 # 将 devnet 模板写入 $WORK（勿覆盖 $WORK/compose.yaml，多节点 compose 一般在 .monad 内维护）
 init_workspace_templates() {
@@ -95,59 +103,114 @@ add_stress_accounts_to_genesis() {
         --balance-usdt "$STRESS_ACCOUNT_BALANCE_USDT"
 }
 
+MONAD_KEYSTORE_BIN="$MONAD_BFT_ROOT/target/release/monad-keystore"
+SIGN_NAME_RECORD_BIN="$MONAD_BFT_ROOT/target/release/sign-name-record"
+
+ensure_monad_keystore_bin() {
+  if [[ -x "$MONAD_KEYSTORE_BIN" ]]; then
+    return 0
+  fi
+  echo "未找到 $MONAD_KEYSTORE_BIN，正在编译 monad-keystore…"
+  (
+    cd "$MONAD_BFT_ROOT"
+    cargo build --release -p monad-keystore
+  ) || {
+    echo "错误: 编译 monad-keystore 失败。请先执行: ./scripts/monad-stress-bench.sh build" >&2
+    exit 1
+  }
+}
+
+ensure_sign_name_record_bin() {
+  if [[ -x "$SIGN_NAME_RECORD_BIN" ]]; then
+    return 0
+  fi
+  echo "未找到 $SIGN_NAME_RECORD_BIN，正在编译 sign-name-record…"
+  (
+    cd "$MONAD_BFT_ROOT"
+    cargo build --release -p monad-peer-discovery --bin sign-name-record
+  ) || {
+    echo "错误: 编译 sign-name-record 失败。请先执行: ./scripts/monad-stress-bench.sh build" >&2
+    exit 1
+  }
+}
+
+remove_bad_keystore_mount_dirs() {
+  if [[ -d "$WORK/biyachaind" ]]; then
+    echo "警告: 删除误建目录 $WORK/biyachaind（将重新 go build）"
+    rm -rf "$WORK/biyachaind"
+  fi
+  for node in "${MONAD_NODES[@]}"; do
+    for f in id-secp id-bls; do
+      p="$WORK/monad-$node/$f"
+      if [[ -d "$p" ]]; then
+        echo "警告: 删除误建目录 $p"
+        rm -rf "$p"
+      fi
+    done
+  done
+}
+
+generate_monad_node_keys() {
+  ensure_monad_keystore_bin
+  remove_bad_keystore_mount_dirs
+  for node in "${MONAD_NODES[@]}"; do
+    mkdir -p "$WORK/monad-$node"
+    "$MONAD_KEYSTORE_BIN" create --keystore-path "$WORK/monad-$node/id-secp" --password "" --key-type secp
+    "$MONAD_KEYSTORE_BIN" create --keystore-path "$WORK/monad-$node/id-bls" --password "" --key-type bls
+  done
+}
+
+ensure_monad_node_keys() {
+  local node missing=0
+  for node in "${MONAD_NODES[@]}"; do
+    if [[ ! -f "$WORK/monad-$node/id-secp" || ! -f "$WORK/monad-$node/id-bls" ]]; then
+      missing=1
+      break
+    fi
+  done
+  if (( missing != 0 )); then
+    echo "未找到 monad 节点 keystore，正在生成 id-secp / id-bls…"
+    generate_monad_node_keys
+  fi
+}
+
+generate_validators_toml_from_keys() {
+  ensure_monad_node_keys
+  NODES="${MONAD_NODES[*]}" KEYSTORE_BIN="$MONAD_KEYSTORE_BIN" \
+    "$MONAD_BFT_ROOT/scripts/gen-validators-toml.sh"
+  local n
+  for n in "${MONAD_NODES[@]:1}"; do
+    cp "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
+  done
+}
+
 setup_environment_and_generate_keys() {
-  # echo create data directory
   echo "--------------------------------"
   echo "step 1: prepare environment"
   echo "--------------------------------"
 
   init_workspace_templates
-    ensure_stress_accounts_generated
+  ensure_stress_accounts_generated
 
-  for node in a b c d; do
-      mkdir -p "$WORK/biyachain-home-$node"
-      mkdir -p "$WORK/monad-$node"
+  for node in "${MONAD_NODES[@]}"; do
+    mkdir -p "$WORK/biyachain-home-$node"
+    mkdir -p "$WORK/monad-$node"
   done
 
-  # Compose 绑定 ./biyachaind、./monad-*/id-secp；若宿主机上曾是「不存在的文件」被 Docker 建成空目录，会导致
-  # "Is a directory" / "secp secret must be encoded in keystore json"。清理后再生成。
-  if [[ -d "$WORK/biyachaind" ]]; then
-      echo "警告: 删除误建目录 $WORK/biyachaind（将重新 go build）"
-      rm -rf "$WORK/biyachaind"
-  fi
-  for node in a b c d; do
-      for f in id-secp id-bls; do
-          p="$WORK/monad-$node/$f"
-          if [[ -d "$p" ]]; then
-              echo "警告: 删除误建目录 $p"
-              rm -rf "$p"
-          fi
-      done
+  generate_monad_node_keys
+
+  for n in "${MONAD_NODES[@]}"; do
+    echo "=== monad-$n secp ==="
+    "$MONAD_KEYSTORE_BIN" recover --keystore-path "$WORK/monad-$n/id-secp" --password "" --key-type secp
+    echo "=== monad-$n bls ==="
+    "$MONAD_KEYSTORE_BIN" recover --keystore-path "$WORK/monad-$n/id-bls" --password "" --key-type bls
   done
 
-  for node in a b c d; do
-    "$MONAD_BFT_ROOT/target/release/monad-keystore" create --keystore-path "$WORK/monad-$node/id-secp" --password "" --key-type secp
-    "$MONAD_BFT_ROOT/target/release/monad-keystore" create --keystore-path "$WORK/monad-$node/id-bls" --password "" --key-type bls
-  done
+  generate_validators_toml_from_keys
 
-
-    for n in a b c d; do
-        echo "=== monad-$n secp ==="
-        "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$WORK/monad-$n/id-secp" --password "" --key-type secp
-        echo "=== monad-$n bls ==="
-        "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$WORK/monad-$n/id-bls" --password "" --key-type bls
-    done
-
-    "$MONAD_BFT_ROOT/scripts/gen-validators-toml.sh"
-
-    for n in b c d; do
-        cp "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
-    done
-
-    echo "--------------------------------"
-    echo "step 1: prepare environment done."
-    echo "--------------------------------"
-
+  echo "--------------------------------"
+  echo "step 1: prepare environment done."
+  echo "--------------------------------"
 }
 
 init_biyachaind() {
@@ -162,46 +225,49 @@ init_biyachaind() {
     # 同时 Docker 在缺少源文件时会把 ./genesis.json.reference 建成目录，需删掉再生成文件。
     if command -v docker >/dev/null 2>&1; then
         # 先以 root 删净（含 root 属主残留），再 chown 给宿主机用户以便本机 biyachaind 写入
+        local home_paths=()
+        for n in "${MONAD_NODES[@]}"; do
+            home_paths+=("/work/biyachain-home-$n")
+        done
         docker run --rm \
             -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
             -v "$WORK:/work:rw" alpine:3.19 sh -c \
-            'rm -rf /work/genesis.json.reference \
-              /work/biyachain-home-a /work/biyachain-home-b /work/biyachain-home-c /work/biyachain-home-d && \
-              mkdir -p /work/biyachain-home-a /work/biyachain-home-b /work/biyachain-home-c /work/biyachain-home-d && \
-              chown -R "$HOST_UID:$HOST_GID" /work/biyachain-home-a /work/biyachain-home-b /work/biyachain-home-c /work/biyachain-home-d'
+            "rm -rf /work/genesis.json.reference ${home_paths[*]} && \
+             mkdir -p ${home_paths[*]} && \
+             chown -R \"\$HOST_UID:\$HOST_GID\" ${home_paths[*]}"
     else
         echo "错误: 需要 docker 以清空可能为 root 属主的 biyachain-home-*（见 init_biyachaind 注释）。" >&2
         exit 1
     fi
 
-    for node in a b c d; do
+    for node in "${MONAD_NODES[@]}"; do
         "$BIYACHAIND_BIN" init monad-$node --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-$node"
     done
 
-    for node in a b c d; do
-    python3 - <<PY "$WORK/biyachain-home-$node/config/app.toml"
-    import pathlib, re, sys
-    path = pathlib.Path(sys.argv[1])
-    text = path.read_text()
-    text = re.sub(
-        r'^minimum-gas-prices = ".*"$',
-        'minimum-gas-prices = "1byb"',
-        text,
-        flags=re.MULTILINE,
-    )
-    path.write_text(text)
+    for node in "${MONAD_NODES[@]}"; do
+        python3 - "$WORK/biyachain-home-$node/config/app.toml" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+text = re.sub(
+    r'^minimum-gas-prices = ".*"$',
+    'minimum-gas-prices = "1byb"',
+    text,
+    flags=re.MULTILINE,
+)
+path.write_text(text)
 PY
     done
     echo "--------------------------------"
     echo "add genesis account"
     echo "--------------------------------"
-    for node in a b c d; do
+    for node in "${MONAD_NODES[@]}"; do
         "$BIYACHAIND_BIN" keys add val-$node --home "$WORK/biyachain-home-$node" --keyring-backend "$KEYRING"
     done
     echo "--------------------------------"
     echo "add genesis account to genesis.json."
     echo "--------------------------------"
-    for node in a b c d; do
+    for node in "${MONAD_NODES[@]}"; do
         ADDR="$("$BIYACHAIND_BIN" keys show val-$node -a --home "$WORK/biyachain-home-$node" --keyring-backend "$KEYRING")"
         "$BIYACHAIND_BIN" genesis add-genesis-account "$ADDR" "$GENESIS_BALANCE" \
             --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-a"
@@ -212,16 +278,10 @@ PY
     echo "--------------------------------"
     TEST_USER_KEY="testuser"
     TEST_USER_MNEMONIC="copper push brief egg scan entry inform record adjust fossil boss egg comic alien upon aspect dry avoid interest fury window hint race symptom"
-    NEWLINE=$'\n'
-    
     # Add test user key (use same mnemonic as USER1 from setup.sh for consistency)
-    if [[ "$KEYRING" == "test" ]]; then
-        yes "$TEST_USER_MNEMONIC$NEWLINE" | "$BIYACHAIND_BIN" keys add $TEST_USER_KEY --recover \
-            --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING"
-    else
-        echo "$TEST_USER_MNEMONIC" | "$BIYACHAIND_BIN" keys add $TEST_USER_KEY --recover \
-            --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING"
-    fi
+    # 勿用 yes|keys：keys 读毕关闭管道后 yes 收 SIGPIPE，在 set -o pipefail 下会误报 141 并中断 genesis。
+    printf '%s\n' "$TEST_USER_MNEMONIC" | "$BIYACHAIND_BIN" keys add $TEST_USER_KEY --recover \
+        --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING"
     
     # Add test user with large balance (100M byb, 100M USDT, 10M WBTC)
     TEST_USER_ADDR="$("$BIYACHAIND_BIN" keys show $TEST_USER_KEY -a --home "$WORK/biyachain-home-a" --keyring-backend "$KEYRING")"
@@ -233,21 +293,21 @@ PY
 
     add_stress_accounts_to_genesis
 
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-b/config/genesis.json"
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-c/config/genesis.json"
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-d/config/genesis.json"
+    for node in "${MONAD_NODES[@]:1}"; do
+        cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-$node/config/genesis.json"
+    done
 
     echo "--------------------------------"
     echo "add gentx to genesis.json."
     echo "--------------------------------"
-    for node in a b c d; do
+    for node in "${MONAD_NODES[@]}"; do
         "$BIYACHAIND_BIN" genesis gentx val-$node "$GENTX_STAKE" \
             --chain-id "$CHAIN_ID" --home "$WORK/biyachain-home-$node"  --keyring-backend "$KEYRING"
     done
     mkdir -p "$WORK/biyachain-home-a/config/gentx"
-    cp -a "$WORK/biyachain-home-b/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
-    cp -a "$WORK/biyachain-home-c/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
-    cp -a "$WORK/biyachain-home-d/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
+    for node in "${MONAD_NODES[@]:1}"; do
+        cp -a "$WORK/biyachain-home-$node/config/gentx/"*.json "$WORK/biyachain-home-a/config/gentx/"
+    done
 
     echo "--------------------------------"
     echo "configure exchange state (markets + denom decimals)"
@@ -305,20 +365,20 @@ PY
 
     "$BIYACHAIND_BIN" genesis collect-gentxs --home "$WORK/biyachain-home-a"
 
-    # 设置区块最大 gas 为-1
+    # 设置区块限制
     cat "$WORK/biyachain-home-a/config/genesis.json" | \
-        jq '.consensus["params"]["block"]["max_gas"]="2000000000"' > \
+        jq --arg max_txs "$MAX_BLOCK_TXS" \
+          '.consensus["params"]["block"]["max_gas"]="2000000000"
+           | .consensus["params"]["block"]["max_txs"]=$max_txs' > \
         "$WORK/biyachain-home-a/config/tmp_genesis.json" && \
         mv "$WORK/biyachain-home-a/config/tmp_genesis.json" "$WORK/biyachain-home-a/config/genesis.json"
 
     "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-a"
 
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-b/config/genesis.json"
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-c/config/genesis.json"
-    cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-d/config/genesis.json"
-    "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-b"
-    "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-c"
-    "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-d"
+    for node in "${MONAD_NODES[@]:1}"; do
+        cp -a "$WORK/biyachain-home-a/config/genesis.json" "$WORK/biyachain-home-$node/config/genesis.json"
+        "$BIYACHAIND_BIN" genesis validate --home "$WORK/biyachain-home-$node"
+    done
 
     if [[ -d "$WORK/genesis.json.reference" ]]; then
         docker run --rm -v "$WORK:/work:rw" alpine:3.19 rm -rf /work/genesis.json.reference
@@ -328,7 +388,7 @@ PY
     # 同名目录（Docker 曾对不存在的源路径建过目录），会与文件挂载冲突并报 OCI mount 错。
     if command -v docker >/dev/null 2>&1; then
         docker run --rm -v "$WORK:/work:rw" alpine:3.19 sh -c \
-            'for n in a b c d; do p="/work/monad-$n/genesis.json"; [ -d "$p" ] && rm -rf "$p"; done'
+            "for n in ${MONAD_NODES[*]}; do p=\"/work/monad-\$n/genesis.json\"; if [ -d \"\$p\" ]; then rm -rf \"\$p\"; fi; done"
     fi
     echo "--------------------------------"
     echo "step 2: init biyachaind done."
@@ -341,7 +401,7 @@ init_monad_node() {
     echo "--------------------------------"
     if command -v docker >/dev/null 2>&1; then
         docker run --rm -v "$WORK:/work:rw" alpine:3.19 sh -c \
-            'for n in a b c d; do p="/work/monad-$n/genesis.json"; [ -d "$p" ] && rm -rf "$p"; done'
+            "for n in ${MONAD_NODES[*]}; do p=\"/work/monad-\$n/genesis.json\"; if [ -d \"\$p\" ]; then rm -rf \"\$p\"; fi; done"
     fi
     NODE_TOML_SRC="$WORK/node.toml"
     if [[ ! -f "$NODE_TOML_SRC" ]]; then
@@ -354,7 +414,7 @@ init_monad_node() {
         echo "错误: 找不到 node.toml 模板（已试 \$WORK/node.toml、.monad/node.toml、docker/devnet/...）" >&2
         exit 1
     fi
-    for n in a b c d; do
+    for n in "${MONAD_NODES[@]}"; do
         M="$WORK/monad-$n"
         mkdir -p "$M/ledger/headers" "$M/ledger/bodies" "$M/ledger/cosmos-commits"
         cp "$NODE_TOML_SRC" "$M/node.toml"
@@ -363,9 +423,14 @@ init_monad_node() {
     # Compose --validators-path /monad/validators.toml；清理数据后常丢失，须与各 id-secp 一致。
     if [[ ! -f "$WORK/monad-a/validators.toml" ]]; then
         echo "未找到 $WORK/monad-a/validators.toml，正在从 keystore 生成…"
-        KEYSTORE_BIN="$MONAD_BFT_ROOT/target/release/monad-keystore" "$(dirname "$0")/gen-validators-toml.sh" || exit 1
+        generate_validators_toml_from_keys
+    else
+        ensure_monad_node_keys
+        for n in "${MONAD_NODES[@]:1}"; do
+            cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
+        done
     fi
-    for n in a b c d; do
+    for n in b c d; do
         cp -a "$WORK/monad-a/validators.toml" "$WORK/monad-$n/validators.toml"
     done
 
@@ -376,15 +441,16 @@ init_monad_node() {
         echo "错误: 找不到 forkpoint 模板 $FP_GENESIS" >&2
         exit 1
     fi
-    for n in a b c d; do
+    for n in "${MONAD_NODES[@]}"; do
         cp "$FP_GENESIS" "$WORK/monad-$n/forkpoint.toml"
         printf '%s\n' 'peers = []' >"$WORK/monad-$n/peers.toml"
     done
 
     recover_secp_pubhex() {
         local dir="$1" raw
+        ensure_monad_keystore_bin
         raw="$(
-            "$MONAD_BFT_ROOT/target/release/monad-keystore" recover --keystore-path "$dir/id-secp" --password "" --key-type secp 2>&1 \
+            "$MONAD_KEYSTORE_BIN" recover --keystore-path "$dir/id-secp" --password "" --key-type secp 2>&1 \
                 | awk -F': ' '$0 ~ /Secp public key/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }'
         )"
         if [[ -z "$raw" ]]; then
@@ -397,13 +463,14 @@ init_monad_node() {
 
     # 与 compose 中 monad_net 固定 IP 对齐；勿用 echo|od 取字母 ASCII（echo 带换行会把 od 多字节拼成 9710 之类脏数）
     declare -A P2P_ADDR P2P_SIG P2P_PUB
-    for n in a b c d; do
+    for n in "${MONAD_NODES[@]}"; do
         ascii=$(LC_ALL=C printf '%d' "'$n")
         octet=$((10 + (ascii - 97) * 10))
         addr="172.28.0.${octet}:8000"
         MONAD_DIR="$WORK/monad-$n"
+        ensure_sign_name_record_bin
         out="$(
-            "$MONAD_BFT_ROOT/target/release/sign-name-record" \
+            "$SIGN_NAME_RECORD_BIN" \
                 --address "$addr" \
                 --authenticated-udp-port 8001 \
                 --self-record-seq-num 0 \
@@ -420,21 +487,27 @@ init_monad_node() {
         P2P_ADDR[$n]="$addr"
         P2P_SIG[$n]="$sig"
         P2P_PUB[$n]="$pub"
-        python3 -c "
-import re, pathlib, sys
+        python3 - "$MONAD_DIR/node.toml" "$addr" "$sig" <<'PY'
+import pathlib
+import re
+import sys
+
 path, addr, sig = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+host = addr.rsplit(':', 1)[0]
 t = path.read_text()
 t, n1 = re.subn(r'^self_address = .*$', 'self_address = \"' + addr + '\"', t, count=1, flags=re.M)
 t, n2 = re.subn(r'^self_name_record_sig = .*$', 'self_name_record_sig = \"' + sig + '\"', t, count=1, flags=re.M)
-assert n1 == 1 and n2 == 1, (n1, n2)
+# 本机多节点时 bind 0.0.0.0:8000 会 AddrInUse；每节点须绑各自 loopback IP（须 setup-ips）。
+t, n3 = re.subn(r'^bind_address_host = .*$', 'bind_address_host = \"' + host + '\"', t, count=1, flags=re.M)
+assert n1 == 1 and n2 == 1 and n3 == 1, (n1, n2, n3)
 path.write_text(t)
-" "$MONAD_DIR/node.toml" "$addr" "$sig"
+PY
     done
 
     # 无 [[bootstrap.peers]] 时 peer discovery 难以建立路由，Raptorcast 会持续 WARN unknown address for node …
-    for n in a b c d; do
+    for n in "${MONAD_NODES[@]}"; do
         bootf="$(mktemp)"
-        for o in a b c d; do
+        for o in "${MONAD_NODES[@]}"; do
             [[ "$o" == "$n" ]] && continue
             {
                 echo "[[bootstrap.peers]]"
@@ -446,8 +519,11 @@ path.write_text(t)
                 echo ""
             } >>"$bootf"
         done
-        python3 -c "
-import pathlib, re, sys
+        python3 - "$WORK/monad-$n/node.toml" "$bootf" <<'PY'
+import pathlib
+import re
+import sys
+
 path, boot_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 boot = boot_path.read_text()
 text = path.read_text()
@@ -456,7 +532,7 @@ new = '[bootstrap]\\n\\n' + boot + '[peer_discovery]'
 text, c = pat.subn(new, text, count=1)
 assert c == 1, ('[bootstrap]…[peer_discovery] replace failed', c)
 path.write_text(text)
-" "$WORK/monad-$n/node.toml" "$bootf"
+PY
         rm -f "$bootf"
     done
 
@@ -468,7 +544,7 @@ path.write_text(text)
 # 防止在未跑完 mult-run 就先 compose，导致 Docker 把绑定源建成目录。
 verify_compose_mount_sources() {
     local err=0
-    for n in a b c d; do
+    for n in "${MONAD_NODES[@]}"; do
         for f in id-secp id-bls; do
             p="$WORK/monad-$n/$f"
             if [[ ! -f "$p" ]] || [[ -d "$p" ]]; then
@@ -512,5 +588,6 @@ init_biyachaind
 init_monad_node
 
 verify_compose_mount_sources
-echo "可在 $WORK 执行: docker compose up -d"
+echo "本机压测（推荐）: ./scripts/monad-stress-bench.sh run"
+echo "可选 Docker: 在 $WORK 执行 docker compose up -d（需 monad-node:local 镜像）"
 

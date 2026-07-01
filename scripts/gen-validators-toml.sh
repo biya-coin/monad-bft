@@ -11,7 +11,7 @@
 #   WORK            多节点数据根目录（默认 $MONAD_BFT_ROOT/data-monad-multinode）
 #   MONAD_IMAGE     Docker 镜像（默认 monad-node:local）
 #   KEYSTORE_PASSWORD  keystore 密码（默认空）
-#   NODES           节点后缀，空格分隔（默认 "a b c d"）
+#   NODES           节点后缀，空格分隔（默认 "a b c"）
 #   EPOCH           validator_sets.epoch（默认 1）
 #   STAKE           每条 stake（默认 1）
 #   KEYSTORE_BIN    若设置则直接调用该路径的 keystore，跳过 Docker
@@ -28,7 +28,7 @@ MONAD_BFT_ROOT="${MONAD_BFT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 WORK="${WORK:-$MONAD_BFT_ROOT/.monad}"
 MONAD_IMAGE="${MONAD_IMAGE:-monad-node:local}"
 KEYSTORE_PASSWORD="${KEYSTORE_PASSWORD:-}"
-NODES="${NODES:-a b c d}"
+NODES="${NODES:-a b c}"
 EPOCH="${EPOCH:-1}"
 STAKE="${STAKE:-1}"
 OUT=""

@@ -456,6 +456,7 @@ where
 
         match target {
             RouterTarget::Broadcast(epoch) | RouterTarget::Raptorcast(epoch) => {
+                let broadcast_start = std::time::Instant::now();
                 let group = match PrimaryBroadcastGroup::of_epoch(
                     epoch,
                     &self_id, // author
@@ -515,6 +516,13 @@ where
                 self.message_builder
                     .build_into(&outbound_message, &build_target, &mut sink)
                     .unwrap_log_on_error(&outbound_message, &build_target);
+
+                use crate::metrics::{
+                    GAUGE_RAPTORCAST_BROADCAST_COUNT, GAUGE_RAPTORCAST_BROADCAST_TOTAL_US,
+                };
+                self.metrics[GAUGE_RAPTORCAST_BROADCAST_TOTAL_US] +=
+                    broadcast_start.elapsed().as_micros() as u64;
+                self.metrics[GAUGE_RAPTORCAST_BROADCAST_COUNT] += 1;
             }
 
             RouterTarget::PointToPoint(to) | RouterTarget::DirectPointToPoint(to)

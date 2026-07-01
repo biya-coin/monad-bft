@@ -7,6 +7,21 @@ use monad_crypto::hasher::{Hasher, Sha256Hash};
 
 pub type CosmosTxId = [u8; 32];
 
+/// Default upper bound on the number of pending txs held in the pool. When the
+/// pool reaches this many txs, `try_push` rejects new ones until commits drain
+/// it. Override at runtime via the `COSMOS_MEMPOOL_MAX_TXS` env var (0 disables
+/// the cap). Chosen to bound memory without throttling healthy throughput.
+pub const DEFAULT_MAX_TXS: usize = 100_000;
+
+/// Resolve the configured tx-count cap. `COSMOS_MEMPOOL_MAX_TXS` overrides the
+/// default; an explicit `0` disables the cap (unbounded).
+fn configured_max_txs() -> usize {
+    match std::env::var("COSMOS_MEMPOOL_MAX_TXS") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(DEFAULT_MAX_TXS),
+        Err(_) => DEFAULT_MAX_TXS,
+    }
+}
+
 #[inline]
 pub fn cosmos_raw_tx_id(raw: &[u8]) -> CosmosTxId {
     let mut hasher = Sha256Hash::new();
@@ -19,19 +34,41 @@ pub struct IndexedCosmosMempool {
     queue: VecDeque<CosmosTxId>,
     txs: HashMap<CosmosTxId, Bytes>,
     total_bytes: usize,
+    /// Max number of pending txs. `0` means unbounded (preserves `Default`).
+    max_txs: usize,
 }
 
 impl IndexedCosmosMempool {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_txs(configured_max_txs())
+    }
+
+    /// Create a pool with an explicit tx-count cap. `max_txs == 0` disables the cap.
+    pub fn with_max_txs(max_txs: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            txs: HashMap::new(),
+            total_bytes: 0,
+            max_txs,
+        }
     }
 
     pub fn pending_len(&self) -> usize {
         self.queue.len()
     }
 
+    /// True when the pool has reached its configured tx-count cap.
+    pub fn is_full(&self) -> bool {
+        self.max_txs != 0 && self.queue.len() >= self.max_txs
+    }
+
     pub fn try_push(&mut self, raw: Bytes) -> bool {
         if raw.is_empty() {
+            return false;
+        }
+        // Capacity gate: once at the cap, reject new txs outright (no eviction)
+        // until committed blocks drain the pool.
+        if self.is_full() {
             return false;
         }
         let id = cosmos_raw_tx_id(&raw);

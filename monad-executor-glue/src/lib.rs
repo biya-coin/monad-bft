@@ -588,6 +588,8 @@ where
         epoch: Epoch,
         round: Round,
         upcoming_leader_rounds: Vec<Round>,
+        /// Upcoming leader node ids for async tx forwarding (consensus-derived).
+        forward_targets: Vec<NodeId<CertificateSignaturePubKey<ST>>>,
     },
 
     // Emitted after statesync is completed
@@ -652,11 +654,13 @@ where
                 epoch,
                 round,
                 upcoming_leader_rounds,
+                forward_targets,
             } => f
                 .debug_struct("EnterRound")
                 .field("epoch", epoch)
                 .field("round", round)
                 .field("upcoming_leader_rounds", upcoming_leader_rounds)
+                .field("forward_targets", forward_targets)
                 .finish(),
             Self::Reset {
                 last_delay_committed_blocks,

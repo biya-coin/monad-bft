@@ -93,6 +93,19 @@ impl ResultBroadcastTx {
             hash:      hex::encode_upper(hash),
         }
     }
+
+    pub fn from_check_tx(
+        hash: [u8; 32],
+        response: monad_cometbft_proto::cometbft::abci::v1::CheckTxResponse,
+    ) -> Self {
+        Self {
+            code: response.code,
+            data: hex::encode(response.data),
+            log: response.log,
+            codespace: response.codespace,
+            hash: hex::encode_upper(hash),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

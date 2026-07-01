@@ -117,11 +117,15 @@ const CHAIN_PARAMS_V_0_10_0: ChainParams = chain_params! {
 };
 
 const CHAIN_PARAMS_V_0_11_0: ChainParams = chain_params! {
-    tx_limit: 5_000,
+    // proposal_byte_limit 只限制当前块交易字节；提案还会内嵌延迟执行结果
+    // (delayed_execution_results 里的完整 FinalizeBlockResponse)，两者相加 + QC/TC 签名
+    // 在满载时会超过 raptorcast 的 MAX_MESSAGE_SIZE(3 MiB)导致 FinalMsgTooLarge 广播失败。
+    // 故将交易预算与笔数限制下调，给延迟执行结果留出空间。
+    tx_limit: 10_000,
     proposal_gas_limit: 200_000_000,
-    proposal_byte_limit: 2_000_000,
+    proposal_byte_limit: 20_000_000,
     max_reserve_balance: 10_000_000_000_000_000_000, // 10 MON
-    vote_pace: Duration::from_millis(0), // 原值400ms，改为0ms快速投票
+    vote_pace: Duration::from_millis(50), 
 };
 
 // NOTE: when adding a new revision, chain_params! asserts that tx_limit is <= MAX_TRANSACTIONS_PER_BLOCK

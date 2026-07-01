@@ -16,8 +16,9 @@ use monad_txpool::{
     block_on_async, process_proposal, process_request_from_inputs, query_execution_result,
     CosmosTxPoolError as CosmosBlockPolicyError, CosmosCommitStore,
 };
-use monad_types::{BlockId, Epoch, SeqNum, Stake, GENESIS_SEQ_NUM};
+use monad_types::{BlockId, Epoch, SeqNum, Stake, GENESIS_BLOCK_ID, GENESIS_SEQ_NUM};
 use monad_validator::signature_collection::{SignatureCollection, SignatureCollectionPubKeyType};
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // CosmosStateBackend
@@ -66,7 +67,13 @@ where
     ) -> Result<CosmosFinalizedHeader, StateBackendError> {
         let store = self.store.lock().unwrap();
         if let Some(header) = store.get(seq_num) {
-            return Ok(header.clone());
+            if !header.finalize_block_response.is_empty() {
+                return Ok(header.clone());
+            }
+            // InitChain seeds genesis with app_hash only (no FinalizeBlock at height 0).
+            if *seq_num == GENESIS_SEQ_NUM && !header.app_hash.is_empty() {
+                return Ok(header.clone());
+            }
         }
         if is_finalized {
             if store.earliest().is_some_and(|earliest| earliest > *seq_num) {
@@ -97,6 +104,71 @@ where
     }
 }
 
+fn execution_result_cached(store: &CosmosCommitStore, height: u64) -> bool {
+    store.get(&SeqNum(height)).is_some_and(|h| {
+        !h.finalize_block_response.is_empty()
+            || (height == GENESIS_SEQ_NUM.0 && !h.app_hash.is_empty())
+    })
+}
+
+fn persist_execution_result(
+    store: &mut CosmosCommitStore,
+    header: CosmosFinalizedHeader,
+) -> Result<(), CosmosBlockPolicyError> {
+    store
+        .commit(header)
+        .map_err(|err| CosmosBlockPolicyError::Transport(err.to_string()))
+}
+
+/// Persist an execution result fetched at runtime (primary cache path).
+pub fn cache_execution_result_from_abci(
+    store: &mut CosmosCommitStore,
+    header: CosmosFinalizedHeader,
+) -> Result<(), CosmosBlockPolicyError> {
+    persist_execution_result(store, header)
+}
+
+/// Startup compensation only: refresh recent placeholder rows from ABCI Query.
+///
+/// Scans `[app_height - execution_delay, app_height]` — the window needed for the
+/// next delayed-execution proposals. Does not walk the full chain; non-full nodes
+/// may lack ancient results on the app (those queries fail harmlessly).
+pub fn compensate_recent_execution_results_from_abci(
+    store: &mut CosmosCommitStore,
+    endpoint: &str,
+    app_height: u64,
+    execution_delay: u64,
+) -> Result<(), CosmosBlockPolicyError> {
+    if app_height == 0 {
+        return Ok(());
+    }
+    let from = app_height.saturating_sub(execution_delay).max(1);
+    for height in from..=app_height {
+        if execution_result_cached(store, height) {
+            continue;
+        }
+        match block_on_async(async { query_execution_result(endpoint, height).await }) {
+            Ok(header) => {
+                info!(
+                    height,
+                    from,
+                    app_height,
+                    "compensated recent cosmos execution result from ABCI query"
+                );
+                persist_execution_result(store, header)?;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    height,
+                    ?err,
+                    "execution result not available for startup compensation"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CosmosBlockPolicy
 // ---------------------------------------------------------------------------
@@ -111,14 +183,65 @@ where
 pub struct CosmosBlockPolicy {
     execution_delay: SeqNum,
     abci_endpoint: String,
+    commit_store: std::sync::Arc<std::sync::Mutex<CosmosCommitStore>>,
 }
 
 impl CosmosBlockPolicy {
-    pub fn new(execution_delay: u64, abci_endpoint: impl Into<String>) -> Self {
+    pub fn new(
+        execution_delay: u64,
+        abci_endpoint: impl Into<String>,
+        commit_store: std::sync::Arc<std::sync::Mutex<CosmosCommitStore>>,
+    ) -> Self {
         Self {
             execution_delay: SeqNum(execution_delay),
             abci_endpoint: abci_endpoint.into(),
+            commit_store,
         }
+    }
+
+    fn lookup_delayed_execution_result<ST, SCT, SBT>(
+        &self,
+        target: SeqNum,
+        state_backend: &SBT,
+    ) -> Result<CosmosFinalizedHeader, StateBackendError>
+    where
+        ST: CertificateSignatureRecoverable,
+        SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
+        SBT: StateBackend<ST, SCT, CosmosExecutionProtocol>,
+    {
+        if let Ok(header) = state_backend.get_execution_result(&GENESIS_BLOCK_ID, &target, true) {
+            return Ok(header.consensus_digest());
+        }
+
+        let endpoint = self.abci_endpoint.clone();
+        let header = match block_on_async(async move { query_execution_result(&endpoint, target.0).await })
+        {
+            Ok(h) => h,
+            Err(err) => {
+                tracing::warn!(
+                    target_height = target.0,
+                    ?err,
+                    "delayed execution result not available (state backend + ABCI query)"
+                );
+                return Err(StateBackendError::NotAvailableYet);
+            }
+        };
+
+        if let Ok(mut store) = self.commit_store.lock() {
+            match persist_execution_result(&mut store, header.clone()) {
+                Ok(()) => tracing::debug!(
+                    target_height = target.0,
+                    "cached delayed execution result to commit store"
+                ),
+                Err(err) => tracing::warn!(
+                    target_height = target.0,
+                    ?err,
+                    "failed to cache delayed execution result to commit store"
+                ),
+            }
+        }
+
+        Ok(header.consensus_digest())
     }
 }
 
@@ -138,7 +261,7 @@ where
         block: &Self::ValidatedBlock,
         extending_blocks: Vec<&Self::ValidatedBlock>,
         blocktree_root: RootInfo,
-        _state_backend: &SBT,
+        state_backend: &SBT,
         _chain_config: &CCT,
     ) -> Result<(), BlockPolicyError> {
         let (extending_seq_num, extending_timestamp) =
@@ -149,9 +272,20 @@ where
             };
 
         if block.get_seq_num() != extending_seq_num + SeqNum(1) {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                extending_seq_num = extending_seq_num.0,
+                "coherency fail: seq_num not consecutive"
+            );
             return Err(BlockPolicyError::BlockNotCoherent);
         }
         if block.get_timestamp() <= extending_timestamp {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                block_ts = block.get_timestamp(),
+                extending_ts = extending_timestamp,
+                "coherency fail: timestamp not increasing"
+            );
             return Err(BlockPolicyError::TimestampError);
         }
 
@@ -161,13 +295,15 @@ where
                 Vec::new()
             } else {
                 let target = block.get_seq_num() - self.execution_delay;
-                let endpoint = self.abci_endpoint.clone();
-                match block_on_async(async move { query_execution_result(&endpoint, target.0).await }) {
-                    Ok(h) => vec![h],
-                    Err(_) => return Err(BlockPolicyError::StateBackendError(StateBackendError::NotAvailableYet)),
-                }
+                vec![self
+                    .lookup_delayed_execution_result(target, state_backend)
+                    .map_err(BlockPolicyError::StateBackendError)?]
             };
         if block.get_execution_results() != &expected_execution_results {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                "coherency fail: execution result mismatch"
+            );
             return Err(BlockPolicyError::ExecutionResultMismatch);
         }
 
@@ -177,9 +313,23 @@ where
             &block.body().execution_body,
         );
         let endpoint = self.abci_endpoint.clone();
-        let resp = block_on_async(async move { process_proposal(&endpoint, req).await })
-            .map_err(|_| BlockPolicyError::BlockNotCoherent)?;
+        let resp = match block_on_async(async move { process_proposal(&endpoint, req).await }) {
+            Ok(resp) => resp,
+            Err(err) => {
+                warn!(
+                    seq_num = block.get_seq_num().0,
+                    ?err,
+                    "coherency fail: process_proposal ABCI call errored"
+                );
+                return Err(BlockPolicyError::BlockNotCoherent);
+            }
+        };
         if resp.status != 1 {
+            warn!(
+                seq_num = block.get_seq_num().0,
+                status = resp.status,
+                "coherency fail: process_proposal returned non-accept status"
+            );
             return Err(BlockPolicyError::BlockNotCoherent);
         }
 
@@ -190,17 +340,13 @@ where
         &self,
         block_seq_num: SeqNum,
         _extending_blocks: Vec<&Self::ValidatedBlock>,
-        _state_backend: &SBT,
+        state_backend: &SBT,
     ) -> Result<Vec<CosmosFinalizedHeader>, StateBackendError> {
         if block_seq_num <= self.execution_delay + GENESIS_SEQ_NUM {
             return Ok(Vec::new());
         }
         let target = block_seq_num - self.execution_delay;
-        let endpoint = self.abci_endpoint.clone();
-        match block_on_async(async move { query_execution_result(&endpoint, target.0).await }) {
-            Ok(h) => Ok(vec![h]),
-            Err(_) => Err(StateBackendError::NotAvailableYet),
-        }
+        Ok(vec![self.lookup_delayed_execution_result(target, state_backend)?])
     }
 
     fn update_committed_block(&mut self, _block: &Self::ValidatedBlock) {}

@@ -190,6 +190,45 @@ metrics!(
         ]
     ),
     (
+        ConsensusTiming,
+        consensus_timing,
+        [
+            (
+                local_timeout_total_us,
+                "Total microseconds actually elapsed on local Pacemaker round timeouts"
+            ),
+            (
+                vote_total_us,
+                "Total microseconds from proposal validate start to vote ready"
+            ),
+            (vote_count, "Vote-ready events"),
+            (
+                execution_result_query_total_us,
+                "Total microseconds fetching delayed execution results before CreateProposal"
+            ),
+            (
+                execution_result_query_count,
+                "Delayed execution result queries before CreateProposal"
+            ),
+            (
+                vote_send_wait_total_us,
+                "Total microseconds from vote ready until vote is sent (vote_pace wait)"
+            ),
+            (
+                vote_send_wait_count,
+                "Votes sent after vote-ready scheduling"
+            ),
+            (
+                finalized_commit_interval_total_us,
+                "Total microseconds between finalized commit emissions"
+            ),
+            (
+                finalized_commit_interval_count,
+                "Intervals between finalized commit emissions"
+            ),
+        ]
+    ),
+    (
         VoteDelay,
         vote_delay,
         [
@@ -204,7 +243,15 @@ metrics!(
             (
                 ready_after_timer_start_p99_ms,
                 "Vote delay ready-after-timer-start p99 in ms (5m rolling window)"
-            )
+            ),
+            (
+                ready_after_timer_start_total_ms,
+                "Cumulative ms from vote timer start until vote ready"
+            ),
+            (
+                ready_after_timer_start_count,
+                "Samples for vote ready after timer start"
+            ),
         ]
     ),
     (

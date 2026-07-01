@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -e
 DIR=$1
 
 function normalize_metric() {

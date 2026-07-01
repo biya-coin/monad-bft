@@ -32,7 +32,10 @@ use monad_chain_config::ChainConfig;
 use monad_consensus_state::ConsensusConfig;
 use monad_consensus_types::{metrics::Metrics, validator_data::ValidatorSetDataWithEpoch};
 use monad_control_panel::ipc::ControlPanelIpcReceiver;
-use monad_cosmos_block_policy::{CosmosBlockPolicy, CosmosBlockValidator, CosmosStateBackend};
+use monad_cosmos_block_policy::{
+    compensate_recent_execution_results_from_abci, CosmosBlockPolicy, CosmosBlockValidator,
+    CosmosStateBackend,
+};
 use monad_cosmos_ledger::CosmosLedger;
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
@@ -212,7 +215,26 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         .sync_with_abci_app(&abci_endpoint)
         .expect("cosmos commit store should match ABCI app height (see docs/monad-cosmos-abci-debugging.md if this fails)");
     let commit_store = Arc::new(std::sync::Mutex::new(genesis_store));
-    let create_block_policy = || CosmosBlockPolicy::new(EXECUTION_DELAY, abci_endpoint.clone());
+    if let Ok(info) = monad_txpool::block_on_async(async { monad_txpool::info(&abci_endpoint).await })
+    {
+        let app_height = info.last_block_height.max(0) as u64;
+        if app_height > 0 {
+            if let Ok(mut store) = commit_store.lock() {
+                compensate_recent_execution_results_from_abci(
+                    &mut store,
+                    &abci_endpoint,
+                    app_height,
+                    EXECUTION_DELAY,
+                )
+                .expect("cosmos commit store should compensate recent execution results from ABCI");
+            }
+        }
+    }
+    let create_block_policy = {
+        let commit_store = commit_store.clone();
+        let abci_endpoint = abci_endpoint.clone();
+        move || CosmosBlockPolicy::new(EXECUTION_DELAY, abci_endpoint.clone(), commit_store.clone())
+    };
     let state_backend = CosmosStateBackend::new(commit_store.clone());
 
     let cosmos_ipc_checked = cosmos_txpool_ipc::spawn_cosmos_txpool_ipc_checked_ingress(
@@ -247,10 +269,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
             node_state.chain_config.get_epoch_length(),
         ),
         timestamp: TokioTimestamp::new(Duration::from_millis(5), 100, 10001),
-        txpool: CosmosTxPoolExecutor::new(
-            abci_endpoint.clone(),
-            cosmos_ipc_checked,
-        ),
+        txpool: CosmosTxPoolExecutor::new(abci_endpoint.clone(), cosmos_ipc_checked),
         control_panel: ControlPanelIpcReceiver::new(
             node_state.control_panel_ipc_path,
             node_state.reload_handle,
@@ -322,7 +341,7 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
         maybe_blocksync_rng_seed: None,
         consensus_config: ConsensusConfig {
             execution_delay: SeqNum(EXECUTION_DELAY),
-            delta: Duration::from_millis(100),
+            delta: Duration::from_millis(5_000),
             // StateSync -> Live transition happens here
             statesync_to_live_threshold: SeqNum(statesync_threshold as u64),
             // Live -> StateSync transition happens here
@@ -411,11 +430,13 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                     let _timer = DropTimer::start(Duration::from_millis(1), |elapsed| {
                         warn!(
                             ?elapsed,
-                            ?event,
+                            %event,
                             "long time to format event"
                         )
                     });
-                    format!("{:?}", event)
+                    // Display(紧凑摘要)而非 Debug:Debug 会把整个事件(含 CosmosBlockBody
+                    // 的全部交易)展开成 MB 级字符串,既慢(~100ms)又把日志撑到 GB。
+                    format!("{}", event)
                 };
 
                 let event = LogFriendlyMonadEvent {

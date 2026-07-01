@@ -22,8 +22,13 @@ monad-state-backend = { workspace = true }
 monad-types = { workspace = true }
 monad-validator = { workspace = true }
 
+actix-web = { workspace = true }
 alloy-rlp = { workspace = true, features = ["arrayvec"] }
+base64 = { workspace = true }
 bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+sha2 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }
@@ -36,6 +41,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,4 +1,4 @@
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{fs, io, path::Path};
 
 use chrono::{DateTime, Utc};
 use monad_abci_client::{
@@ -122,6 +122,7 @@ fn parse_consensus_params(genesis: &Value) -> ConsensusParams {
         block: Some(BlockParams {
             max_bytes: parse_i64_str(block.and_then(|v| v.get("max_bytes"))),
             max_gas: parse_i64_str(block.and_then(|v| v.get("max_gas"))),
+            max_txs: parse_i64_str(block.and_then(|v| v.get("max_txs"))),
         }),
         evidence: Some(EvidenceParams {
             max_age_num_blocks: parse_i64_str(evidence.and_then(|v| v.get("max_age_num_blocks"))),

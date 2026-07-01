@@ -1,36 +1,69 @@
 //! Feed raw Cosmos SDK transaction bytes to monad-node via the mempool Unix socket.
+//!
+//! One-shot feed (test_run.sh sendtx):
+//!   cosmos-txpool-feed <mempool.sock> <tx.raw>
+//!   MONAD_MEMPOOL_SOCK=<mempool.sock> cosmos-txpool-feed <tx.raw>
+//!
+//! Comet RPC for chain-stresser (port 26657):
+//!   cosmos-txpool-feed serve --listen 127.0.0.1:26657 --cosmos-ipc-path <mempool.sock>
 
 use std::env;
 use std::ffi::OsString;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(name = "cosmos-txpool-feed")]
+struct ServeArgs {
+    /// Comet RPC listen address (chain-stresser --node-addr)
+    #[arg(long, default_value = "127.0.0.1:26657")]
+    listen: String,
+
+    /// monad-node --mempool-ipc-path
+    #[arg(long)]
+    cosmos_ipc_path: Option<PathBuf>,
+}
 
 fn mempool_sock_from_env() -> Option<OsString> {
     env::var_os("MONAD_MEMPOOL_SOCK").filter(|p| !p.is_empty())
 }
 
-fn usage() {
+fn feed_usage() {
     eprintln!("usage: cosmos-txpool-feed <mempool.sock> <tx.raw>");
     eprintln!("   or: MONAD_MEMPOOL_SOCK=<mempool.sock> cosmos-txpool-feed <tx.raw>");
+    eprintln!("   or: cosmos-txpool-feed serve [--listen ADDR] --cosmos-ipc-path <mempool.sock>");
     eprintln!("socket must match monad-node --mempool-ipc-path (empty path yields EINVAL)");
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn parse_serve_args() -> Option<ServeArgs> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 && args[1] == "serve" {
+        let mut serve_argv = vec![args[0].clone()];
+        serve_argv.extend(args.iter().skip(2).cloned());
+        Some(ServeArgs::parse_from(serve_argv))
+    } else {
+        None
+    }
+}
+
+async fn run_feed() -> ExitCode {
     let mut args = env::args_os();
     let _ = args.next();
     let mut rest = args.collect::<Vec<_>>();
 
     let (socket, path): (OsString, OsString) = match rest.len() {
         0 => {
-            usage();
+            feed_usage();
             return ExitCode::FAILURE;
         }
         1 => {
             let path = rest.pop().unwrap();
             let Some(sock) = mempool_sock_from_env() else {
                 eprintln!("error: single-argument form requires MONAD_MEMPOOL_SOCK");
-                usage();
+                feed_usage();
                 return ExitCode::FAILURE;
             };
             (sock, path)
@@ -41,7 +74,7 @@ async fn main() -> ExitCode {
             if socket.is_empty() {
                 let Some(sock) = mempool_sock_from_env() else {
                     eprintln!("error: mempool socket path is empty; pass monad-node's --mempool-ipc-path or set MONAD_MEMPOOL_SOCK");
-                    usage();
+                    feed_usage();
                     return ExitCode::FAILURE;
                 };
                 socket = sock;
@@ -49,7 +82,7 @@ async fn main() -> ExitCode {
             (socket, path)
         }
         _ => {
-            usage();
+            feed_usage();
             return ExitCode::FAILURE;
         }
     };
@@ -76,5 +109,36 @@ async fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn run_serve(args: ServeArgs) -> ExitCode {
+    let mempool = match args.cosmos_ipc_path.or_else(|| {
+        mempool_sock_from_env().map(PathBuf::from)
+    }) {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => {
+            eprintln!("error: serve requires --cosmos-ipc-path or MONAD_MEMPOOL_SOCK");
+            feed_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match monad_txpool::comet_mempool_rpc::run_server(&args.listen, mempool).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("cosmos-txpool-feed serve: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[actix_web::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt::init();
+    if let Some(serve_args) = parse_serve_args() {
+        run_serve(serve_args).await
+    } else {
+        run_feed().await
     }
 }
